@@ -48,6 +48,11 @@ func TestEmailFromClaudeJSON(t *testing.T) {
 		{"missing field", `{"foo":"bar"}`, ""},
 		{"empty file", "", ""},
 		{"empty value", `{"emailAddress":""}`, ""},
+		// Defensive: escaped `\"` inside the value must not be treated as
+		// the closing quote. Realistically no email contains a quote, but
+		// the parser must not silently truncate if one ever does.
+		{"escaped quote inside value", `{"emailAddress":"a\"b@example.com"}`, `a\"b@example.com`},
+		{"escaped backslash before quote", `{"emailAddress":"a\\","other":"x"}`, `a\\`},
 	}
 	for i, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

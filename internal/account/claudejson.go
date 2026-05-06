@@ -76,11 +76,24 @@ func emailFromClaudeJSON(path string) string {
 		return ""
 	}
 	j++
-	end := strings.Index(s[j:], `"`)
-	if end < 0 {
-		return ""
+	// Walk to the closing quote, skipping over any `\X` escape pair so
+	// an escaped `\"` inside the value (theoretical for emails, but
+	// JSON-legal) doesn't end the string early. Real-world emails never
+	// contain backslashes; this is a defensive guardrail, not a hot
+	// path. We return the raw substring without unescape — the value is
+	// only used as a display label.
+	start := j
+	for j < len(s) {
+		switch s[j] {
+		case '\\':
+			j += 2 // skip escape pair (`\"`, `\\`, `\n`, …)
+		case '"':
+			return s[start:j]
+		default:
+			j++
+		}
 	}
-	return s[j : j+end]
+	return ""
 }
 
 // ReadOAuthBlock returns the raw JSON of the `oauthAccount` field

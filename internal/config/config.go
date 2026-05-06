@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"sort"
 )
 
 // Config is persisted to ~/.claude-monitor/config.json so that toggles set
@@ -124,11 +125,7 @@ func SanitizeThresholds(in []float64) []float64 {
 		seen[v] = struct{}{}
 		out = append(out, v)
 	}
-	for i := 1; i < len(out); i++ {
-		for j := i; j > 0 && out[j-1] > out[j]; j-- {
-			out[j-1], out[j] = out[j], out[j-1]
-		}
-	}
+	sort.Float64s(out)
 	return out
 }
 

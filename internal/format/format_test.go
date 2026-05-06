@@ -27,16 +27,30 @@ func TestTruncate(t *testing.T) {
 	}
 }
 
-// TestTruncateByteSemantics documents the current behavior: Truncate
-// operates on bytes, not runes, despite the docstring saying "runes".
-// Multi-byte UTF-8 input *can* be sliced mid-rune. This test pins the
-// behavior so a future fix is intentional, not accidental.
-func TestTruncateByteSemantics(t *testing.T) {
-	// "héllo" — é is two bytes (0xc3 0xa9). Bytes: h, 0xc3, 0xa9, l, l, o (6 bytes).
-	// max=4 keeps first 3 bytes (h, 0xc3, 0xa9) plus ellipsis → "hé…".
-	got := Truncate("héllo", 4)
-	want := "hé…"
-	if got != want {
-		t.Errorf("Truncate byte-mode: got %q, want %q", got, want)
+// TestTruncateRuneAware verifies that Truncate operates on runes, not
+// bytes, so multi-byte UTF-8 input is never sliced mid-encoding.
+func TestTruncateRuneAware(t *testing.T) {
+	tests := []struct {
+		s    string
+		max  int
+		want string
+	}{
+		// "héllo" is 5 runes (h, é, l, l, o). max=4 keeps 3 runes + ellipsis.
+		{"héllo", 4, "hél…"},
+		// All ASCII fits within max → return as-is even when byte-len > max
+		// would have truncated.
+		{"héllo", 5, "héllo"},
+		// CJK input: each character is 3 bytes in UTF-8.
+		{"日本語テスト", 4, "日本語…"},
+		// Already valid: short input, plenty of room.
+		{"日本", 5, "日本"},
+		// max=1 always returns the ellipsis alone, regardless of input.
+		{"héllo", 1, "…"},
+	}
+	for _, tt := range tests {
+		got := Truncate(tt.s, tt.max)
+		if got != tt.want {
+			t.Errorf("Truncate(%q, %d) = %q, want %q", tt.s, tt.max, got, tt.want)
+		}
 	}
 }
