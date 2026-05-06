@@ -18,10 +18,14 @@ import (
 type tickMsg time.Time
 
 // refreshMsg carries the result of a FetchAll call back into the model.
+// The version field matches the inflight counter at the time the
+// refresh was launched so that stale results from a superseded refresh
+// can be dropped silently.
 type refreshMsg struct {
-	rows []AccountUsage
-	err  error
-	at   time.Time
+	rows    []AccountUsage
+	err     error
+	at      time.Time
+	version uint64
 }
 
 // flashClearMsg clears a transient status banner (used for "config saved",
@@ -56,16 +60,20 @@ type model struct {
 }
 
 func initialModel(root string, cfg Config) model {
+	// Start at inflight=1, refreshing=true so the first frame already
+	// shows "loading…" while Init's refreshCmd runs.
 	return model{
-		root:     root,
-		cfg:      cfg,
-		showHelp: true,
+		root:       root,
+		cfg:        cfg,
+		showHelp:   true,
+		inflight:   1,
+		refreshing: true,
 	}
 }
 
 func (m model) Init() tea.Cmd {
 	return tea.Batch(
-		m.refreshCmd(m.inflight+1),
+		m.refreshCmd(m.inflight),
 		tickCmd(m.cfg.IntervalSeconds),
 	)
 }
@@ -78,11 +86,10 @@ func (m *model) refreshCmd(version uint64) tea.Cmd {
 	root := m.root
 	autoKick := m.cfg.AutoKick
 	return func() tea.Msg {
-		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		rows, err := FetchAll(ctx, root, autoKick)
-		_ = version // version is captured separately on the model side
-		return refreshMsg{rows: rows, err: err, at: time.Now()}
+		return refreshMsg{rows: rows, err: err, at: time.Now(), version: version}
 	}
 }
 
@@ -123,6 +130,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, tea.Batch(cmds...)
 
 	case refreshMsg:
+		// Discard results from a refresh that has been superseded by a
+		// newer one (e.g. user mashed `r` while a tick was already in
+		// flight). Keeping the newer in-flight refresh marked as such is
+		// what makes the screen show "refreshing…" continuously.
+		if msg.version != m.inflight {
+			return m, nil
+		}
 		m.refreshing = false
 		m.rows = msg.rows
 		m.err = msg.err
@@ -144,12 +158,19 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, tea.Quit
 
 	case "r":
-		if m.refreshing {
-			return m, nil
-		}
+		// Always trigger a brand-new refresh and bump the inflight
+		// counter so any in-flight refresh's result will be discarded
+		// when it returns. This makes the keypress feel instant: the
+		// screen flips to "refreshing…" on the very next frame, even
+		// when a tick-driven refresh was already in progress.
 		m.refreshing = true
 		m.inflight++
-		return m, m.refreshCmd(m.inflight)
+		m.flash = "refresh!"
+		m.flashExpiry = time.Now().Add(800 * time.Millisecond)
+		return m, tea.Batch(
+			m.refreshCmd(m.inflight),
+			flashClearCmd(800*time.Millisecond),
+		)
 
 	case "k":
 		m.cfg.AutoKick = !m.cfg.AutoKick
