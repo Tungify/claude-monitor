@@ -1,4 +1,4 @@
-BINARY      := claude-analytic
+BINARY      := claude-monitor
 PKG         := ./...
 BIN_DIR     := bin
 INSTALL_DIR ?= $(HOME)/bin
@@ -26,13 +26,9 @@ build:
 	@if [ "$(GOOS)" = "darwin" ]; then codesign -f -s - $(BIN_DIR)/$(BINARY) >/dev/null; fi
 	@echo "built $(BIN_DIR)/$(BINARY) ($(GOOS)/$(GOARCH), $(VERSION))"
 
-## run: build and start the live dashboard
+## run: build and start the TUI
 run: build
 	$(BIN_DIR)/$(BINARY)
-
-## once: build and render a single snapshot
-once: build
-	$(BIN_DIR)/$(BINARY) --once
 
 ## install: copy binary to $(INSTALL_DIR) (default: ~/bin)
 install: build

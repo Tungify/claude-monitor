@@ -1,59 +1,6 @@
 package main
 
-import (
-	"fmt"
-	"strings"
-	"time"
-)
-
-func formatTokens(n int64) string {
-	switch {
-	case n >= 1_000_000_000:
-		return fmt.Sprintf("%.2fB", float64(n)/1e9)
-	case n >= 1_000_000:
-		return fmt.Sprintf("%.2fM", float64(n)/1e6)
-	case n >= 1_000:
-		return fmt.Sprintf("%.1fK", float64(n)/1e3)
-	default:
-		return fmt.Sprintf("%d", n)
-	}
-}
-
-func formatCost(c float64) string {
-	if c <= 0 {
-		return "$0"
-	}
-	if c < 0.01 {
-		return "<$0.01"
-	}
-	if c < 100 {
-		return fmt.Sprintf("$%.2f", c)
-	}
-	return fmt.Sprintf("$%.0f", c)
-}
-
-func formatRelative(t time.Time) string {
-	if t.IsZero() {
-		return "—"
-	}
-	d := time.Since(t)
-	switch {
-	case d < 0:
-		return "now"
-	case d < 5*time.Second:
-		return "now"
-	case d < time.Minute:
-		return fmt.Sprintf("%ds ago", int(d.Seconds()))
-	case d < time.Hour:
-		return fmt.Sprintf("%dm ago", int(d.Minutes()))
-	case d < 24*time.Hour:
-		return fmt.Sprintf("%dh ago", int(d.Hours()))
-	case d < 30*24*time.Hour:
-		return fmt.Sprintf("%dd ago", int(d.Hours()/24))
-	default:
-		return t.Format("2006-01-02")
-	}
-}
+import "strings"
 
 func truncate(s string, max int) string {
 	if max <= 0 {

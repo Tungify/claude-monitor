@@ -3,6 +3,8 @@
 
 # Build output
 /bin/
+/claude-monitor
+/claude-analytic
 *.exe
 *.test
 *.out
