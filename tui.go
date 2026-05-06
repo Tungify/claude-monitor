@@ -17,6 +17,11 @@ import (
 // tickMsg fires every config.IntervalSeconds and triggers a refresh.
 type tickMsg time.Time
 
+// secondTickMsg fires once per second to drive live countdowns
+// ("refreshed 12s ago", "rate limited (retry in 4m23s)") that aren't
+// tied to the slower refresh cadence.
+type secondTickMsg struct{}
+
 // refreshMsg carries the result of a FetchAll call back into the model.
 // The version field matches the inflight counter at the time the
 // refresh was launched so that stale results from a superseded refresh
@@ -82,6 +87,7 @@ func (m model) Init() tea.Cmd {
 	return tea.Batch(
 		m.refreshCmd(m.inflight),
 		tickCmd(m.cfg.IntervalSeconds),
+		secondTickCmd(),
 	)
 }
 
@@ -109,6 +115,12 @@ func (m *model) refreshCmd(version uint64) tea.Cmd {
 func tickCmd(secs int) tea.Cmd {
 	return tea.Tick(time.Duration(secs)*time.Second, func(t time.Time) tea.Msg {
 		return tickMsg(t)
+	})
+}
+
+func secondTickCmd() tea.Cmd {
+	return tea.Tick(time.Second, func(time.Time) tea.Msg {
+		return secondTickMsg{}
 	})
 }
 
@@ -176,6 +188,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.flash = ""
 		}
 		return m, nil
+
+	case secondTickMsg:
+		// Re-arm; the tick exists purely to force a re-render so live
+		// countdowns advance. View() recomputes everything from state.
+		return m, secondTickCmd()
 	}
 	return m, nil
 }
@@ -322,6 +339,19 @@ func (m model) table(st styles) string {
 
 	now := time.Now()
 	for _, r := range m.rows {
+		// Live-countdown override: even if the row carries an old
+		// "rate limited" error string, prefer the deadline from the
+		// backoff map so the seconds tick down on screen.
+		if until, ok := m.backoff[r.ConfigDir]; ok && now.Before(until) {
+			remaining := until.Sub(now).Round(time.Second)
+			label := accountLabel(r)
+			msg := fmt.Sprintf("rate limited (retry in %s)", remaining)
+			line := padRight(st.colHeader.Render(label), widths[0]) +
+				"  " + st.warn.Render(msg)
+			b.WriteString(line)
+			b.WriteString("\n")
+			continue
+		}
 		if r.Err != nil {
 			label := accountLabel(r)
 			line := padRight(st.colHeader.Render(label), widths[0]) +
