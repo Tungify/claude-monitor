@@ -15,10 +15,7 @@ import (
 	"time"
 )
 
-const (
-	githubReleasesAPI = "https://api.github.com/repos/Tungify/claude-monitor/releases/latest"
-	updateCacheTTL    = 24 * time.Hour
-)
+const githubReleasesAPI = "https://api.github.com/repos/Tungify/claude-monitor/releases/latest"
 
 // UpdateInfo describes a published release that's strictly newer than
 // the running binary. Returned by CheckForUpdate; nil means "you're on
@@ -27,13 +24,6 @@ type UpdateInfo struct {
 	LatestTag   string
 	DownloadURL string
 	Body        string
-}
-
-type updateCache struct {
-	CheckedAt   time.Time `json:"checkedAt"`
-	LatestTag   string    `json:"latestTag"`
-	DownloadURL string    `json:"downloadURL"`
-	Body        string    `json:"body"`
 }
 
 type ghRelease struct {
@@ -45,26 +35,23 @@ type ghRelease struct {
 	} `json:"assets"`
 }
 
-// CheckForUpdate returns a non-nil UpdateInfo when the GitHub Releases
-// API (or a fresh-enough cache) advertises a tag newer than current.
-// Errors are returned for callers that care, but the TUI treats any
-// failure as "no banner" — an offline laptop must not nag.
+// CheckForUpdate hits the GitHub Releases API and returns a non-nil
+// UpdateInfo when the latest tag is newer than current. The check fires
+// asynchronously from the TUI's Init, so the network round-trip never
+// blocks startup; failures (offline, rate-limited, GitHub down) are
+// reported back to the caller but the TUI treats them as "no banner"
+// to keep the dashboard quiet on a flaky network.
+//
+// We deliberately don't cache here. The dashboard is a long-running
+// TUI that gets launched once or twice a day per user, so a single
+// API call per launch sits comfortably under GitHub's 60 req/hour
+// anonymous limit and removes the surprising "I just shipped a release
+// but the banner won't show for hours" behavior we had with caching.
 func CheckForUpdate(ctx context.Context, currentVersion string) (*UpdateInfo, error) {
-	if cached, ok := readCachedUpdate(); ok {
-		if isNewerVersion(cached.LatestTag, currentVersion) {
-			return &UpdateInfo{
-				LatestTag:   cached.LatestTag,
-				DownloadURL: cached.DownloadURL,
-				Body:        cached.Body,
-			}, nil
-		}
-		return nil, nil
-	}
 	info, err := fetchLatestRelease(ctx)
 	if err != nil {
 		return nil, err
 	}
-	writeCachedUpdate(info)
 	if isNewerVersion(info.LatestTag, currentVersion) {
 		return info, nil
 	}
@@ -160,51 +147,6 @@ func compareDottedVersions(a, b string) int {
 	return 0
 }
 
-func updateCachePath() (string, error) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(home, ".claude-monitor", "update-check.json"), nil
-}
-
-func readCachedUpdate() (*updateCache, bool) {
-	p, err := updateCachePath()
-	if err != nil {
-		return nil, false
-	}
-	b, err := os.ReadFile(p)
-	if err != nil {
-		return nil, false
-	}
-	var c updateCache
-	if err := json.Unmarshal(b, &c); err != nil {
-		return nil, false
-	}
-	if time.Since(c.CheckedAt) > updateCacheTTL {
-		return nil, false
-	}
-	return &c, true
-}
-
-func writeCachedUpdate(info *UpdateInfo) {
-	p, err := updateCachePath()
-	if err != nil {
-		return
-	}
-	_ = os.MkdirAll(filepath.Dir(p), 0o755)
-	b, err := json.MarshalIndent(updateCache{
-		CheckedAt:   time.Now(),
-		LatestTag:   info.LatestTag,
-		DownloadURL: info.DownloadURL,
-		Body:        info.Body,
-	}, "", "  ")
-	if err != nil {
-		return
-	}
-	_ = os.WriteFile(p, b, 0o644)
-}
-
 // PerformUpgrade downloads info.DownloadURL next to the running
 // executable, ad-hoc codesigns it on darwin, and replaces the original.
 // The currently-running process keeps executing from its already-mapped
@@ -267,27 +209,24 @@ func PerformUpgrade(ctx context.Context, info *UpdateInfo) error {
 		}
 	}
 
-	// Drop the cache so the just-installed version isn't immediately
-	// re-flagged on the next launch.
-	if p, err := updateCachePath(); err == nil {
-		_ = os.Remove(p)
-	}
 	return nil
 }
 
 // cleanupStaleUpgradeArtifacts removes leftover <exe>.old / <exe>.new
-// files from prior upgrades. Called once at startup. Best-effort: any
+// files from prior upgrades, plus the legacy update-check.json cache
+// file we no longer write. Called once at startup; best-effort, any
 // permission error is swallowed because it's non-essential.
 func cleanupStaleUpgradeArtifacts() {
-	exe, err := os.Executable()
-	if err != nil {
-		return
+	if exe, err := os.Executable(); err == nil {
+		if resolved, err := filepath.EvalSymlinks(exe); err == nil {
+			exe = resolved
+		}
+		_ = os.Remove(exe + ".old")
+		_ = os.Remove(exe + ".new")
 	}
-	if resolved, err := filepath.EvalSymlinks(exe); err == nil {
-		exe = resolved
+	if home, err := os.UserHomeDir(); err == nil {
+		_ = os.Remove(filepath.Join(home, ".claude-monitor", "update-check.json"))
 	}
-	_ = os.Remove(exe + ".old")
-	_ = os.Remove(exe + ".new")
 }
 
 func downloadToFile(ctx context.Context, url, dest string) error {

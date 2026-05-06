@@ -71,7 +71,7 @@ make install INSTALL_DIR=/usr/local/bin
 
 ### Upgrades
 
-The TUI checks GitHub Releases once on launch (cached for 24h at `~/.claude-monitor/update-check.json`). When a newer tag exists you'll see a `⬆ vX.Y.Z available — press [u]` banner in the header; pressing `u` downloads the binary, ad-hoc codesigns it, and atomically replaces the running executable. From the shell:
+The TUI hits the GitHub Releases API once on launch (async — never blocks startup). When a newer tag exists you'll see a `⬆ vX.Y.Z available — press [u]` banner in the header; pressing `u` downloads the binary for the current OS/arch, codesigns it on macOS, and replaces the running executable. From the shell:
 
 ```sh
 claude-monitor --upgrade   # same flow without the TUI
