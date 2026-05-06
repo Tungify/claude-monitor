@@ -1,0 +1,23 @@
+# macOS
+.DS_Store
+
+# Build output
+/bin/
+*.exe
+*.test
+*.out
+
+# Go
+vendor/
+go.work
+go.work.sum
+
+# Editor / IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Env
+.env
+.env.local
