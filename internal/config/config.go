@@ -1,4 +1,4 @@
-package main
+package config
 
 import (
 	"encoding/json"
@@ -40,7 +40,7 @@ type Config struct {
 	RebalanceOnReset bool `json:"rebalanceOnReset"`
 
 	// KeychainSetupDone is set after the macOS one-shot bootstrap
-	// (RunKeychainSetup) has registered the `security` CLI in each
+	// (keychain.RunSetup) has registered the `security` CLI in each
 	// Claude Code keychain entry's partition list. Until it's true
 	// we prompt the user once on launch to enter their macOS
 	// password so future swaps stay silent. Always true on
@@ -58,7 +58,7 @@ const (
 // and 60s was the safe lower bound we settled on against rate-limiting.
 const RefreshIntervalSeconds = 60
 
-func defaultConfig() Config {
+func defaults() Config {
 	return Config{
 		AutoKick:         false,
 		AutoSwap:         false,
@@ -68,7 +68,7 @@ func defaultConfig() Config {
 	}
 }
 
-func configPath() (string, error) {
+func path() (string, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return "", err
@@ -76,30 +76,36 @@ func configPath() (string, error) {
 	return filepath.Join(home, ".claude-monitor", "config.json"), nil
 }
 
-func LoadConfig() (Config, error) {
-	cfg := defaultConfig()
-	path, err := configPath()
+// Load returns the persisted Config, or defaults when the file is
+// missing/unreadable/corrupt. The error is informational — callers
+// typically ignore it because every field has a sensible default.
+func Load() (Config, error) {
+	cfg := defaults()
+	p, err := path()
 	if err != nil {
 		return cfg, err
 	}
-	b, err := os.ReadFile(path)
+	b, err := os.ReadFile(p)
 	if err != nil {
 		return cfg, err
 	}
 	// Decode on top of defaults so that newly-added fields keep sensible
 	// values when reading an old file.
 	if err := json.Unmarshal(b, &cfg); err != nil {
-		return defaultConfig(), err
+		return defaults(), err
 	}
-	cfg.SwapThresholds = sanitizeThresholds(cfg.SwapThresholds)
+	cfg.SwapThresholds = SanitizeThresholds(cfg.SwapThresholds)
 	cfg.PickOrder = sanitizePickOrder(cfg.PickOrder)
 	return cfg, nil
 }
 
-// sanitizeThresholds clamps each value to [0, 100], drops duplicates and
+// SanitizeThresholds clamps each value to [0, 100], drops duplicates and
 // sorts ascending. An empty list falls back to the default cascade so the
 // swap logic always has at least one tier to evaluate.
-func sanitizeThresholds(in []float64) []float64 {
+//
+// Exported because the TUI editor parses user input then re-uses this
+// to normalize before persisting.
+func SanitizeThresholds(in []float64) []float64 {
 	if len(in) == 0 {
 		return []float64{90, 99, 100}
 	}
@@ -135,18 +141,19 @@ func sanitizePickOrder(s string) string {
 	}
 }
 
-func SaveConfig(cfg Config) error {
-	path, err := configPath()
+// Save persists cfg as pretty-printed JSON. Creates the parent directory
+// if missing.
+func Save(cfg Config) error {
+	p, err := path()
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
 		return err
 	}
 	b, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, b, 0o644)
+	return os.WriteFile(p, b, 0o644)
 }
-

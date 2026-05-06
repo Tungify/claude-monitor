@@ -34,7 +34,7 @@ jobs:
           out="claude-monitor-darwin-${{ matrix.arch }}"
           GOOS=darwin GOARCH=${{ matrix.arch }} CGO_ENABLED=1 go build \
             -ldflags "-X main.version=${version} -linkmode=external" \
-            -o "${out}" ./...
+            -o "${out}" ./cmd/claude-monitor
           codesign -f -s - "${out}"
       - uses: actions/upload-artifact@v4
         with:
@@ -72,7 +72,7 @@ jobs:
           out="claude-monitor-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}"
           GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} CGO_ENABLED=0 go build \
             -ldflags "-X main.version=${version}" \
-            -o "${out}" ./...
+            -o "${out}" ./cmd/claude-monitor
       - uses: actions/upload-artifact@v4
         with:
           name: bin-${{ matrix.goos }}-${{ matrix.goarch }}

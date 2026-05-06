@@ -7,7 +7,12 @@ import (
 	"os"
 	"time"
 
-	tea "github.com/charmbracelet/bubbletea"
+	"claude-monitor/internal/account"
+	"claude-monitor/internal/config"
+	"claude-monitor/internal/keychain"
+	"claude-monitor/internal/swap"
+	"claude-monitor/internal/tui"
+	"claude-monitor/internal/update"
 )
 
 var (
@@ -56,76 +61,91 @@ func main() {
 	}
 
 	if *flagListAccounts {
-		if err := ListAccounts(*flagRoot); err != nil {
+		if err := swap.ListAccounts(*flagRoot); err != nil {
 			die("%v", err)
 		}
 		return
 	}
 
 	if *flagSwapTo != "" {
-		if err := SwapTo(*flagRoot, *flagSwapTo); err != nil {
+		if err := swap.To(*flagRoot, *flagSwapTo); err != nil {
 			die("%v", err)
 		}
 		return
 	}
 
-	cfg, _ := LoadConfig() // missing/corrupt → defaults; not fatal
+	cfg, _ := config.Load() // missing/corrupt → defaults; not fatal
 
 	if *flagKeychainSetup {
-		if err := RunKeychainSetup(*flagRoot); err != nil {
+		if err := keychain.RunSetup(discoverConfigDirs(*flagRoot)); err != nil {
 			die("%v", err)
 		}
 		cfg.KeychainSetupDone = true
-		_ = SaveConfig(cfg)
+		_ = config.Save(cfg)
 		return
 	}
 
 	// Clean up <exe>.old / <exe>.new from prior upgrades — Windows
 	// can't remove them while the running process holds them.
-	cleanupStaleUpgradeArtifacts()
+	update.CleanupStaleArtifacts()
 
 	// One-shot keychain registration on the first launch so future
-	// swaps don't pop a password prompt every time. RunKeychainSetup
-	// is a no-op on Linux/Windows (no partition list to update) and
+	// swaps don't pop a password prompt every time. RunSetup is a
+	// no-op on Linux/Windows (no partition list to update) and
 	// short-circuits on darwin if stdin isn't a TTY or there are no
 	// accounts yet. We always set the flag afterwards, even on
 	// skip/failure, so the user isn't re-prompted on every launch —
 	// they can rerun the bootstrap explicitly via --keychain-setup.
 	if !cfg.KeychainSetupDone {
-		_ = RunKeychainSetup(*flagRoot)
+		_ = keychain.RunSetup(discoverConfigDirs(*flagRoot))
 		cfg.KeychainSetupDone = true
-		_ = SaveConfig(cfg)
+		_ = config.Save(cfg)
 	}
 
-	p := tea.NewProgram(initialModel(*flagRoot, cfg), tea.WithAltScreen())
-	final, err := p.Run()
+	restart, err := tui.Run(*flagRoot, cfg, version)
 	if err != nil {
 		die("tui error: %v", err)
 	}
 	// Auto-restart after a successful in-app [u]-upgrade so the user
 	// lands back in the dashboard running the new version, without
 	// having to re-type the command. On Windows this is a no-op
-	// (restartSelf prints a hint instead — see restart_windows.go).
-	if mm, ok := final.(model); ok && mm.UpgradeRestart {
-		if err := restartSelf(); err != nil {
+	// (RestartSelf prints a hint instead).
+	if restart {
+		if err := update.RestartSelf(); err != nil {
 			fmt.Fprintf(os.Stderr, "auto-restart failed: %v\nrun `claude-monitor` to use the new version.\n", err)
 		}
 	}
 }
 
+// discoverConfigDirs is a thin caller-side helper around
+// account.ResolveDirs so keychain.RunSetup stays a leaf (no account
+// import). Returns nil when discovery fails, matching the behavior
+// keychain.RunSetup expects (treats empty as "skip silently").
+func discoverConfigDirs(rootSpec string) []string {
+	accts, err := account.ResolveDirs(rootSpec)
+	if err != nil || len(accts) == 0 {
+		return nil
+	}
+	dirs := make([]string, len(accts))
+	for i, a := range accts {
+		dirs[i] = a.ConfigDir
+	}
+	return dirs
+}
+
 func runUpgrade() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Second)
 	defer cancel()
-	info, err := fetchLatestRelease(ctx)
+	info, err := update.FetchLatest(ctx)
 	if err != nil {
 		return err
 	}
-	if !isNewerVersion(info.LatestTag, version) {
+	if !update.IsNewer(info.LatestTag, version) {
 		fmt.Printf("already on latest (%s)\n", version)
 		return nil
 	}
 	fmt.Printf("upgrading %s → %s\n", version, info.LatestTag)
-	if err := PerformUpgrade(ctx, info); err != nil {
+	if err := update.Perform(ctx, info); err != nil {
 		return err
 	}
 	fmt.Printf("✓ upgraded to %s\n", info.LatestTag)

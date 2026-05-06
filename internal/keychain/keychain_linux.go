@@ -1,6 +1,6 @@
 //go:build linux
 
-package main
+package keychain
 
 import (
 	"encoding/json"
@@ -49,19 +49,12 @@ func readKeychainEntry(username, svc string) (*OAuthCreds, error) {
 	return &env.ClaudeAiOauth, nil
 }
 
-// RunKeychainSetup is a no-op on Linux. The Secret Service / libsecret
-// model libsecret-tools talks to doesn't have an analogue of macOS's
-// partition list — entries are accessible to any process running as
-// the same user once the keyring is unlocked, so claude-monitor's
-// keychain writes never trigger an auth prompt to begin with.
-func RunKeychainSetup(rootSpec string) error { return nil }
-
-// WriteKeychainEntry stores creds via `secret-tool store`. The label is
-// what shows up in keyring UIs (gnome-keyring's seahorse, kwallet
-// manager); the service+account attributes are how `secret-tool lookup`
-// finds the entry again. We pipe the JSON envelope on stdin to keep it
-// out of the process arglist.
-func WriteKeychainEntry(svc string, creds *OAuthCreds) error {
+// WriteEntry stores creds via `secret-tool store`. The label is what
+// shows up in keyring UIs (gnome-keyring's seahorse, kwallet manager);
+// the service+account attributes are how `secret-tool lookup` finds
+// the entry again. We pipe the JSON envelope on stdin to keep it out
+// of the process arglist.
+func WriteEntry(svc string, creds *OAuthCreds) error {
 	u, err := user.Current()
 	if err != nil {
 		return fmt.Errorf("user lookup: %w", err)
