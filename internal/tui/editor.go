@@ -1,4 +1,4 @@
-package main
+package tui
 
 import (
 	"fmt"
@@ -7,6 +7,8 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+
+	"claude-monitor/internal/config"
 )
 
 // editField identifies one row in the config form. Order matches the
@@ -26,10 +28,10 @@ const (
 // field has the cursor and, when the user is text-editing the
 // thresholds value, the typed buffer.
 type editorState struct {
-	cursor      editField
-	textMode    bool   // true while typing into the thresholds field
-	textBuf     string // working buffer while textMode
-	textErr     string // last validation error, cleared on next keypress
+	cursor   editField
+	textMode bool   // true while typing into the thresholds field
+	textBuf  string // working buffer while textMode
+	textErr  string // last validation error, cleared on next keypress
 }
 
 // handleEditKey routes keypresses while [e] is active. It returns the
@@ -121,10 +123,10 @@ func (m model) adjustField(dir int) (model, tea.Cmd, bool) {
 		m.prevUtil = map[string]float64{}
 		m.persistAndFlash(fmt.Sprintf("auto-swap: %s", onOff(m.cfg.AutoSwap)))
 	case fieldPickOrder:
-		if m.cfg.PickOrder == PickOrderLowest {
-			m.cfg.PickOrder = PickOrderHighest
+		if m.cfg.PickOrder == config.PickOrderLowest {
+			m.cfg.PickOrder = config.PickOrderHighest
 		} else {
-			m.cfg.PickOrder = PickOrderLowest
+			m.cfg.PickOrder = config.PickOrderLowest
 		}
 		m.persistAndFlash(fmt.Sprintf("pick order: %s", m.cfg.PickOrder))
 	case fieldRebalance:
@@ -231,5 +233,5 @@ func parseThresholds(s string) ([]float64, error) {
 	if len(out) == 0 {
 		return nil, fmt.Errorf("at least one value")
 	}
-	return sanitizeThresholds(out), nil
+	return config.SanitizeThresholds(out), nil
 }

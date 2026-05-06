@@ -1,5 +1,6 @@
 BINARY      := claude-monitor
-PKG         := ./...
+PKG         := ./cmd/claude-monitor
+ALL_PKGS    := ./...
 BIN_DIR     := bin
 INSTALL_DIR ?= $(HOME)/bin
 
@@ -53,7 +54,7 @@ fmt:
 
 ## vet: go vet
 vet:
-	go vet $(PKG)
+	go vet $(ALL_PKGS)
 
 ## tidy: tidy go.mod
 tidy:

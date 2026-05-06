@@ -1,6 +1,6 @@
 //go:build windows
 
-package main
+package keychain
 
 import (
 	"encoding/json"
@@ -37,17 +37,10 @@ func readKeychainEntry(username, svc string) (*OAuthCreds, error) {
 	return &env.ClaudeAiOauth, nil
 }
 
-// RunKeychainSetup is a no-op on Windows. Generic credentials in the
-// Credential Manager unlock with the user's profile and don't gate
-// modifications behind a UAC prompt or per-process partition list, so
-// claude-monitor's keychain writes never trigger an auth dialog to
-// begin with.
-func RunKeychainSetup(rootSpec string) error { return nil }
-
-// WriteKeychainEntry creates or replaces a generic credential. We mark
-// it PersistLocalMachine so it survives logoff/login (keytar's default
+// WriteEntry creates or replaces a generic credential. We mark it
+// PersistLocalMachine so it survives logoff/login (keytar's default
 // for Claude Code is the same).
-func WriteKeychainEntry(svc string, creds *OAuthCreds) error {
+func WriteEntry(svc string, creds *OAuthCreds) error {
 	u, err := user.Current()
 	if err != nil {
 		return fmt.Errorf("user lookup: %w", err)

@@ -1,20 +1,10 @@
-package main
+package tui
 
 import "strings"
 
-func truncate(s string, max int) string {
-	if max <= 0 {
-		return ""
-	}
-	if len(s) <= max {
-		return s
-	}
-	if max <= 1 {
-		return "…"
-	}
-	return s[:max-1] + "…"
-}
-
+// padRight pads s with spaces on the right so that its visible width
+// (ignoring ANSI escapes) reaches at least width. Used to keep table
+// columns aligned regardless of styling.
 func padRight(s string, width int) string {
 	visible := visibleLen(s)
 	if visible >= width {

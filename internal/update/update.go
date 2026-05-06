@@ -1,4 +1,8 @@
-package main
+// Package update implements the in-app self-upgrade flow: it talks to
+// GitHub Releases, downloads the right binary for the host, and swaps
+// the running file. Restart of the running process lives in
+// restart_unix.go / restart_windows.go.
+package update
 
 import (
 	"context"
@@ -13,14 +17,16 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"claude-monitor/internal/format"
 )
 
 const githubReleasesAPI = "https://api.github.com/repos/Tungify/claude-monitor/releases/latest"
 
-// UpdateInfo describes a published release that's strictly newer than
-// the running binary. Returned by CheckForUpdate; nil means "you're on
-// the latest" (or the check failed silently).
-type UpdateInfo struct {
+// Info describes a published release that's strictly newer than the
+// running binary. Returned by Check; nil means "you're on the latest"
+// (or the check failed silently).
+type Info struct {
 	LatestTag   string
 	DownloadURL string
 	Body        string
@@ -35,30 +41,33 @@ type ghRelease struct {
 	} `json:"assets"`
 }
 
-// CheckForUpdate hits the GitHub Releases API and returns a non-nil
-// UpdateInfo when the latest tag is newer than current. The check fires
-// asynchronously from the TUI's Init, so the network round-trip never
-// blocks startup; failures (offline, rate-limited, GitHub down) are
-// reported back to the caller but the TUI treats them as "no banner"
-// to keep the dashboard quiet on a flaky network.
+// Check hits the GitHub Releases API and returns a non-nil Info when
+// the latest tag is newer than current. The check fires asynchronously
+// from the TUI's Init, so the network round-trip never blocks startup;
+// failures (offline, rate-limited, GitHub down) are reported back to
+// the caller but the TUI treats them as "no banner" to keep the
+// dashboard quiet on a flaky network.
 //
 // We deliberately don't cache here. The dashboard is a long-running
 // TUI that gets launched once or twice a day per user, so a single
 // API call per launch sits comfortably under GitHub's 60 req/hour
 // anonymous limit and removes the surprising "I just shipped a release
 // but the banner won't show for hours" behavior we had with caching.
-func CheckForUpdate(ctx context.Context, currentVersion string) (*UpdateInfo, error) {
-	info, err := fetchLatestRelease(ctx)
+func Check(ctx context.Context, currentVersion string) (*Info, error) {
+	info, err := FetchLatest(ctx)
 	if err != nil {
 		return nil, err
 	}
-	if isNewerVersion(info.LatestTag, currentVersion) {
+	if IsNewer(info.LatestTag, currentVersion) {
 		return info, nil
 	}
 	return nil, nil
 }
 
-func fetchLatestRelease(ctx context.Context) (*UpdateInfo, error) {
+// FetchLatest returns the latest release's Info regardless of whether
+// it's newer than the running version. Used by the `--upgrade` CLI
+// path so it can print "already on latest" rather than a no-op.
+func FetchLatest(ctx context.Context) (*Info, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, githubReleasesAPI, nil)
 	if err != nil {
 		return nil, err
@@ -74,7 +83,7 @@ func fetchLatestRelease(ctx context.Context) (*UpdateInfo, error) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, truncate(string(body), 200))
+		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, format.Truncate(string(body), 200))
 	}
 	var rel ghRelease
 	if err := json.NewDecoder(resp.Body).Decode(&rel); err != nil {
@@ -86,7 +95,7 @@ func fetchLatestRelease(ctx context.Context) (*UpdateInfo, error) {
 	}
 	for _, a := range rel.Assets {
 		if a.Name == target {
-			return &UpdateInfo{
+			return &Info{
 				LatestTag:   rel.TagName,
 				DownloadURL: a.BrowserDownloadURL,
 				Body:        rel.Body,
@@ -96,11 +105,12 @@ func fetchLatestRelease(ctx context.Context) (*UpdateInfo, error) {
 	return nil, fmt.Errorf("no asset %q in release %s", target, rel.TagName)
 }
 
-// isNewerVersion compares two semver-ish strings (with or without a
-// leading "v") numerically per dotted component. A non-numeric current
-// version (e.g. "dev" from an untagged build) is treated as older than
-// any released tag, so dev builds get nudged toward an actual release.
-func isNewerVersion(latest, current string) bool {
+// IsNewer compares two semver-ish strings (with or without a leading
+// "v") numerically per dotted component. A non-numeric current
+// version (e.g. "dev" from an untagged build) is treated as older
+// than any released tag, so dev builds get nudged toward an actual
+// release.
+func IsNewer(latest, current string) bool {
 	cur := normalizeVersion(current)
 	next := normalizeVersion(latest)
 	if next == "" {
@@ -147,8 +157,8 @@ func compareDottedVersions(a, b string) int {
 	return 0
 }
 
-// PerformUpgrade downloads info.DownloadURL next to the running
-// executable, ad-hoc codesigns it on darwin, and replaces the original.
+// Perform downloads info.DownloadURL next to the running executable,
+// ad-hoc codesigns it on darwin, and replaces the original.
 // The currently-running process keeps executing from its already-mapped
 // pages; the next invocation picks up the new binary.
 //
@@ -158,13 +168,13 @@ func compareDottedVersions(a, b string) int {
 //     because Unix opens-by-inode keep the running text mapping live.
 //   - windows: a running .exe is locked, so we move it aside to
 //     `<exe>.old` first, then rename the new file into place. The .old
-//     file is removed by cleanupStaleUpgradeArtifacts on next launch.
+//     file is removed by CleanupStaleArtifacts on next launch.
 //
 // Skipped when the running process can't write to its own directory
 // (e.g. installed under /usr/local/bin without sudo / Program Files
 // without admin). In that case we surface a clear error so the user
 // can re-run the appropriate installer manually.
-func PerformUpgrade(ctx context.Context, info *UpdateInfo) error {
+func Perform(ctx context.Context, info *Info) error {
 	exe, err := os.Executable()
 	if err != nil {
 		return fmt.Errorf("locate self: %w", err)
@@ -212,11 +222,11 @@ func PerformUpgrade(ctx context.Context, info *UpdateInfo) error {
 	return nil
 }
 
-// cleanupStaleUpgradeArtifacts removes leftover <exe>.old / <exe>.new
-// files from prior upgrades, plus the legacy update-check.json cache
-// file we no longer write. Called once at startup; best-effort, any
+// CleanupStaleArtifacts removes leftover <exe>.old / <exe>.new files
+// from prior upgrades, plus the legacy update-check.json cache file
+// we no longer write. Called once at startup; best-effort, any
 // permission error is swallowed because it's non-essential.
-func cleanupStaleUpgradeArtifacts() {
+func CleanupStaleArtifacts() {
 	if exe, err := os.Executable(); err == nil {
 		if resolved, err := filepath.EvalSymlinks(exe); err == nil {
 			exe = resolved

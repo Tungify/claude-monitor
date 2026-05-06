@@ -1,11 +1,10 @@
 //go:build darwin
 
-package main
+package keychain
 
 import (
 	"bufio"
 	"bytes"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -15,76 +14,12 @@ import (
 	"strings"
 )
 
-// readKeychainEntry shells out to the macOS `security` CLI:
-//
-//	security find-generic-password -s <service> -a <account> -w
-//
-// -w prints just the password (the JSON envelope) on stdout. Depending
-// on the entry's ACL, the OS may pop a Touch ID / "allow access" prompt
-// the first time.
-func readKeychainEntry(username, svc string) (*OAuthCreds, error) {
-	cmd := exec.Command("security", "find-generic-password", "-s", svc, "-a", username, "-w")
-	out, err := cmd.Output()
-	if err != nil {
-		return nil, fmt.Errorf("keychain read %q: %w", svc, err)
-	}
-	var env credsEnvelope
-	if err := json.Unmarshal(out, &env); err != nil {
-		return nil, fmt.Errorf("decode credentials: %w", err)
-	}
-	if env.ClaudeAiOauth.AccessToken == "" {
-		return nil, fmt.Errorf("no access token in keychain entry %q", svc)
-	}
-	return &env.ClaudeAiOauth, nil
-}
-
-// WriteKeychainEntry creates or updates a generic-password entry holding
-// the OAuth creds envelope Claude Code expects. -U makes the call
-// idempotent (update existing, create when missing).
-//
-// Note on the missing -A flag: macOS Security treats "add-generic-
-// password -U -A" as a request to *replace* the entry's ACL with one
-// listing the calling tool (the `security` CLI itself) as the sole
-// trusted decrypter. That replacement requires the change_acl
-// privilege — and when the existing entry's change_acl ACL has an
-// empty trusted-apps list (which Claude Code-credentials entries do
-// by default), the system pops a "Claude Code-credentials wants
-// access" dialog on every write. So we deliberately omit -A: the
-// encrypt ACL on these entries is already wide-open (applications:
-// <null> = any process), so updating just the password value goes
-// through silently. The trade-off is that future *reads* by other
-// processes (Claude Code itself) follow the entry's decrypt ACL
-// unchanged — exactly what we want, since Claude Code originally
-// created these with permissive decrypt ACLs.
-func WriteKeychainEntry(svc string, creds *OAuthCreds) error {
-	u, err := user.Current()
-	if err != nil {
-		return fmt.Errorf("user lookup: %w", err)
-	}
-	payload, err := json.Marshal(credsEnvelope{ClaudeAiOauth: *creds})
-	if err != nil {
-		return fmt.Errorf("encode credentials: %w", err)
-	}
-	cmd := exec.Command("security", "add-generic-password",
-		"-U",
-		"-s", svc,
-		"-a", u.Username,
-		"-w", string(payload),
-	)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("keychain write %q: %w (%s)", svc, err, strings.TrimSpace(string(out)))
-	}
-	return nil
-}
-
 // setPartitionList registers the macOS `security` CLI in the partition
 // list of a keychain entry. On macOS 10.13+ each generic-password entry
 // has a partition list that gates which code-signing identities can
 // modify it — even when the entry's classic ACL is "allow any
-// application" (the -A flag in WriteKeychainEntry). Without this, the
-// security CLI is treated as an outsider and every modify pops a
-// keychain-password dialog.
+// application". Without this, the security CLI is treated as an
+// outsider and every modify pops a keychain-password dialog.
 //
 // The -k flag passes the user's macOS password directly so the call
 // itself doesn't prompt; we use it once during the one-shot setup to
@@ -148,24 +83,27 @@ func stdinIsTTY() bool {
 	return cmd.Run() == nil
 }
 
-// RunKeychainSetup is the one-shot bootstrap that registers
-// claude-monitor's `security` CLI with each Claude Code keychain
-// entry's partition list. Without it, every account swap pops a
-// keychain-password dialog because modern macOS gates modifications
-// on the calling process's code-signing identity.
+// RunSetup is the one-shot bootstrap that registers claude-monitor's
+// `security` CLI with each Claude Code keychain entry's partition
+// list. Without it, every account swap pops a keychain-password
+// dialog because modern macOS gates modifications on the calling
+// process's code-signing identity.
+//
+// configDirs is the list of account config dirs to register; the
+// caller (main.go) discovers them via account.ResolveDirs so this
+// package stays a leaf. The plain slot is registered unconditionally.
 //
 // We collect the user's macOS user password once (hidden TTY input,
 // not stored anywhere), then call setPartitionList for the plain slot
 // plus each per-account hashed entry. Future swaps stay silent until
 // the user resets their keychain or adds a new account whose entry
-// hasn't been registered yet (in which case `--keychain-setup` can be
+// hasn't been registered yet (in which case the bootstrap can be
 // rerun).
 //
-// Skipped silently when stdin isn't a TTY (CI/automation), no accounts
-// have been discovered, or the user enters a blank password.
-func RunKeychainSetup(rootSpec string) error {
-	accts, err := ResolveAccountDirs(rootSpec)
-	if err != nil || len(accts) == 0 {
+// Skipped silently when stdin isn't a TTY (CI/automation), no
+// configDirs were given, or the user enters a blank password.
+func RunSetup(configDirs []string) error {
+	if len(configDirs) == 0 {
 		return nil
 	}
 	if !stdinIsTTY() {
@@ -201,10 +139,10 @@ func RunKeychainSetup(rootSpec string) error {
 	// hashed entry. Dedupe so an account whose configDir hashes to the
 	// same suffix as another (extremely unlikely, but cheap to handle)
 	// only triggers one set-partition-list call.
-	seen := map[string]struct{}{plainKeychainSvc: {}}
-	svcs := []string{plainKeychainSvc}
-	for _, a := range accts {
-		svc := keychainServiceFor(a.configDir)
+	seen := map[string]struct{}{PlainServiceName: {}}
+	svcs := []string{PlainServiceName}
+	for _, dir := range configDirs {
+		svc := ServiceFor(dir)
 		if _, dup := seen[svc]; dup {
 			continue
 		}

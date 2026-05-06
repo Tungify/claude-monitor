@@ -1,4 +1,4 @@
-package main
+package keychain
 
 import (
 	"crypto/sha256"
@@ -11,6 +11,12 @@ import (
 	"strings"
 	"time"
 )
+
+// PlainServiceName is the OAuth slot a `claude` invocation reads when
+// no CLAUDE_CONFIG_DIR is set. Auto-swap rewrites this single slot to
+// rotate accounts; tabs invoked with an explicit CLAUDE_CONFIG_DIR
+// bypass it and are intentionally left alone.
+const PlainServiceName = "Claude Code-credentials"
 
 // OAuthCreds is the inner shape Claude Code stores under
 // "Claude Code-credentials[-<hash>]" in the OS credential store.
@@ -33,13 +39,13 @@ type credsEnvelope struct {
 	ClaudeAiOauth OAuthCreds `json:"claudeAiOauth"`
 }
 
-// keychainServiceFor mirrors keytar's service-name convention used by
-// Claude Code: when CLAUDE_CONFIG_DIR is set, the entry name carries an
+// ServiceFor mirrors keytar's service-name convention used by Claude
+// Code: when CLAUDE_CONFIG_DIR is set, the entry name carries an
 // 8-char sha256 suffix derived from the absolute config dir path. The
 // hash is identical across OSes because we normalize the path string
 // the same way Claude Code does (absolute, native separators, no
 // trailing separator).
-func keychainServiceFor(configDir string) string {
+func ServiceFor(configDir string) string {
 	abs, err := filepath.Abs(configDir)
 	if err != nil {
 		abs = configDir
@@ -47,11 +53,11 @@ func keychainServiceFor(configDir string) string {
 	abs = strings.TrimRight(abs, `/\`)
 	sum := sha256.Sum256([]byte(abs))
 	suffix := hex.EncodeToString(sum[:])[:8]
-	return "Claude Code-credentials-" + suffix
+	return PlainServiceName + "-" + suffix
 }
 
-// keychainCandidates returns the list of service names to try for an
-// account's config dir, in priority order. Two cases matter:
+// candidates returns the list of service names to try for an account's
+// config dir, in priority order. Two cases matter:
 //
 //   - default location (~/.claude): Claude Code stores the entry without
 //     any suffix, as plain "Claude Code-credentials".
@@ -61,23 +67,23 @@ func keychainServiceFor(configDir string) string {
 // We try the most likely match first so the common case doesn't trigger
 // an extra credential-store invocation (which can prompt for biometric
 // auth on macOS or unlock the keyring on Linux).
-func keychainCandidates(configDir string) []string {
+func candidates(configDir string) []string {
 	abs, err := filepath.Abs(configDir)
 	if err != nil {
 		abs = configDir
 	}
 	abs = strings.TrimRight(abs, `/\`)
-	defaultDir := defaultClaudeDir()
 
-	hashed := keychainServiceFor(configDir)
-	const plain = "Claude Code-credentials"
-
-	if abs == defaultDir {
-		return []string{plain, hashed}
+	hashed := ServiceFor(configDir)
+	if abs == defaultClaudeDir() {
+		return []string{PlainServiceName, hashed}
 	}
-	return []string{hashed, plain}
+	return []string{hashed, PlainServiceName}
 }
 
+// defaultClaudeDir is duplicated from internal/account so this package
+// stays a leaf — it's a 3-line helper, not worth a shared paths
+// package or a cross-package import.
 func defaultClaudeDir() string {
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -94,11 +100,11 @@ func defaultClaudeDir() string {
 // matches. Claude Code uses this plaintext file on Linux setups where
 // libsecret/Secret Service isn't reachable (headless boxes, CI, WSL).
 func LoadCredentials(configDir string) (*OAuthCreds, error) {
-	creds, err := loadCredsFromCandidates(keychainCandidates(configDir))
+	creds, err := loadFromCandidates(candidates(configDir))
 	if err == nil {
 		return creds, nil
 	}
-	if fileCreds, ferr := loadCredsFromFile(configDir); ferr == nil {
+	if fileCreds, ferr := loadFromFile(configDir); ferr == nil {
 		return fileCreds, nil
 	}
 	return nil, err
@@ -115,23 +121,22 @@ func LoadCredentials(configDir string) (*OAuthCreds, error) {
 // pre-park, or AutoSwap was just turned on), and finally to
 // <configDir>/.credentials.json for file-based storage.
 func LoadCredentialsHashedFirst(configDir string) (*OAuthCreds, error) {
-	hashed := keychainServiceFor(configDir)
-	const plain = "Claude Code-credentials"
-	creds, err := loadCredsFromCandidates([]string{hashed, plain})
+	hashed := ServiceFor(configDir)
+	creds, err := loadFromCandidates([]string{hashed, PlainServiceName})
 	if err == nil {
 		return creds, nil
 	}
-	if fileCreds, ferr := loadCredsFromFile(configDir); ferr == nil {
+	if fileCreds, ferr := loadFromFile(configDir); ferr == nil {
 		return fileCreds, nil
 	}
 	return nil, err
 }
 
-// loadCredsFromFile reads <configDir>/.credentials.json — Claude Code's
+// loadFromFile reads <configDir>/.credentials.json — Claude Code's
 // plaintext fallback when no Secret Service / Keychain backend is
 // available (common on Linux headless boxes, WSL, CI). The shape is the
 // same credsEnvelope JSON keytar serializes.
-func loadCredsFromFile(configDir string) (*OAuthCreds, error) {
+func loadFromFile(configDir string) (*OAuthCreds, error) {
 	p := filepath.Join(configDir, ".credentials.json")
 	data, err := os.ReadFile(p)
 	if err != nil {
@@ -147,25 +152,10 @@ func loadCredsFromFile(configDir string) (*OAuthCreds, error) {
 	return &env.ClaudeAiOauth, nil
 }
 
-// writeCredsToFile mirrors loadCredsFromFile for the swap write path.
-// Used as a fallback when WriteKeychainEntry can't reach a credential
-// store.
-func writeCredsToFile(configDir string, creds *OAuthCreds) error {
-	if err := os.MkdirAll(configDir, 0o700); err != nil {
-		return fmt.Errorf("mkdir %s: %w", configDir, err)
-	}
-	payload, err := json.MarshalIndent(credsEnvelope{ClaudeAiOauth: *creds}, "", "  ")
-	if err != nil {
-		return fmt.Errorf("encode credentials: %w", err)
-	}
-	p := filepath.Join(configDir, ".credentials.json")
-	return os.WriteFile(p, payload, 0o600)
-}
-
 // LoadCredentialsByService reads creds for an explicit service name.
-// Used by the swap module to read source creds (the target account's
-// hashed entry) and to inspect the plain "active slot" without going
-// through the configDir → service-name machinery.
+// Used by swap to read source creds (the target account's hashed
+// entry) and to inspect the plain "active slot" without going through
+// the configDir → service-name machinery.
 func LoadCredentialsByService(svc string) (*OAuthCreds, error) {
 	u, err := user.Current()
 	if err != nil {
@@ -174,7 +164,7 @@ func LoadCredentialsByService(svc string) (*OAuthCreds, error) {
 	return readKeychainEntry(u.Username, svc)
 }
 
-func loadCredsFromCandidates(svcs []string) (*OAuthCreds, error) {
+func loadFromCandidates(svcs []string) (*OAuthCreds, error) {
 	u, err := user.Current()
 	if err != nil {
 		return nil, fmt.Errorf("user lookup: %w", err)

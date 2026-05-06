@@ -1,4 +1,4 @@
-package main
+package api
 
 import (
 	"context"
@@ -35,11 +35,11 @@ type ExtraUsage struct {
 	Currency     *string  `json:"currency"`
 }
 
-// APIUsage is the parsed response from /api/oauth/usage.
+// Usage is the parsed response from /api/oauth/usage.
 // We model only the fields the official `/usage` slash command surfaces;
 // other fields (tangelo, iguana_necktie, omelette_promotional, ...) are
 // internal A/B-test buckets and intentionally ignored.
-type APIUsage struct {
+type Usage struct {
 	FiveHour       *Window     `json:"five_hour"`
 	SevenDay       *Window     `json:"seven_day"`
 	SevenDaySonnet *Window     `json:"seven_day_sonnet"`
@@ -60,7 +60,11 @@ func (e *RateLimitError) Error() string {
 	return fmt.Sprintf("rate limited (retry in %s)", e.RetryAfter.Round(time.Second))
 }
 
-func FetchUsage(ctx context.Context, token string) (*APIUsage, error) {
+// FetchUsage GETs /api/oauth/usage with the given OAuth bearer and
+// decodes the response. RateLimitError is surfaced for HTTP 429 so the
+// caller can apply per-account backoff; any other non-2xx is wrapped
+// with a preview of the response body for diagnosability.
+func FetchUsage(ctx context.Context, token string) (*Usage, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, usageEndpoint, nil)
 	if err != nil {
 		return nil, err
@@ -94,7 +98,7 @@ func FetchUsage(ctx context.Context, token string) (*APIUsage, error) {
 		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, preview)
 	}
 
-	var u APIUsage
+	var u Usage
 	if err := json.Unmarshal(body, &u); err != nil {
 		return nil, fmt.Errorf("decode response: %w", err)
 	}

@@ -194,11 +194,11 @@ claude-monitor --swap-to acc-be-2         # by short name
 claude-monitor --swap-to alice@corp.com   # or by email
 ```
 
-A sample slash command lives in [`commands/switch-account.md`](commands/switch-account.md). Drop it into your Claude Code commands dir:
+A sample slash command lives in [`examples/switch-account.md`](examples/switch-account.md). Drop it into your Claude Code commands dir:
 
 ```sh
 mkdir -p ~/.claude/commands
-cp commands/switch-account.md ~/.claude/commands/
+cp examples/switch-account.md ~/.claude/commands/
 ```
 
 Then in any Claude Code tab:
