@@ -28,17 +28,20 @@ type AccountUsage struct {
 	accessToken string // retained for the auto-kick pass; not exported
 }
 
-// FetchAll discovers accounts under root, queries /api/oauth/usage for each
-// in parallel, optionally kicks any account whose 5h window is at 0%, and
-// returns the table rows. It is the single data source the TUI calls on
-// every tick.
-func FetchAll(ctx context.Context, root string, autoKick bool) ([]AccountUsage, error) {
-	accts, err := discoverAccounts(root)
+// FetchAll resolves accounts according to rootSpec, queries
+// /api/oauth/usage for each in parallel, optionally kicks any account
+// whose 5h window is at 0%, and returns the table rows. It is the single
+// data source the TUI calls on every tick.
+func FetchAll(ctx context.Context, rootSpec string, autoKick bool) ([]AccountUsage, error) {
+	accts, err := ResolveAccountDirs(rootSpec)
 	if err != nil {
 		return nil, err
 	}
 	if len(accts) == 0 {
-		return nil, fmt.Errorf("no accounts found under %s", root)
+		if rootSpec == "" {
+			return nil, fmt.Errorf("no Claude config dirs found in $HOME (looked for ~/.claude*)")
+		}
+		return nil, fmt.Errorf("no accounts found under %s", rootSpec)
 	}
 
 	rows := make([]AccountUsage, len(accts))
@@ -100,28 +103,145 @@ type discoveredAccount struct {
 	email     string
 }
 
-func discoverAccounts(root string) ([]discoveredAccount, error) {
-	entries, err := os.ReadDir(root)
-	if err != nil {
-		return nil, err
+// ResolveAccountDirs interprets a --root spec into a deduped, sorted list
+// of accounts.
+//
+//   - empty string    → auto-discover every ~/.claude* directory in $HOME
+//     that looks like a Claude config dir, plus the
+//     subdirectories of ~/.claude-account if present.
+//   - comma-separated → each path may be a single Claude config dir
+//     (treated as one account) or a parent dir whose
+//     subdirectories are accounts.
+//
+// The function dedupes by canonical absolute path so that, e.g., a
+// symlink farm under ~/.claude-account doesn't double-count its targets.
+func ResolveAccountDirs(spec string) ([]discoveredAccount, error) {
+	var paths []string
+	if spec == "" {
+		var err error
+		paths, err = autoDiscoverPaths()
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		for _, p := range strings.Split(spec, ",") {
+			p = strings.TrimSpace(p)
+			if p == "" {
+				continue
+			}
+			paths = append(paths, expandHome(p))
+		}
 	}
+
+	seen := map[string]struct{}{}
 	var out []discoveredAccount
+	for _, p := range paths {
+		entries := expandRootPath(p)
+		for _, dir := range entries {
+			abs, err := filepath.Abs(dir)
+			if err != nil {
+				abs = dir
+			}
+			if resolved, err := filepath.EvalSymlinks(abs); err == nil {
+				abs = resolved
+			}
+			if _, dup := seen[abs]; dup {
+				continue
+			}
+			seen[abs] = struct{}{}
+			out = append(out, discoveredAccount{
+				name:      accountNameFor(abs),
+				configDir: abs,
+				email:     readAccountEmail(abs),
+			})
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].name < out[j].name })
+	return out, nil
+}
+
+// expandRootPath turns one user-supplied path into the list of actual
+// account config dirs it represents. If the path itself is a Claude
+// config dir, the path is returned as-is. Otherwise it is treated as a
+// parent and its immediate subdirectories are scanned.
+func expandRootPath(path string) []string {
+	if !dirExists(path) {
+		return nil
+	}
+	if looksLikeClaudeDir(path) {
+		return []string{path}
+	}
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		return nil
+	}
+	var out []string
 	for _, e := range entries {
 		if !e.IsDir() || strings.HasPrefix(e.Name(), ".") {
 			continue
 		}
-		dir := filepath.Join(root, e.Name())
-		if !looksLikeClaudeDir(dir) {
+		sub := filepath.Join(path, e.Name())
+		if looksLikeClaudeDir(sub) {
+			out = append(out, sub)
+		}
+	}
+	return out
+}
+
+// autoDiscoverPaths returns every ~/.claude* entry in $HOME that's a
+// directory. The caller decides whether each entry is a single account
+// or a parent — autoDiscover doesn't second-guess that.
+func autoDiscoverPaths() ([]string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil, err
+	}
+	entries, err := os.ReadDir(home)
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, e := range entries {
+		name := e.Name()
+		if !strings.HasPrefix(name, ".claude") {
 			continue
 		}
-		out = append(out, discoveredAccount{
-			name:      e.Name(),
-			configDir: dir,
-			email:     readAccountEmail(dir),
-		})
+		if !e.IsDir() {
+			// Skip files like .claude.json / .claude.json.backup.
+			continue
+		}
+		out = append(out, filepath.Join(home, name))
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].name < out[j].name })
 	return out, nil
+}
+
+// accountNameFor derives the display name for an account from its path.
+// Strip the leading dot so ".claude" reads as "claude" in the table.
+func accountNameFor(absPath string) string {
+	base := filepath.Base(absPath)
+	return strings.TrimPrefix(base, ".")
+}
+
+func expandHome(p string) string {
+	if !strings.HasPrefix(p, "~") {
+		return p
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return p
+	}
+	if p == "~" {
+		return home
+	}
+	if strings.HasPrefix(p, "~/") {
+		return filepath.Join(home, p[2:])
+	}
+	return p
+}
+
+func dirExists(p string) bool {
+	info, err := os.Stat(p)
+	return err == nil && info.IsDir()
 }
 
 func fetchOne(ctx context.Context, a discoveredAccount) AccountUsage {

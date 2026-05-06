@@ -23,15 +23,32 @@ A real-time terminal dashboard for **multiple Claude Code accounts at once**, sh
 
 ## Use case
 
-You run multiple Claude Code accounts in parallel via aliases:
+You run multiple Claude Code accounts in parallel — either as separate top-level config dirs (`~/.claude`, `~/.claude-gem`, …) or grouped under one parent (`~/.claude-account/be-1`, `~/.claude-account/be-2`, …). `claude-monitor` figures out which layout you're using:
 
 ```sh
-alias claude-acc-be-1="CLAUDE_CONFIG_DIR=~/.claude-account/acc-be-1 claude"
-alias claude-acc-be-2="CLAUDE_CONFIG_DIR=~/.claude-account/acc-be-2 claude"
-# ...
+# Layout A — top-level dirs in $HOME (no setup needed; auto-discovered):
+~/.claude/
+~/.claude-gem/
+~/.claude-work/
+
+# Layout B — one parent containing several account subdirs:
+~/.claude-account/be-1/
+~/.claude-account/be-2/
+~/.claude-account/data/
 ```
 
-`claude-monitor` scans every `~/.claude-account/*`, pulls each account's OAuth token from the macOS Keychain, calls Anthropic's `/api/oauth/usage` for each in parallel, and keeps a live dashboard updated on a tunable interval (default 60s).
+Pulls each account's OAuth token from the macOS Keychain, calls Anthropic's `/api/oauth/usage` for each in parallel, and keeps a live dashboard updated on a tunable interval (default 60s).
+
+### Account discovery
+
+| `--root` value             | Behaviour                                                                            |
+|----------------------------|--------------------------------------------------------------------------------------|
+| _(omitted)_                | Auto-discover every `~/.claude*` directory in `$HOME`.                               |
+| `~/.claude-account`        | Treat as a parent; each subdir that looks like a Claude config dir is one account.   |
+| `~/.claude,~/.claude-gem`  | Comma-separated list. Each item can be a single config dir OR a parent.              |
+| `~/work-claudes`           | Single path. Same single-vs-parent autodetection applies.                            |
+
+Paths are deduped by their resolved (symlink-followed) absolute path.
 
 ## Requirements
 
@@ -51,8 +68,9 @@ make install INSTALL_DIR=/usr/local/bin
 ## Run
 
 ```sh
-claude-monitor                       # full TUI, default settings
-claude-monitor --root ~/.cfg-dir     # different account root
+claude-monitor                                  # auto-discover ~/.claude* in $HOME
+claude-monitor --root ~/.claude-account         # single parent dir holding sub-accounts
+claude-monitor --root ~/.claude,~/.claude-gem   # comma-separated list of dirs
 claude-monitor --version
 ```
 
