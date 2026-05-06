@@ -11,9 +11,11 @@
 # Override with env vars:
 #   INSTALL_DIR=/usr/local/bin   SHELL_RC=~/.bashrc   sh install.sh
 #
-# Linux note: claude-monitor reads OAuth tokens via libsecret. If
-# `claude` itself works on your box, libsecret is already present;
-# otherwise install with `sudo apt install libsecret-tools` (Debian /
+# Linux note: claude-monitor reads OAuth tokens from whichever store
+# `claude` is using — libsecret (Secret Service) when available, or the
+# plaintext ~/.claude/.credentials.json fallback that `claude` writes on
+# headless / WSL / KDE-without-bridge setups. libsecret is recommended
+# but not required; install with `sudo apt install libsecret-tools` (Debian /
 # Ubuntu) or your distro's equivalent.
 #
 # Windows: use install.ps1 instead (PowerShell).
@@ -47,14 +49,14 @@ esac
 target="${os}-${arch}"
 
 # ---------- libsecret check (Linux) ----------
+# Optional: claude-monitor falls back to ~/.claude/.credentials.json
+# when libsecret isn't available, so this is just a heads-up.
 if [ "$os" = "linux" ] && ! command -v secret-tool >/dev/null 2>&1; then
-    red "✗ secret-tool not found"
-    echo "   claude-monitor needs libsecret to read tokens that 'claude' stores."
-    echo "   Install it first:"
+    echo "ℹ secret-tool (libsecret) not found — falling back to ~/.claude/.credentials.json."
+    echo "   If 'claude' uses the system keyring on this box, install libsecret for full feature parity:"
     echo "     Debian/Ubuntu: sudo apt install libsecret-tools"
     echo "     Fedora:        sudo dnf install libsecret"
     echo "     Arch:          sudo pacman -S libsecret"
-    exit 1
 fi
 
 # ---------- download ----------

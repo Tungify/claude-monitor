@@ -3,6 +3,7 @@ package main
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/user"
@@ -88,8 +89,19 @@ func defaultClaudeDir() string {
 // LoadCredentials reads + parses the credential-store entry for the
 // given account config dir. Returns an error when no candidate service
 // name matched — callers should treat that as "not authenticated".
+//
+// Falls back to <configDir>/.credentials.json when no keychain entry
+// matches. Claude Code uses this plaintext file on Linux setups where
+// libsecret/Secret Service isn't reachable (headless boxes, CI, WSL).
 func LoadCredentials(configDir string) (*OAuthCreds, error) {
-	return loadCredsFromCandidates(keychainCandidates(configDir))
+	creds, err := loadCredsFromCandidates(keychainCandidates(configDir))
+	if err == nil {
+		return creds, nil
+	}
+	if fileCreds, ferr := loadCredsFromFile(configDir); ferr == nil {
+		return fileCreds, nil
+	}
+	return nil, err
 }
 
 // LoadCredentialsHashedFirst is the variant used by the monitor when
@@ -100,11 +112,54 @@ func LoadCredentials(configDir string) (*OAuthCreds, error) {
 // dashboard row pointing at the original account's parked credentials.
 //
 // Falls back to plain when the hashed entry doesn't exist (clean install
-// pre-park, or AutoSwap was just turned on).
+// pre-park, or AutoSwap was just turned on), and finally to
+// <configDir>/.credentials.json for file-based storage.
 func LoadCredentialsHashedFirst(configDir string) (*OAuthCreds, error) {
 	hashed := keychainServiceFor(configDir)
 	const plain = "Claude Code-credentials"
-	return loadCredsFromCandidates([]string{hashed, plain})
+	creds, err := loadCredsFromCandidates([]string{hashed, plain})
+	if err == nil {
+		return creds, nil
+	}
+	if fileCreds, ferr := loadCredsFromFile(configDir); ferr == nil {
+		return fileCreds, nil
+	}
+	return nil, err
+}
+
+// loadCredsFromFile reads <configDir>/.credentials.json — Claude Code's
+// plaintext fallback when no Secret Service / Keychain backend is
+// available (common on Linux headless boxes, WSL, CI). The shape is the
+// same credsEnvelope JSON keytar serializes.
+func loadCredsFromFile(configDir string) (*OAuthCreds, error) {
+	p := filepath.Join(configDir, ".credentials.json")
+	data, err := os.ReadFile(p)
+	if err != nil {
+		return nil, err
+	}
+	var env credsEnvelope
+	if err := json.Unmarshal(data, &env); err != nil {
+		return nil, fmt.Errorf("decode %s: %w", p, err)
+	}
+	if env.ClaudeAiOauth.AccessToken == "" {
+		return nil, fmt.Errorf("no access token in %s", p)
+	}
+	return &env.ClaudeAiOauth, nil
+}
+
+// writeCredsToFile mirrors loadCredsFromFile for the swap write path.
+// Used as a fallback when WriteKeychainEntry can't reach a credential
+// store.
+func writeCredsToFile(configDir string, creds *OAuthCreds) error {
+	if err := os.MkdirAll(configDir, 0o700); err != nil {
+		return fmt.Errorf("mkdir %s: %w", configDir, err)
+	}
+	payload, err := json.MarshalIndent(credsEnvelope{ClaudeAiOauth: *creds}, "", "  ")
+	if err != nil {
+		return fmt.Errorf("encode credentials: %w", err)
+	}
+	p := filepath.Join(configDir, ".credentials.json")
+	return os.WriteFile(p, payload, 0o600)
 }
 
 // LoadCredentialsByService reads creds for an explicit service name.
