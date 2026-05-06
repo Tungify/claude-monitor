@@ -45,6 +45,12 @@ type model struct {
 	lastRefresh time.Time
 	refreshing  bool
 
+	// backoff[configDir] is the earliest moment at which we'll call the
+	// API for that account again. Populated when an account hits HTTP
+	// 429 and cleared once the window expires (lazily, on next refresh)
+	// or when the user presses 'R' to force a retry.
+	backoff map[string]time.Time
+
 	// inflight is incremented every time we issue a refreshCmd and
 	// compared against the version embedded in the resulting refreshMsg
 	// — a stale result from a previous tick is discarded if a newer
@@ -68,6 +74,7 @@ func initialModel(root string, cfg Config) model {
 		showHelp:   true,
 		inflight:   1,
 		refreshing: true,
+		backoff:    map[string]time.Time{},
 	}
 }
 
@@ -85,10 +92,16 @@ func (m model) Init() tea.Cmd {
 func (m *model) refreshCmd(version uint64) tea.Cmd {
 	root := m.root
 	autoKick := m.cfg.AutoKick
+	// Snapshot the backoff map so the goroutine has a stable view, even
+	// if the user presses 'R' (which mutates m.backoff) while in flight.
+	skipUntil := make(map[string]time.Time, len(m.backoff))
+	for k, v := range m.backoff {
+		skipUntil[k] = v
+	}
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		rows, err := FetchAll(ctx, root, autoKick)
+		rows, err := FetchAll(ctx, root, autoKick, skipUntil)
 		return refreshMsg{rows: rows, err: err, at: time.Now(), version: version}
 	}
 }
@@ -141,6 +154,21 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.rows = msg.rows
 		m.err = msg.err
 		m.lastRefresh = msg.at
+		// Update backoff state from the row results: 429 errors
+		// arm/extend the window, while a successful row clears any
+		// pre-existing backoff for that account (recovery path).
+		for _, r := range msg.rows {
+			if r.ConfigDir == "" {
+				continue
+			}
+			if rl, ok := r.Err.(*RateLimitError); ok {
+				m.backoff[r.ConfigDir] = time.Now().Add(rl.RetryAfter)
+				continue
+			}
+			if r.Err == nil && r.Usage != nil {
+				delete(m.backoff, r.ConfigDir)
+			}
+		}
 		return m, nil
 
 	case flashClearMsg:
@@ -170,6 +198,22 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, tea.Batch(
 			m.refreshCmd(m.inflight),
 			flashClearCmd(800*time.Millisecond),
+		)
+
+	case "R":
+		// Capital R: ignore backoff and force-retry every account. Use
+		// when you've manually waited out a 429 and don't want to wait
+		// for the cached window to expire.
+		for k := range m.backoff {
+			delete(m.backoff, k)
+		}
+		m.refreshing = true
+		m.inflight++
+		m.flash = "force refresh (cleared backoff)"
+		m.flashExpiry = time.Now().Add(2 * time.Second)
+		return m, tea.Batch(
+			m.refreshCmd(m.inflight),
+			flashClearCmd(2*time.Second),
 		)
 
 	case "k":
@@ -342,6 +386,7 @@ func (m model) helpBar(st styles) string {
 		fmt.Sprintf("%s color: %s", st.key.Render("[c]"), boolBadge(st, m.cfg.Color)),
 		fmt.Sprintf("%s interval: %s", st.key.Render("[+/-]"), st.value.Render(fmtInterval(m.cfg.IntervalSeconds))),
 		st.key.Render("[r]") + " refresh",
+		st.key.Render("[R]") + " force (clear backoff)",
 		st.key.Render("[?]") + " toggle help",
 		st.key.Render("[q]") + " quit",
 	}

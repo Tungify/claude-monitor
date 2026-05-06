@@ -32,7 +32,11 @@ type AccountUsage struct {
 // /api/oauth/usage for each in parallel, optionally kicks any account
 // whose 5h window is at 0%, and returns the table rows. It is the single
 // data source the TUI calls on every tick.
-func FetchAll(ctx context.Context, rootSpec string, autoKick bool) ([]AccountUsage, error) {
+//
+// skipUntil maps a config dir to a "do not call API before" timestamp;
+// accounts in the backoff window get a synthetic row reflecting the
+// remaining wait, so the UI keeps showing them but no request goes out.
+func FetchAll(ctx context.Context, rootSpec string, autoKick bool, skipUntil map[string]time.Time) ([]AccountUsage, error) {
 	accts, err := ResolveAccountDirs(rootSpec)
 	if err != nil {
 		return nil, err
@@ -44,10 +48,20 @@ func FetchAll(ctx context.Context, rootSpec string, autoKick bool) ([]AccountUsa
 		return nil, fmt.Errorf("no accounts found under %s", rootSpec)
 	}
 
+	now := time.Now()
 	rows := make([]AccountUsage, len(accts))
 	var wg sync.WaitGroup
 	for i, a := range accts {
 		i, a := i, a
+		if t, ok := skipUntil[a.configDir]; ok && now.Before(t) {
+			rows[i] = AccountUsage{
+				Name:      a.name,
+				ConfigDir: a.configDir,
+				Email:     a.email,
+				Err:       fmt.Errorf("rate limited (retry in %s)", time.Until(t).Round(time.Second)),
+			}
+			continue
+		}
 		wg.Add(1)
 		go func() {
 			defer wg.Done()

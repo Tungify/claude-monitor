@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"time"
 )
 
@@ -46,6 +47,19 @@ type APIUsage struct {
 	ExtraUsage     *ExtraUsage `json:"extra_usage"`
 }
 
+// RateLimitError is returned by FetchUsage when the server responds with
+// HTTP 429. RetryAfter is the parsed Retry-After header (or a sane
+// default when the header is missing/malformed) so callers can apply
+// per-account backoff instead of hammering the API.
+type RateLimitError struct {
+	RetryAfter time.Duration
+	Body       string
+}
+
+func (e *RateLimitError) Error() string {
+	return fmt.Sprintf("rate limited (retry in %s)", e.RetryAfter.Round(time.Second))
+}
+
 func FetchUsage(ctx context.Context, token string) (*APIUsage, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, usageEndpoint, nil)
 	if err != nil {
@@ -64,6 +78,12 @@ func FetchUsage(ctx context.Context, token string) (*APIUsage, error) {
 	defer resp.Body.Close()
 
 	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode == http.StatusTooManyRequests {
+		return nil, &RateLimitError{
+			RetryAfter: parseRetryAfter(resp.Header.Get("Retry-After"), 60*time.Second),
+			Body:       string(body),
+		}
+	}
 	if resp.StatusCode != http.StatusOK {
 		// Trim the response so a stray HTML page from a misroute doesn't
 		// flood stderr in the table.
@@ -79,4 +99,23 @@ func FetchUsage(ctx context.Context, token string) (*APIUsage, error) {
 		return nil, fmt.Errorf("decode response: %w", err)
 	}
 	return &u, nil
+}
+
+// parseRetryAfter handles both numeric (seconds) and HTTP-date forms of
+// the Retry-After header. Anthropic generally sends seconds, but spec
+// allows either. Falls back to def when the header is missing or
+// unparseable.
+func parseRetryAfter(h string, def time.Duration) time.Duration {
+	if h == "" {
+		return def
+	}
+	if secs, err := strconv.Atoi(h); err == nil && secs > 0 {
+		return time.Duration(secs) * time.Second
+	}
+	if t, err := http.ParseTime(h); err == nil {
+		if d := time.Until(t); d > 0 {
+			return d
+		}
+	}
+	return def
 }
