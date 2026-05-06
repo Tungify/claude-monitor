@@ -85,6 +85,7 @@ claude-monitor --root ~/.claude-account         # parent dir holding sub-account
 claude-monitor --root ~/.claude,~/.claude-gem   # comma-separated list
 claude-monitor --list-accounts                  # print accounts and exit (CLI mode)
 claude-monitor --swap-to acc-be-2               # rewrite the keychain slot and exit
+claude-monitor --keychain-setup                 # macOS: silence per-swap password prompts
 claude-monitor --version
 ```
 
@@ -168,6 +169,20 @@ The picked account becomes a **pin** (`★` turns blue, `📌 pin: <name>` shows
 - The threshold cascade still applies — when the pinned account hits 90% (or whatever your lowest threshold is), auto-swap takes over and rotates to a fresh candidate. The pin clears the moment auto-swap moves the active dir.
 
 In other words: "use this account until the next threshold."
+
+### macOS keychain setup (silence the password prompt)
+
+On macOS 10.13+, every keychain modification prompts for your user password unless the calling binary's code-signing identity is in the entry's *partition list*. claude-monitor is ad-hoc signed (no team ID), so without setup it triggers a dialog on every swap.
+
+The first time you run claude-monitor it prompts once for your macOS user password and registers itself in each Claude Code keychain entry's partition list. After that all swaps stay silent. Skip with Enter; rerun later via:
+
+```sh
+claude-monitor --keychain-setup
+```
+
+The password is passed to the system `security` CLI via the `-k` flag (so each `set-generic-password-partition-list` call doesn't itself prompt) and is never stored. It's visible in `ps aux` for the few milliseconds the command runs — fine on a single-user laptop, weak on a shared host.
+
+If you add a new account later, that account's hashed entry won't be in the partition list yet. Rerun `--keychain-setup` to register it.
 
 ### From a `claude` slash command
 

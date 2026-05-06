@@ -22,6 +22,10 @@ var (
 			"Lets a `/switch-account` slash command flip the running `claude` tab to a different account.")
 	flagListAccounts = flag.Bool("list-accounts", false,
 		"Print discovered accounts (name, email, 5h utilization, active marker) and exit.")
+	flagKeychainSetup = flag.Bool("keychain-setup", false,
+		"Re-register claude-monitor with the macOS keychain so account swaps don't prompt for "+
+			"a password every time. Asks for your macOS user password once (not stored). "+
+			"No-op on Linux/Windows.")
 )
 
 // version is wired by ldflags via the Makefile.
@@ -65,11 +69,33 @@ func main() {
 		return
 	}
 
+	cfg, _ := LoadConfig() // missing/corrupt → defaults; not fatal
+
+	if *flagKeychainSetup {
+		if err := RunKeychainSetup(*flagRoot); err != nil {
+			die("%v", err)
+		}
+		cfg.KeychainSetupDone = true
+		_ = SaveConfig(cfg)
+		return
+	}
+
 	// Clean up <exe>.old / <exe>.new from prior upgrades — Windows
 	// can't remove them while the running process holds them.
 	cleanupStaleUpgradeArtifacts()
 
-	cfg, _ := LoadConfig() // missing/corrupt → defaults; not fatal
+	// One-shot keychain registration on the first launch so future
+	// swaps don't pop a password prompt every time. RunKeychainSetup
+	// is a no-op on Linux/Windows (no partition list to update) and
+	// short-circuits on darwin if stdin isn't a TTY or there are no
+	// accounts yet. We always set the flag afterwards, even on
+	// skip/failure, so the user isn't re-prompted on every launch —
+	// they can rerun the bootstrap explicitly via --keychain-setup.
+	if !cfg.KeychainSetupDone {
+		_ = RunKeychainSetup(*flagRoot)
+		cfg.KeychainSetupDone = true
+		_ = SaveConfig(cfg)
+	}
 
 	p := tea.NewProgram(initialModel(*flagRoot, cfg), tea.WithAltScreen())
 	final, err := p.Run()

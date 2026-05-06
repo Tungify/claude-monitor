@@ -38,6 +38,14 @@ type Config struct {
 	// between refreshes). Independent of the threshold cascade —
 	// fires even when active is well below 90%.
 	RebalanceOnReset bool `json:"rebalanceOnReset"`
+
+	// KeychainSetupDone is set after the macOS one-shot bootstrap
+	// (RunKeychainSetup) has registered the `security` CLI in each
+	// Claude Code keychain entry's partition list. Until it's true
+	// we prompt the user once on launch to enter their macOS
+	// password so future swaps stay silent. Always true on
+	// non-darwin platforms (no partition list there).
+	KeychainSetupDone bool `json:"keychainSetupDone"`
 }
 
 const (
