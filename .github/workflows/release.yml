@@ -6,44 +6,103 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Tag name to (re)build, e.g. v0.1.0'
+        description: 'Tag name to (re)build, e.g. v0.1.2'
         required: true
 
 permissions:
   contents: write
 
 jobs:
-  release:
+  # darwin builds need a macOS runner so we can ad-hoc codesign with
+  # the system codesign tool. linux/windows builds cross-compile fine
+  # from ubuntu and don't need any post-processing.
+  build-darwin:
     runs-on: macos-latest
+    strategy:
+      matrix:
+        arch: [amd64, arm64]
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-go@v5
         with:
           go-version: '1.24'
           check-latest: true
-
-      - name: Build darwin binaries
+      - name: Build
         run: |
           set -eu
           version="${GITHUB_REF_NAME:-${{ github.event.inputs.tag }}}"
-          for arch in amd64 arm64; do
-            out="claude-monitor-darwin-${arch}"
-            echo "building ${out} (${version})"
-            GOOS=darwin GOARCH="${arch}" CGO_ENABLED=1 go build \
-              -ldflags "-X main.version=${version} -linkmode=external" \
-              -o "${out}" ./...
-            codesign -f -s - "${out}"
-          done
-          shasum -a 256 claude-monitor-darwin-* > checksums.txt
-          cat checksums.txt
+          out="claude-monitor-darwin-${{ matrix.arch }}"
+          GOOS=darwin GOARCH=${{ matrix.arch }} CGO_ENABLED=1 go build \
+            -ldflags "-X main.version=${version} -linkmode=external" \
+            -o "${out}" ./...
+          codesign -f -s - "${out}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bin-darwin-${{ matrix.arch }}
+          path: claude-monitor-darwin-${{ matrix.arch }}
+          if-no-files-found: error
 
+  build-cross:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+            ext: ''
+          - goos: linux
+            goarch: arm64
+            ext: ''
+          - goos: windows
+            goarch: amd64
+            ext: '.exe'
+          - goos: windows
+            goarch: arm64
+            ext: '.exe'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+          check-latest: true
+      - name: Build
+        run: |
+          set -eu
+          version="${GITHUB_REF_NAME:-${{ github.event.inputs.tag }}}"
+          out="claude-monitor-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}"
+          GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} CGO_ENABLED=0 go build \
+            -ldflags "-X main.version=${version}" \
+            -o "${out}" ./...
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bin-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: claude-monitor-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}
+          if-no-files-found: error
+
+  release:
+    needs: [build-darwin, build-cross]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Generate checksums
+        working-directory: dist
+        run: |
+          ls -la
+          shasum -a 256 claude-monitor-* > checksums.txt
+          cat checksums.txt
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.event.inputs.tag || github.ref_name }}
           generate_release_notes: true
           files: |
-            claude-monitor-darwin-amd64
-            claude-monitor-darwin-arm64
-            checksums.txt
+            dist/claude-monitor-darwin-amd64
+            dist/claude-monitor-darwin-arm64
+            dist/claude-monitor-linux-amd64
+            dist/claude-monitor-linux-arm64
+            dist/claude-monitor-windows-amd64.exe
+            dist/claude-monitor-windows-arm64.exe
+            dist/checksums.txt

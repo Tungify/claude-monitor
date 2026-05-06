@@ -3,10 +3,8 @@ package main
 import (
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"os"
-	"os/exec"
 	"os/user"
 	"path/filepath"
 	"strings"
@@ -14,7 +12,7 @@ import (
 )
 
 // OAuthCreds is the inner shape Claude Code stores under
-// "Claude Code-credentials[-<hash>]" in the macOS keychain.
+// "Claude Code-credentials[-<hash>]" in the OS credential store.
 type OAuthCreds struct {
 	AccessToken      string   `json:"accessToken"`
 	RefreshToken     string   `json:"refreshToken"`
@@ -34,23 +32,25 @@ type credsEnvelope struct {
 	ClaudeAiOauth OAuthCreds `json:"claudeAiOauth"`
 }
 
-// keychainServiceFor mirrors Claude Code's Py("-credentials") helper:
-// when CLAUDE_CONFIG_DIR is set, the service name carries an 8-char
-// sha256 suffix derived from the absolute config dir path.
+// keychainServiceFor mirrors keytar's service-name convention used by
+// Claude Code: when CLAUDE_CONFIG_DIR is set, the entry name carries an
+// 8-char sha256 suffix derived from the absolute config dir path. The
+// hash is identical across OSes because we normalize the path string
+// the same way Claude Code does (absolute, native separators, no
+// trailing separator).
 func keychainServiceFor(configDir string) string {
 	abs, err := filepath.Abs(configDir)
 	if err != nil {
 		abs = configDir
 	}
-	abs = strings.TrimRight(abs, "/")
+	abs = strings.TrimRight(abs, `/\`)
 	sum := sha256.Sum256([]byte(abs))
 	suffix := hex.EncodeToString(sum[:])[:8]
 	return "Claude Code-credentials-" + suffix
 }
 
 // keychainCandidates returns the list of service names to try for an
-// account's config dir, in priority order. The first that resolves is
-// the one we use. Two cases matter:
+// account's config dir, in priority order. Two cases matter:
 //
 //   - default location (~/.claude): Claude Code stores the entry without
 //     any suffix, as plain "Claude Code-credentials".
@@ -58,13 +58,14 @@ func keychainServiceFor(configDir string) string {
 //     the entry carries the 8-hex sha256 suffix.
 //
 // We try the most likely match first so the common case doesn't trigger
-// an extra `security` invocation (which can prompt for Touch ID).
+// an extra credential-store invocation (which can prompt for biometric
+// auth on macOS or unlock the keyring on Linux).
 func keychainCandidates(configDir string) []string {
 	abs, err := filepath.Abs(configDir)
 	if err != nil {
 		abs = configDir
 	}
-	abs = strings.TrimRight(abs, "/")
+	abs = strings.TrimRight(abs, `/\`)
 	defaultDir := defaultClaudeDir()
 
 	hashed := keychainServiceFor(configDir)
@@ -84,9 +85,9 @@ func defaultClaudeDir() string {
 	return filepath.Join(home, ".claude")
 }
 
-// LoadCredentials reads + parses the keychain entry for the given
-// account config dir. Returns an error when no candidate service name
-// matched — callers should treat that as "not authenticated".
+// LoadCredentials reads + parses the credential-store entry for the
+// given account config dir. Returns an error when no candidate service
+// name matched — callers should treat that as "not authenticated".
 func LoadCredentials(configDir string) (*OAuthCreds, error) {
 	return loadCredsFromCandidates(keychainCandidates(configDir))
 }
@@ -132,50 +133,4 @@ func loadCredsFromCandidates(svcs []string) (*OAuthCreds, error) {
 		lastErr = err
 	}
 	return nil, lastErr
-}
-
-func readKeychainEntry(username, svc string) (*OAuthCreds, error) {
-	cmd := exec.Command("security", "find-generic-password", "-s", svc, "-a", username, "-w")
-	out, err := cmd.Output()
-	if err != nil {
-		return nil, fmt.Errorf("keychain read %q: %w", svc, err)
-	}
-	var env credsEnvelope
-	if err := json.Unmarshal(out, &env); err != nil {
-		return nil, fmt.Errorf("decode credentials: %w", err)
-	}
-	if env.ClaudeAiOauth.AccessToken == "" {
-		return nil, fmt.Errorf("no access token in keychain entry %q", svc)
-	}
-	return &env.ClaudeAiOauth, nil
-}
-
-// WriteKeychainEntry creates or updates a generic-password entry holding
-// the OAuth creds envelope Claude Code expects. -U makes the call
-// idempotent (update existing, create when missing); -A grants access to
-// any application without prompting, which mirrors how Claude Code's own
-// installer registers its entries — without it, the `claude` binary
-// would hit a Touch ID / "allow access" dialog on every read after we
-// rewrite the entry.
-func WriteKeychainEntry(svc string, creds *OAuthCreds) error {
-	u, err := user.Current()
-	if err != nil {
-		return fmt.Errorf("user lookup: %w", err)
-	}
-	payload, err := json.Marshal(credsEnvelope{ClaudeAiOauth: *creds})
-	if err != nil {
-		return fmt.Errorf("encode credentials: %w", err)
-	}
-	cmd := exec.Command("security", "add-generic-password",
-		"-U",
-		"-A",
-		"-s", svc,
-		"-a", u.Username,
-		"-w", string(payload),
-	)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("keychain write %q: %w (%s)", svc, err, strings.TrimSpace(string(out)))
-	}
-	return nil
 }

@@ -23,20 +23,40 @@ Real-time terminal dashboard for **multiple Claude Code accounts**, backed by th
 
 ## Requirements
 
-- **macOS** — uses the `security` CLI to read the Keychain
-- Each account must have logged in once (`CLAUDE_CONFIG_DIR=… claude`) so its OAuth token is in the Keychain
+claude-monitor reads OAuth tokens from the same OS credential store Claude Code writes them to via [keytar](https://github.com/atom/node-keytar):
+
+| OS          | Backend                                                                              | Extra deps                                                             |
+|-------------|--------------------------------------------------------------------------------------|------------------------------------------------------------------------|
+| **macOS**   | Keychain Services (via the `security` CLI)                                           | none                                                                   |
+| **Linux**   | Secret Service API / libsecret (via `secret-tool`)                                   | `libsecret-tools` + a running keyring (gnome-keyring on most desktops) |
+| **Windows** | Windows Credential Manager (via [`wincred`](https://github.com/danieljoos/wincred))  | none                                                                   |
+
+Each account must have logged in once (`CLAUDE_CONFIG_DIR=… claude`) so its OAuth token is stored — claude-monitor only reads.
 
 ## Install
+
+**macOS / Linux:**
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/Tungify/claude-monitor/main/install.sh | sh
 ```
 
-Downloads the latest pre-built binary into `~/.local/bin/claude-monitor`, ad-hoc codesigns it, and adds the dir to your `~/.zshrc` if it isn't on `PATH` yet. Override with env vars:
+**Windows (PowerShell):**
+
+```powershell
+irm https://raw.githubusercontent.com/Tungify/claude-monitor/main/install.ps1 | iex
+```
+
+Both installers download the latest pre-built binary, drop it into `~/.local/bin/claude-monitor` (or `$HOME\.local\bin\claude-monitor.exe` on Windows), and prepend that directory to your shell's `PATH`. Override with env vars:
 
 ```sh
 INSTALL_DIR=/usr/local/bin SHELL_RC=~/.bashrc \
   sh -c "$(curl -fsSL https://raw.githubusercontent.com/Tungify/claude-monitor/main/install.sh)"
+```
+
+```powershell
+$env:INSTALL_DIR = 'C:\tools\claude-monitor'
+irm https://raw.githubusercontent.com/Tungify/claude-monitor/main/install.ps1 | iex
 ```
 
 ### Build from source
@@ -158,16 +178,20 @@ Refresh interval is fixed at 60s (the safe lower bound against rate-limiting on 
 ## Source layout
 
 ```
-main.go      flag parsing, bubbletea bootstrap
-tui.go       Model / Update / View, lipgloss styles, hotkeys
-editor.go    [e] settings form
-config.go    ~/.claude-monitor/config.json load/save
-snapshot.go  account discovery + parallel fetch + auto-kick pass
-swap.go      threshold cascade, reset rebalance, keychain-slot rotation
-api.go       /api/oauth/usage HTTP client + decoder
-keychain.go  service-name hashing → security CLI → OAuth creds
-kick.go      POST /v1/messages with the account's OAuth token
-format.go    string helpers (truncate, padRight, visibleLen)
+main.go              flag parsing, bubbletea bootstrap
+tui.go               Model / Update / View, lipgloss styles, hotkeys
+editor.go            [e] settings form
+config.go            ~/.claude-monitor/config.json load/save
+snapshot.go          account discovery + parallel fetch + auto-kick pass
+swap.go              threshold cascade, reset rebalance, keychain-slot rotation
+api.go               /api/oauth/usage HTTP client + decoder
+update.go            GitHub Releases check + atomic self-replace
+keychain.go          cross-platform: service-name hashing, candidate ordering
+keychain_darwin.go   macOS: shell out to `security`
+keychain_linux.go    Linux: shell out to `secret-tool` (libsecret)
+keychain_windows.go  Windows: wincred (Credential Manager) via syscall
+kick.go              POST /v1/messages with the account's OAuth token
+format.go            string helpers (truncate, padRight, visibleLen)
 ```
 
 ## Make targets
@@ -183,13 +207,13 @@ format.go    string helpers (truncate, padRight, visibleLen)
 
 ## Security
 
-Tokens are read from the Keychain via the `security` CLI on every refresh and sent only over HTTPS to `api.anthropic.com`. Nothing is logged, cached, or transmitted elsewhere. macOS may prompt for Touch ID or a password depending on the entry's ACL.
+Tokens are read from the OS credential store on every refresh and sent only over HTTPS to `api.anthropic.com`. Nothing is logged, cached, or transmitted elsewhere. The first read may surface a system prompt: Touch ID / "always allow" on macOS, the keyring unlock dialog on Linux, or a UAC banner on Windows depending on policy.
 
 `/api/oauth/usage` is internal to Claude Code (not in Anthropic's public docs); its format may change without notice. To debug if it breaks: `claude --debug api 2> log && grep oauth/usage log`.
 
 ## Limitations
 
-- **macOS only** — depends on the `security` CLI. Linux would need libsecret/D-Bus.
 - **Undocumented endpoint** — `/api/oauth/usage` may change without notice.
 - **No automatic OAuth refresh** — when a token expires, run `CLAUDE_CONFIG_DIR=… claude` once.
 - **OAuth disabled for org** — returns 403; that account must use an API key.
+- **Linux**: requires libsecret + a running keyring daemon. Headless servers without a Secret Service don't work yet.

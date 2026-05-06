@@ -1,15 +1,22 @@
 #!/bin/sh
 #
-# claude-monitor installer
-# ------------------------
+# claude-monitor installer (macOS + Linux)
+# ----------------------------------------
 #   curl -fsSL https://raw.githubusercontent.com/Tungify/claude-monitor/main/install.sh | sh
 #
-# Downloads the latest pre-built binary for your arch, drops it into
-# $INSTALL_DIR (default ~/.local/bin), ad-hoc codesigns it, and ensures
-# the dir is on PATH via $SHELL_RC (default ~/.zshrc).
+# Downloads the latest pre-built binary for your OS/arch, drops it into
+# $INSTALL_DIR (default ~/.local/bin), ad-hoc codesigns it on macOS, and
+# ensures the dir is on PATH via $SHELL_RC (default ~/.zshrc).
 #
 # Override with env vars:
 #   INSTALL_DIR=/usr/local/bin   SHELL_RC=~/.bashrc   sh install.sh
+#
+# Linux note: claude-monitor reads OAuth tokens via libsecret. If
+# `claude` itself works on your box, libsecret is already present;
+# otherwise install with `sudo apt install libsecret-tools` (Debian /
+# Ubuntu) or your distro's equivalent.
+#
+# Windows: use install.ps1 instead (PowerShell).
 #
 set -eu
 
@@ -23,14 +30,32 @@ green() { printf '\033[0;32m%s\033[0m\n' "$*"; }
 blue()  { printf '\033[0;34m%s\033[0m\n' "$*"; }
 die()   { red "✗ $*" >&2; exit 1; }
 
-# ---------- platform check ----------
-[ "$(uname -s)" = "Darwin" ] || die "macOS only — depends on the 'security' Keychain CLI."
+# ---------- platform detection ----------
+case "$(uname -s)" in
+    Darwin) os="darwin" ;;
+    Linux)  os="linux"  ;;
+    MINGW*|MSYS*|CYGWIN*) die "Windows detected — use install.ps1 from PowerShell." ;;
+    *) die "unsupported OS: $(uname -s)" ;;
+esac
 
 case "$(uname -m)" in
-    arm64|aarch64)  target="darwin-arm64" ;;
-    x86_64)         target="darwin-amd64" ;;
+    arm64|aarch64)  arch="arm64" ;;
+    x86_64|amd64)   arch="amd64" ;;
     *)              die "unsupported architecture: $(uname -m)" ;;
 esac
+
+target="${os}-${arch}"
+
+# ---------- libsecret check (Linux) ----------
+if [ "$os" = "linux" ] && ! command -v secret-tool >/dev/null 2>&1; then
+    red "✗ secret-tool not found"
+    echo "   claude-monitor needs libsecret to read tokens that 'claude' stores."
+    echo "   Install it first:"
+    echo "     Debian/Ubuntu: sudo apt install libsecret-tools"
+    echo "     Fedora:        sudo dnf install libsecret"
+    echo "     Arch:          sudo pacman -S libsecret"
+    exit 1
+fi
 
 # ---------- download ----------
 url="https://github.com/$REPO/releases/latest/download/$BINARY-$target"
@@ -43,8 +68,12 @@ if ! curl -fL --progress-bar -o "$dest" "$url"; then
 fi
 
 chmod +x "$dest"
-xattr -d com.apple.quarantine "$dest" 2>/dev/null || true
-codesign -f -s - "$dest" >/dev/null 2>&1 || true
+
+if [ "$os" = "darwin" ]; then
+    xattr -d com.apple.quarantine "$dest" 2>/dev/null || true
+    codesign -f -s - "$dest" >/dev/null 2>&1 || true
+fi
+
 green "✓ installed $dest"
 
 # ---------- PATH wiring ----------

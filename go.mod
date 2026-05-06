@@ -5,6 +5,7 @@ go 1.24.0
 require (
 	github.com/charmbracelet/bubbletea v1.3.10
 	github.com/charmbracelet/lipgloss v1.1.0
+	github.com/danieljoos/wincred v1.2.3
 )
 
 require (

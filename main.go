@@ -46,6 +46,10 @@ func main() {
 		return
 	}
 
+	// Clean up <exe>.old / <exe>.new from prior upgrades — Windows
+	// can't remove them while the running process holds them.
+	cleanupStaleUpgradeArtifacts()
+
 	cfg, _ := LoadConfig() // missing/corrupt → defaults; not fatal
 
 	p := tea.NewProgram(initialModel(*flagRoot, cfg), tea.WithAltScreen())
