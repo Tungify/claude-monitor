@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"errors"
 	"fmt"
 	"time"
 
@@ -97,12 +98,32 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if r.ConfigDir == "" {
 				continue
 			}
-			if rl, ok := r.Err.(*api.RateLimitError); ok {
-				m.backoff[r.ConfigDir] = time.Now().Add(rl.RetryAfter)
+			var rl *api.RateLimitError
+			if errors.As(r.Err, &rl) {
+				// Refresh-source 429s self-throttle via the api package's
+				// circuit breaker — they must NOT arm m.backoff. If we
+				// did, the next tick's pre-skip in snapshot.go would
+				// also skip FetchUsage, leaving the row stuck at "rate
+				// limited" even after another process (Claude Code,
+				// `claude auth login`, etc.) refreshes the token in the
+				// keychain. With the breaker handling refresh
+				// throttling, we just need fetchOne to re-run next
+				// tick: it'll see fresh creds and call FetchUsage.
+				//
+				// We still record the deadline in refreshBackoff so the
+				// renderer can tick "retry in Xs" down each second
+				// instead of freezing at the value captured by the
+				// last FetchAll.
+				if rl.Source == "refresh" {
+					m.refreshBackoff[r.ConfigDir] = time.Now().Add(rl.RetryAfter)
+				} else {
+					m.backoff[r.ConfigDir] = time.Now().Add(rl.RetryAfter)
+				}
 				continue
 			}
 			if r.Err == nil && r.Usage != nil {
 				delete(m.backoff, r.ConfigDir)
+				delete(m.refreshBackoff, r.ConfigDir)
 				next[r.ConfigDir] = account.FiveHourUtil(r.Usage)
 			}
 		}

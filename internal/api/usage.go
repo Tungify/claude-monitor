@@ -47,16 +47,34 @@ type Usage struct {
 	ExtraUsage     *ExtraUsage `json:"extra_usage"`
 }
 
-// RateLimitError is returned by FetchUsage when the server responds with
+// RateLimitError is returned when an Anthropic endpoint responds with
 // HTTP 429. RetryAfter is the parsed Retry-After header (or a sane
 // default when the header is missing/malformed) so callers can apply
 // per-account backoff instead of hammering the API.
+//
+// Source distinguishes which endpoint hit the limit. This matters
+// because the two have independent rate-limit windows and very
+// different recovery semantics:
+//
+//   - "usage"   — /api/oauth/usage. The token is fine, the API itself
+//     is throttled; skipping the whole row until cooldown is correct.
+//   - "refresh" — /v1/oauth/token. Only the refresh path is throttled;
+//     if Claude Code or another process refreshes the token in the
+//     meantime, the dashboard should pick up the new token immediately
+//     and resume FetchUsage normally — NOT sit at "rate limited" for
+//     5 min just because we tried to refresh once.
+//
+// Empty Source defaults to "usage" semantics for backwards compat.
 type RateLimitError struct {
 	RetryAfter time.Duration
 	Body       string
+	Source     string
 }
 
 func (e *RateLimitError) Error() string {
+	if e.Source != "" && e.Source != "usage" {
+		return fmt.Sprintf("%s rate limited (retry in %s)", e.Source, e.RetryAfter.Round(time.Second))
+	}
 	return fmt.Sprintf("rate limited (retry in %s)", e.RetryAfter.Round(time.Second))
 }
 
@@ -86,6 +104,7 @@ func FetchUsage(ctx context.Context, token string) (*Usage, error) {
 		return nil, &RateLimitError{
 			RetryAfter: parseRetryAfter(resp.Header.Get("Retry-After"), 60*time.Second),
 			Body:       string(body),
+			Source:     "usage",
 		}
 	}
 	if resp.StatusCode != http.StatusOK {

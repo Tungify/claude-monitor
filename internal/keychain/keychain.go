@@ -20,12 +20,25 @@ const PlainServiceName = "Claude Code-credentials"
 
 // OAuthCreds is the inner shape Claude Code stores under
 // "Claude Code-credentials[-<hash>]" in the OS credential store.
+//
+// RateLimitTier and ClientId are preserved-but-not-produced fields:
+// Claude Code populates them from the user-profile lookup at /login
+// time (and via the `H.rateLimitTier ?? O?.rateLimitTier` fallback on
+// every save), then propagates them as CLAUDE_CODE_RATE_LIMIT_TIER /
+// the embedded client_id env vars to subprocesses. Stripping them on a
+// round-trip (which the struct used to do) made `claude` re-discover
+// the tier via an extra profile request after every refresh — and on
+// machines doing frequent auto-swaps that's exactly the burst that
+// trips Anthropic's IP-level limiter into 429s. We don't generate these
+// values ourselves; we just round-trip whatever Claude Code wrote.
 type OAuthCreds struct {
 	AccessToken      string   `json:"accessToken"`
 	RefreshToken     string   `json:"refreshToken"`
 	ExpiresAt        int64    `json:"expiresAt"`
 	Scopes           []string `json:"scopes"`
 	SubscriptionType string   `json:"subscriptionType"`
+	RateLimitTier    string   `json:"rateLimitTier,omitempty"`
+	ClientID         string   `json:"clientId,omitempty"`
 }
 
 func (c *OAuthCreds) Expired() bool {
@@ -33,6 +46,30 @@ func (c *OAuthCreds) Expired() bool {
 		return false
 	}
 	return time.Now().UnixMilli() >= c.ExpiresAt
+}
+
+// NeedsRefresh returns true when the access token has expired OR is
+// within `skew` of expiring. skew=0 matches Expired() exactly.
+//
+// Why proactive refresh: a user who logs in N accounts within a few
+// minutes will have all their tokens expire within the same few-minute
+// window every hour (Anthropic's tokens are 1h). Cold-starting the
+// dashboard inside that window forces N back-to-back refreshes against
+// /v1/oauth/token, which trips the IP-level rate limiter on top of an
+// already-narrow per-OAuth-client budget. With skew>0 we refresh ahead
+// of expiry, so each token gets refreshed during a quiet tick instead
+// of contending with the rest of its cohort.
+//
+// ExpiresAt==0 means "no expiry recorded" (either never authenticated
+// or the OAuth response didn't carry expires_in). Treat as fresh — the
+// caller will call FetchUsage with the token; if it's actually dead
+// the API returns 401 and the row surfaces a token-expired error,
+// which is more informative than a needs-refresh false positive.
+func (c *OAuthCreds) NeedsRefresh(skew time.Duration) bool {
+	if c.ExpiresAt == 0 {
+		return false
+	}
+	return time.Now().Add(skew).UnixMilli() >= c.ExpiresAt
 }
 
 type credsEnvelope struct {
@@ -164,18 +201,97 @@ func LoadCredentialsByService(svc string) (*OAuthCreds, error) {
 	return readKeychainEntry(u.Username, svc)
 }
 
+// CredSource tags where a successfully-loaded set of OAuth creds came
+// from, so a refreshed pair can be written back to the same slot.
+// Exactly one of Service / File is set on success.
+//
+// This matters for auto-swap: when the dashboard reads each row's
+// creds via the per-dir hashed entry (LoadCredentialsHashedFirst) we
+// must NOT persist refreshed tokens to the plain slot — the plain slot
+// is being rotated by Execute and represents whichever account is
+// currently active, not necessarily the row we just refreshed.
+type CredSource struct {
+	Service string // keychain service name when read from OS credential store
+	File    string // <configDir>/.credentials.json when read from filesystem fallback
+}
+
+// Persist writes refreshed creds back to the same source they were
+// originally loaded from. Returns an error when the source is empty
+// (i.e. construction skipped a successful load — programmer error).
+func (s CredSource) Persist(creds *OAuthCreds) error {
+	if s.Service != "" {
+		return WriteEntry(s.Service, creds)
+	}
+	if s.File != "" {
+		return writeCredsFile(s.File, creds)
+	}
+	return fmt.Errorf("CredSource is empty — nothing to persist to")
+}
+
+// LoadForRefresh mirrors LoadCredentials/LoadCredentialsHashedFirst but
+// also returns a CredSource so a subsequent OAuth refresh can be
+// written back to the exact slot the creds were read from. Pass
+// hashedFirst=true to match LoadCredentialsHashedFirst's ordering
+// (used by the auto-swap path); false uses the default ordering.
+func LoadForRefresh(configDir string, hashedFirst bool) (*OAuthCreds, CredSource, error) {
+	var svcs []string
+	if hashedFirst {
+		svcs = []string{ServiceFor(configDir), PlainServiceName}
+	} else {
+		svcs = candidates(configDir)
+	}
+	creds, svc, err := loadFromCandidatesWithSvc(svcs)
+	if err == nil {
+		return creds, CredSource{Service: svc}, nil
+	}
+	if fileCreds, file, ferr := loadFromFileWithPath(configDir); ferr == nil {
+		return fileCreds, CredSource{File: file}, nil
+	}
+	return nil, CredSource{}, err
+}
+
 func loadFromCandidates(svcs []string) (*OAuthCreds, error) {
+	creds, _, err := loadFromCandidatesWithSvc(svcs)
+	return creds, err
+}
+
+func loadFromCandidatesWithSvc(svcs []string) (*OAuthCreds, string, error) {
 	u, err := user.Current()
 	if err != nil {
-		return nil, fmt.Errorf("user lookup: %w", err)
+		return nil, "", fmt.Errorf("user lookup: %w", err)
 	}
 	var lastErr error
 	for _, svc := range svcs {
 		creds, err := readKeychainEntry(u.Username, svc)
 		if err == nil {
-			return creds, nil
+			return creds, svc, nil
 		}
 		lastErr = err
 	}
-	return nil, lastErr
+	return nil, "", lastErr
+}
+
+func loadFromFileWithPath(configDir string) (*OAuthCreds, string, error) {
+	p := filepath.Join(configDir, ".credentials.json")
+	creds, err := loadFromFile(configDir)
+	if err != nil {
+		return nil, "", err
+	}
+	return creds, p, nil
+}
+
+// writeCredsFile persists refreshed creds to <configDir>/.credentials.json
+// — the plaintext fallback Claude Code uses on Linux setups without
+// libsecret. Mode 0600 matches Claude Code's own write permissions so
+// the keyring-less environment doesn't suddenly leak creds to other
+// users on the same box.
+func writeCredsFile(path string, creds *OAuthCreds) error {
+	data, err := json.Marshal(credsEnvelope{ClaudeAiOauth: *creds})
+	if err != nil {
+		return fmt.Errorf("encode credentials: %w", err)
+	}
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		return fmt.Errorf("write %s: %w", path, err)
+	}
+	return nil
 }

@@ -37,26 +37,76 @@ func ClaudeJSONPaths(configDir string) []string {
 // without unmarshalling the whole 24KB blob.
 func ReadEmail(configDir string) string {
 	for _, p := range ClaudeJSONPaths(configDir) {
-		if email := emailFromClaudeJSON(p); email != "" {
+		if email := stringFieldFromClaudeJSON(p, "emailAddress"); email != "" {
 			return email
 		}
 	}
 	return ""
 }
 
+// ReadAccountUUID returns the in-dir <configDir>/.claude.json's
+// oauthAccount.accountUuid. Unlike ReadEmail, this does NOT fall back to
+// $HOME/.claude.json: that file is patched by both Claude Code (on
+// /login) and swap.syncHomeOAuthAccount to mirror whichever account
+// currently owns the plain keychain slot — i.e. it represents the
+// *active* account, not the configDir's identity. Falling back to it
+// would make every row spuriously read the active uuid, which would
+// break the comparison detectActiveDir performs between the home file
+// and per-row AccountUUIDs (every row would match every active
+// account).
+//
+// Returns "" when the in-dir file or the field is missing — the
+// detect-active path falls through to refresh_token matching in that
+// case, so the empty value is fine.
+func ReadAccountUUID(configDir string) string {
+	return stringFieldFromClaudeJSON(filepath.Join(configDir, ".claude.json"), "accountUuid")
+}
+
+// ReadActiveAccountUUID returns oauthAccount.accountUuid from
+// $HOME/.claude.json, the file Claude Code consults to render its
+// "logged in as <email>" banner. Both Claude Code's own /login flow and
+// our swap.syncHomeOAuthAccount keep this in sync with whichever account
+// currently owns the plain keychain slot, so its accountUuid is the
+// stable identifier detectActiveDir uses to figure out which row owns
+// the ★. We deliberately bypass ClaudeJSONPaths' default-dir fallback
+// chain (which prefers ~/.claude/.claude.json — that's the *backup* of
+// the original default identity, not the active one).
+//
+// Returns "" when $HOME isn't resolvable, the file is missing, or the
+// field isn't present (fresh install pre-first-login).
+func ReadActiveAccountUUID() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return stringFieldFromClaudeJSON(filepath.Join(home, ".claude.json"), "accountUuid")
+}
+
+// emailFromClaudeJSON is kept as a thin wrapper so existing tests (and
+// any external lookups) can call the email-specific name; the real
+// parser is stringFieldFromClaudeJSON.
 func emailFromClaudeJSON(path string) string {
+	return stringFieldFromClaudeJSON(path, "emailAddress")
+}
+
+// stringFieldFromClaudeJSON locates a top-level string field by name
+// inside a Claude Code .claude.json without unmarshalling the whole
+// 24KB blob. We assume the field name is unique within the file —
+// Claude Code's schema is flat enough at the leaf level (emailAddress,
+// accountUuid, etc. live only inside oauthAccount) that this holds in
+// practice. Callers that need a nested field should still use
+// json.Unmarshal.
+//
+// Handles both compact (`"key":"v"`) and pretty-printed (`"key": "v"`)
+// shapes the encoder may emit, plus `\X` escape pairs inside the value
+// so an escaped quote doesn't end the string early.
+func stringFieldFromClaudeJSON(path, field string) string {
 	b, err := os.ReadFile(path)
 	if err != nil {
 		return ""
 	}
-	// Locate `"emailAddress"`, then skip whitespace + `:` + whitespace
-	// before the opening quote of the value. Claude Code's JSON
-	// encoder writes the field with a space (`"emailAddress": "…"`)
-	// while the older shape did not (`"emailAddress":"…"`); the
-	// permissive walk handles both without paying for a full
-	// json.Unmarshal of the 24KB blob.
 	s := string(b)
-	const key = `"emailAddress"`
+	key := `"` + field + `"`
 	i := strings.Index(s, key)
 	if i < 0 {
 		return ""
@@ -76,17 +126,11 @@ func emailFromClaudeJSON(path string) string {
 		return ""
 	}
 	j++
-	// Walk to the closing quote, skipping over any `\X` escape pair so
-	// an escaped `\"` inside the value (theoretical for emails, but
-	// JSON-legal) doesn't end the string early. Real-world emails never
-	// contain backslashes; this is a defensive guardrail, not a hot
-	// path. We return the raw substring without unescape — the value is
-	// only used as a display label.
 	start := j
 	for j < len(s) {
 		switch s[j] {
 		case '\\':
-			j += 2 // skip escape pair (`\"`, `\\`, `\n`, …)
+			j += 2
 		case '"':
 			return s[start:j]
 		default:

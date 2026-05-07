@@ -1,10 +1,12 @@
 package swap
 
 import (
+	"errors"
 	"fmt"
 	"sort"
 
 	"claude-monitor/internal/account"
+	"claude-monitor/internal/api"
 	"claude-monitor/internal/config"
 )
 
@@ -55,7 +57,39 @@ func decideSwap(rows []account.Row, activeDir string, prevUtil map[string]float6
 		}
 		candidates = append(candidates, r)
 	}
-	if active == nil || active.Err != nil || active.Usage == nil {
+	if active == nil {
+		return nil, ""
+	}
+	// Active is fetch-usage rate-limited: we can't read its util, but
+	// the 429 itself is the strongest "this account is the busy one"
+	// signal there is — Anthropic only throttles tokens that are being
+	// hammered by `claude`. Rotate to any healthy candidate so the
+	// next request hits a fresh token. We deliberately skip the
+	// threshold cascade (no util to compare) and the rebalance-on-reset
+	// path (no prev-util reliable here either).
+	//
+	// The refresh-source 429 path is intentionally NOT caught here:
+	// the token itself isn't dead, just our refresh attempt got
+	// limited; the existing tokens in the keychain may still be fresh
+	// (Claude Code or another tab may have refreshed them already).
+	// Falling through to the regular cascade keeps that behavior.
+	if rl := rateLimitErr(active.Err); rl != nil && rl.Source != "refresh" {
+		if len(candidates) == 0 {
+			return nil, ""
+		}
+		// Don't auto-rotate off a manually pinned active even when
+		// it's rate-limited — that's the user explicitly saying
+		// "hold this one regardless." They can [m] off it themselves.
+		if manualPickDir != "" && active.ConfigDir == manualPickDir {
+			return nil, ""
+		}
+		target := pickTarget(candidates, cfg.PickOrder)
+		if target == nil {
+			return nil, ""
+		}
+		return target, "active rate limited"
+	}
+	if active.Err != nil || active.Usage == nil {
 		return nil, ""
 	}
 	if len(candidates) == 0 {
@@ -103,6 +137,21 @@ func decideSwap(rows []account.Row, activeDir string, prevUtil map[string]float6
 		return target, reason
 	}
 	return nil, ""
+}
+
+// rateLimitErr unwraps a row's Err into a *api.RateLimitError when
+// applicable, else nil. Centralizing this keeps decideSwap from
+// caring whether the rate-limit error is the bare value or wrapped
+// (fmt.Errorf with %w would still unwrap correctly).
+func rateLimitErr(err error) *api.RateLimitError {
+	if err == nil {
+		return nil
+	}
+	var rl *api.RateLimitError
+	if errors.As(err, &rl) {
+		return rl
+	}
+	return nil
 }
 
 func pickTarget(eligible []*account.Row, order string) *account.Row {

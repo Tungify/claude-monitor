@@ -76,6 +76,44 @@ func TestExpired(t *testing.T) {
 	}
 }
 
+// TestNeedsRefresh covers the proactive-refresh boundary used by
+// fetchOne to stagger the morning cohort. Skew shifts the "expired"
+// window forward by that duration: a token with 4 minutes of life left
+// is treated as needing refresh under skew=5min, but not under
+// skew=0 (which is just Expired() semantics).
+func TestNeedsRefresh(t *testing.T) {
+	now := time.Now()
+	tests := []struct {
+		name string
+		c    OAuthCreds
+		skew time.Duration
+		want bool
+	}{
+		{"zero ExpiresAt never needs refresh",
+			OAuthCreds{}, 5 * time.Minute, false},
+		{"fresh token with 1h left, skew 5min",
+			OAuthCreds{ExpiresAt: now.Add(time.Hour).UnixMilli()}, 5 * time.Minute, false},
+		{"token with 4min left, skew 5min — needs proactive refresh",
+			OAuthCreds{ExpiresAt: now.Add(4 * time.Minute).UnixMilli()}, 5 * time.Minute, true},
+		{"token with 6min left, skew 5min — still fresh",
+			OAuthCreds{ExpiresAt: now.Add(6 * time.Minute).UnixMilli()}, 5 * time.Minute, false},
+		{"already expired, skew 0 — same as Expired()",
+			OAuthCreds{ExpiresAt: now.Add(-time.Hour).UnixMilli()}, 0, true},
+		{"already expired, skew 5min — still true",
+			OAuthCreds{ExpiresAt: now.Add(-time.Hour).UnixMilli()}, 5 * time.Minute, true},
+		{"skew 0 reproduces Expired() semantics on fresh token",
+			OAuthCreds{ExpiresAt: now.Add(time.Hour).UnixMilli()}, 0, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.c.NeedsRefresh(tt.skew); got != tt.want {
+				t.Errorf("NeedsRefresh(%s) = %v, want %v (ExpiresAt=%dms from now)",
+					tt.skew, got, tt.want, tt.c.ExpiresAt-now.UnixMilli())
+			}
+		})
+	}
+}
+
 func TestCandidatesPriority(t *testing.T) {
 	// Default dir → plain first, hashed second.
 	tmp := t.TempDir()
@@ -192,5 +230,42 @@ func TestPlainServiceNameConstant(t *testing.T) {
 	// every existing user's keychain entry.
 	if PlainServiceName != "Claude Code-credentials" {
 		t.Errorf("PlainServiceName = %q, want %q", PlainServiceName, "Claude Code-credentials")
+	}
+}
+
+// TestRoundTripPreservesRateLimitTier guards the OAuthCreds JSON tags
+// against a regression that previously stripped rateLimitTier on every
+// read-write cycle. Claude Code uses that field (and the embedded
+// clientId on newer logins) to skip the post-refresh profile-lookup
+// request — without it, every refresh fired an extra /api/oauth call,
+// which on a machine doing frequent auto-swaps was enough to trip the
+// IP rate limiter into 429s.
+//
+// We pin the round-trip against the actual envelope shape Claude Code
+// 2.1.132 writes: {accessToken, refreshToken, expiresAt, scopes,
+// subscriptionType, rateLimitTier, clientId}. If a future field gets
+// added there, this test will keep passing for the legacy fields and
+// the new field needs its own assertion.
+func TestRoundTripPreservesRateLimitTier(t *testing.T) {
+	src := `{"claudeAiOauth":{"accessToken":"a","refreshToken":"r","expiresAt":1700000000000,"scopes":["x"],"subscriptionType":"team","rateLimitTier":"default_claude_max_5x","clientId":"c-123"}}`
+	var env credsEnvelope
+	if err := json.Unmarshal([]byte(src), &env); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if env.ClaudeAiOauth.RateLimitTier != "default_claude_max_5x" {
+		t.Errorf("RateLimitTier = %q, want default_claude_max_5x", env.ClaudeAiOauth.RateLimitTier)
+	}
+	if env.ClaudeAiOauth.ClientID != "c-123" {
+		t.Errorf("ClientID = %q, want c-123", env.ClaudeAiOauth.ClientID)
+	}
+	out, err := json.Marshal(env)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(out), `"rateLimitTier":"default_claude_max_5x"`) {
+		t.Errorf("round-trip dropped rateLimitTier; got %s", out)
+	}
+	if !strings.Contains(string(out), `"clientId":"c-123"`) {
+		t.Errorf("round-trip dropped clientId; got %s", out)
 	}
 }

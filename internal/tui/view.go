@@ -108,6 +108,19 @@ func (m model) table(st styles) string {
 			b.WriteString("\n")
 			continue
 		}
+		// Same live-countdown trick for refresh-source 429s. Distinct
+		// map because refreshBackoff doesn't gate fetchOne — only the
+		// rendered countdown.
+		if until, ok := m.refreshBackoff[r.ConfigDir]; ok && now.Before(until) {
+			remaining := until.Sub(now).Round(time.Second)
+			label := m.decorateLabel(st, i, r, account.Label(r))
+			msg := fmt.Sprintf("refresh rate limited (retry in %s)", remaining)
+			line := padRight(st.colHeader.Render(label), widths[0]) +
+				"  " + st.warn.Render(msg)
+			b.WriteString(line)
+			b.WriteString("\n")
+			continue
+		}
 		if r.Err != nil {
 			label := m.decorateLabel(st, i, r, account.Label(r))
 			line := padRight(st.colHeader.Render(label), widths[0]) +

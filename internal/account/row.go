@@ -12,13 +12,20 @@ import (
 //
 // Tokens are exported because the swap package (a separate package
 // after the layout split) needs to read them: detectActiveDir matches
-// the plain keychain slot's RefreshToken against each row, and
+// each row's AccountUUID against $HOME/.claude.json's accountUuid (and
+// falls back to RefreshToken matching for fresh installs), and
 // runAutoKick uses AccessToken to fire the 1-token /v1/messages call
 // without going back to the keychain.
 type Row struct {
 	Name      string
 	ConfigDir string
 	Email     string
+
+	// AccountUUID is read once at ResolveDirs time from the in-dir
+	// <configDir>/.claude.json's oauthAccount.accountUuid. Stable
+	// across token rotations, so it's the primary signal for the
+	// active-marker logic in detectActiveDir.
+	AccountUUID string
 
 	Usage *api.Usage // nil when fetch failed
 	Err   error      // populated when Usage is nil

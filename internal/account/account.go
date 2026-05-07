@@ -12,9 +12,10 @@ import (
 // API usage, active marker, etc.) lives on Row, populated by package
 // swap.
 type Account struct {
-	Name      string
-	ConfigDir string
-	Email     string
+	Name        string
+	ConfigDir   string
+	Email       string
+	AccountUUID string
 }
 
 // DefaultDir returns ~/.claude on the current user's home directory.
@@ -74,9 +75,10 @@ func ResolveDirs(spec string) ([]Account, error) {
 			}
 			seen[abs] = struct{}{}
 			out = append(out, Account{
-				Name:      nameFor(abs),
-				ConfigDir: abs,
-				Email:     ReadEmail(abs),
+				Name:        nameFor(abs),
+				ConfigDir:   abs,
+				Email:       ReadEmail(abs),
+				AccountUUID: ReadAccountUUID(abs),
 			})
 		}
 	}

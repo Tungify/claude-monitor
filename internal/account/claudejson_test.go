@@ -72,6 +72,82 @@ func TestEmailFromClaudeJSON(t *testing.T) {
 	}
 }
 
+func TestReadAccountUUIDInDirOnly(t *testing.T) {
+	// ReadAccountUUID is strict on purpose: it reads <configDir>/.claude.json
+	// and never falls back to $HOME/.claude.json, because the home file
+	// represents the *active* account (mirrored by Claude Code on /login
+	// and by our syncHomeOAuthAccount on swap), not the configDir's own
+	// identity. Using it as a fallback would make every row spuriously
+	// adopt the active account's uuid, breaking detectActiveDir.
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	defaultDir := filepath.Join(tmp, ".claude")
+	if err := os.MkdirAll(defaultDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	// Only $HOME/.claude.json exists, with the (active) uuid. The default
+	// dir's row should NOT pick up that uuid — its in-dir file is missing,
+	// so it returns "".
+	if err := os.WriteFile(filepath.Join(tmp, ".claude.json"),
+		[]byte(`{"oauthAccount":{"accountUuid":"home-active-uuid"}}`), 0o600); err != nil {
+		t.Fatalf("write home: %v", err)
+	}
+	if got := ReadAccountUUID(defaultDir); got != "" {
+		t.Errorf("ReadAccountUUID(default) = %q, want empty (no in-dir backup, must NOT fall back to $HOME)", got)
+	}
+
+	// In-dir backup present → returns its uuid (the original default's).
+	if err := os.WriteFile(filepath.Join(defaultDir, ".claude.json"),
+		[]byte(`{"oauthAccount":{"accountUuid":"in-dir-uuid"}}`), 0o600); err != nil {
+		t.Fatalf("write in-dir: %v", err)
+	}
+	if got := ReadAccountUUID(defaultDir); got != "in-dir-uuid" {
+		t.Errorf("ReadAccountUUID(default) = %q, want in-dir-uuid", got)
+	}
+
+	// Non-default dir reads its in-dir file directly.
+	other := filepath.Join(tmp, ".claude-be3")
+	if err := os.MkdirAll(other, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(other, ".claude.json"),
+		[]byte(`{"oauthAccount":{"accountUuid":"be3-uuid"}}`), 0o600); err != nil {
+		t.Fatalf("write be3: %v", err)
+	}
+	if got := ReadAccountUUID(other); got != "be3-uuid" {
+		t.Errorf("ReadAccountUUID(non-default) = %q, want be3-uuid", got)
+	}
+}
+
+func TestReadActiveAccountUUID(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+
+	// Missing file → empty.
+	if got := ReadActiveAccountUUID(); got != "" {
+		t.Errorf("missing $HOME/.claude.json: got %q, want empty", got)
+	}
+
+	// File present with accountUuid → returned.
+	if err := os.WriteFile(filepath.Join(tmp, ".claude.json"),
+		[]byte(`{"oauthAccount":{"accountUuid":"active-uuid"}}`), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if got := ReadActiveAccountUUID(); got != "active-uuid" {
+		t.Errorf("ReadActiveAccountUUID = %q, want active-uuid", got)
+	}
+
+	// File present without oauthAccount → empty.
+	if err := os.WriteFile(filepath.Join(tmp, ".claude.json"),
+		[]byte(`{"foo":"bar"}`), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if got := ReadActiveAccountUUID(); got != "" {
+		t.Errorf("file without oauthAccount: got %q, want empty", got)
+	}
+}
+
 func TestReadEmailPriority(t *testing.T) {
 	// The default-dir lookup tries in-dir first, then $HOME fallback.
 	// Both present → in-dir wins.

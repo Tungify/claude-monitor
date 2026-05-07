@@ -33,7 +33,7 @@ func snapshotAccountsLite(rootSpec string) ([]account.Row, error) {
 	}
 	rows := make([]account.Row, len(accts))
 	for i, a := range accts {
-		rows[i] = account.Row{Name: a.Name, ConfigDir: a.ConfigDir, Email: a.Email}
+		rows[i] = account.Row{Name: a.Name, ConfigDir: a.ConfigDir, Email: a.Email, AccountUUID: a.AccountUUID}
 		// Hashed-first because after a swap the plain entry no longer
 		// represents the default account; only the hashed entries are
 		// reliable per-account identities.

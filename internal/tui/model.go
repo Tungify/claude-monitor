@@ -38,6 +38,16 @@ type model struct {
 	// refresh) or when the user presses 'R' to force a retry.
 	backoff map[string]time.Time
 
+	// refreshBackoff[configDir] is the deadline for refresh-source
+	// 429s. Unlike backoff, this map is rendering-only — snapshot.go
+	// does NOT pre-skip on it, because the api package's circuit
+	// breaker handles the actual throttling and a parallel `claude`
+	// invocation may refresh the keychain entry before our deadline
+	// elapses. Storing the deadline here lets the view's live-second
+	// loop tick the "retry in Xs" countdown down smoothly instead of
+	// freezing at whatever value the last tick captured.
+	refreshBackoff map[string]time.Time
+
 	// inflight is incremented every time we issue a refreshCmd and
 	// compared against the version embedded in the resulting
 	// refreshMsg — a stale result from a previous tick is discarded
@@ -122,8 +132,9 @@ func initialModel(root string, cfg config.Config, version string) model {
 		showHelp:   true,
 		inflight:   1,
 		refreshing: true,
-		backoff:    map[string]time.Time{},
-		prevUtil:   map[string]float64{},
+		backoff:        map[string]time.Time{},
+		refreshBackoff: map[string]time.Time{},
+		prevUtil:       map[string]float64{},
 	}
 }
 

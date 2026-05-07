@@ -3,6 +3,7 @@ package swap
 import (
 	"errors"
 	"testing"
+	"time"
 
 	"claude-monitor/internal/account"
 	"claude-monitor/internal/api"
@@ -338,6 +339,89 @@ func TestDecideSwapManualPinNoLongerActiveDoesNotApply(t *testing.T) {
 	}
 	if got.Name != "low" {
 		t.Errorf("target = %q, want low", got.Name)
+	}
+}
+
+// TestDecideSwapActiveUsageRateLimitedRotates covers the scenario the
+// user actually hit in production: active account is the busy one,
+// gets 429 on /api/oauth/usage, dashboard can't read its util. Without
+// this branch, decideSwap saw active.Err != nil and bailed — leaving
+// the user pinned to a throttled account until they swapped manually.
+// Now we treat the 429 itself as the "active is maxed" signal and
+// rotate to any healthy candidate.
+func TestDecideSwapActiveUsageRateLimitedRotates(t *testing.T) {
+	active := account.Row{Name: "a", ConfigDir: "/a", RefreshToken: "ra"}
+	active.Err = &api.RateLimitError{RetryAfter: 60 * time.Second, Source: "usage"}
+	// Usage is nil — that's the whole point.
+	rows := []account.Row{
+		active,
+		row("b", "/b", 10, "rb"),
+		row("c", "/c", 50, "rc"),
+	}
+	got, reason := decideSwap(rows, "/a", nil, "", 0, defaultCfg())
+	if got == nil {
+		t.Fatal("expected swap when active is usage-rate-limited, got nil")
+	}
+	if got.Name != "b" {
+		t.Errorf("target = %q, want b (lowest util candidate)", got.Name)
+	}
+	if reason == "" {
+		t.Error("expected non-empty reason")
+	}
+}
+
+// TestDecideSwapActiveRefreshRateLimitDoesNotRotate guards the "only
+// usage-source" carve-out: a refresh 429 doesn't mean the token is
+// dead, it means our refresh attempt got throttled. The keychain may
+// still hold a perfectly fine token (Claude Code or another tab may
+// have refreshed it for us). Falling through to the regular cascade
+// is the right behavior — and since active.Err != nil and Usage is
+// nil, that cascade returns nil, so we sit tight.
+func TestDecideSwapActiveRefreshRateLimitDoesNotRotate(t *testing.T) {
+	active := account.Row{Name: "a", ConfigDir: "/a", RefreshToken: "ra"}
+	active.Err = &api.RateLimitError{RetryAfter: 60 * time.Second, Source: "refresh"}
+	rows := []account.Row{
+		active,
+		row("b", "/b", 10, "rb"),
+	}
+	got, _ := decideSwap(rows, "/a", nil, "", 0, defaultCfg())
+	if got != nil {
+		t.Errorf("expected nil for refresh-source 429 (keychain may have fresh token), got %+v", got)
+	}
+}
+
+// TestDecideSwapActiveUsageRateLimitedNoHealthyCandidates: active is
+// 429'd, every candidate is also 429'd. There's nothing to rotate
+// to, so we hold position and wait for one of them to recover.
+func TestDecideSwapActiveUsageRateLimitedNoHealthyCandidates(t *testing.T) {
+	active := account.Row{Name: "a", ConfigDir: "/a", RefreshToken: "ra"}
+	active.Err = &api.RateLimitError{RetryAfter: 60 * time.Second, Source: "usage"}
+
+	bad := account.Row{Name: "b", ConfigDir: "/b", RefreshToken: "rb"}
+	bad.Err = &api.RateLimitError{RetryAfter: 60 * time.Second, Source: "usage"}
+
+	rows := []account.Row{active, bad}
+	got, _ := decideSwap(rows, "/a", nil, "", 0, defaultCfg())
+	if got != nil {
+		t.Errorf("expected nil when no healthy candidate exists, got %+v", got)
+	}
+}
+
+// TestDecideSwapActiveUsageRateLimitedRespectsManualPin verifies the
+// manual pin (the user's deliberate "hold this account") wins over the
+// rate-limit-rotation heuristic. Otherwise pinning a high-traffic
+// account would auto-revert the moment Anthropic 429s a usage call.
+func TestDecideSwapActiveUsageRateLimitedRespectsManualPin(t *testing.T) {
+	active := account.Row{Name: "a", ConfigDir: "/a", RefreshToken: "ra"}
+	active.Err = &api.RateLimitError{RetryAfter: 60 * time.Second, Source: "usage"}
+	rows := []account.Row{
+		active,
+		row("b", "/b", 10, "rb"),
+	}
+	// User pinned /a explicitly.
+	got, _ := decideSwap(rows, "/a", nil, "/a", 50, defaultCfg())
+	if got != nil {
+		t.Errorf("expected nil when active is the manual pin, got %+v", got)
 	}
 }
 
