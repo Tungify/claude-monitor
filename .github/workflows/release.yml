@@ -53,6 +53,11 @@ jobs:
           name: web-bundle
           path: web/.next/standalone
           if-no-files-found: error
+          # The standalone bundle ships its server build inside .next/,
+          # which upload-artifact@v4.4+ treats as hidden and strips by
+          # default. Without this flag the released tarball lacks
+          # .next/server + .next/static and Next refuses to start.
+          include-hidden-files: true
 
   # darwin builds need a macOS runner so we can ad-hoc codesign with
   # the system codesign tool. linux/windows builds cross-compile fine
