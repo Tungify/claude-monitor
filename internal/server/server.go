@@ -119,6 +119,7 @@ func (s *Server) Routes() *http.ServeMux {
 	mux.HandleFunc("GET /api/accounts", s.handleAccounts)
 	mux.HandleFunc("POST /api/swap-to", s.handleSwapTo)
 	mux.HandleFunc("GET /api/events", s.handleEvents)
+	mux.HandleFunc("POST /api/worktrees", s.handleCreateWorktrees)
 	mux.HandleFunc("OPTIONS /api/{rest...}", s.handleCORSPreflight)
 	return mux
 }
