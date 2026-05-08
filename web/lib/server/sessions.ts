@@ -504,6 +504,10 @@ export function sendMessage(
     throw new Error(`session is ${s.status}`);
   }
   if (clientRequestId) {
+    // Sessions created before this field existed (HMR survivors)
+    // arrive here with `recentRequestIds === undefined`. Initialise
+    // on demand so the iteration in pruneRecentIds doesn't throw.
+    if (!s.recentRequestIds) s.recentRequestIds = new Map();
     const now = Date.now();
     pruneRecentIds(s, now);
     if (s.recentRequestIds.has(clientRequestId)) {
