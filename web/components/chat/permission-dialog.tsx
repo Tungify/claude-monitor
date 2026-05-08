@@ -43,8 +43,14 @@ export function PermissionDialog({ request, onDecide }: Props) {
   const [denyMessage, setDenyMessage] = useState("");
   const [denyMode, setDenyMode] = useState(false);
   const [showRaw, setShowRaw] = useState(false);
-  const [busy, setBusy] = useState<"allow" | "deny" | null>(null);
+  const [busy, setBusy] = useState<"allow" | "always" | "deny" | null>(null);
   const open = request !== null;
+  // The SDK ships per-call permission suggestions (e.g. "addRules:
+  // Bash(<exact command>:*) for session"). When present we surface an
+  // "Always allow" affordance that round-trips those suggestions back
+  // as updatedPermissions — the SDK then short-circuits matching tool
+  // calls for the rest of the session without bothering the user.
+  const canAlwaysAllow = (request?.permission_suggestions?.length ?? 0) > 0;
 
   const reset = () => {
     setDenyMessage("");
@@ -57,6 +63,15 @@ export function PermissionDialog({ request, onDecide }: Props) {
     setBusy("allow");
     try {
       await onDecide({ behavior: "allow" });
+    } finally {
+      reset();
+    }
+  };
+
+  const onAlwaysAllow = async () => {
+    setBusy("always");
+    try {
+      await onDecide({ behavior: "allow", always_allow: true });
     } finally {
       reset();
     }
@@ -79,12 +94,17 @@ export function PermissionDialog({ request, onDecide }: Props) {
 
   return (
     <Dialog open={open}>
-      <DialogContent className="max-w-2xl">
-        <DialogHeader>
-          <DialogTitle className="flex items-center gap-2">
+      {/* DialogContent uses CSS grid; grid items default to
+          min-width:auto so an unwrappable child (long path, long bash
+          command, JSON blob) can blow past max-w-2xl. min-w-0 lets the
+          grid tracks shrink, and the inner pre's wrap rules handle the
+          rest. */}
+      <DialogContent className="max-w-2xl sm:max-w-2xl">
+        <DialogHeader className="min-w-0">
+          <DialogTitle className="flex min-w-0 items-center gap-2">
             <span
               className={cn(
-                "flex size-8 items-center justify-center rounded-md",
+                "flex size-8 shrink-0 items-center justify-center rounded-md",
                 meta?.tone === "danger"
                   ? "bg-destructive/15 text-destructive"
                   : meta?.tone === "warn"
@@ -94,8 +114,10 @@ export function PermissionDialog({ request, onDecide }: Props) {
             >
               <Icon className="size-4" aria-hidden />
             </span>
-            <span>{meta?.title ?? request?.tool_name}</span>
-            <span className="ml-2 font-mono text-xs text-muted-foreground">
+            <span className="min-w-0 truncate">
+              {meta?.title ?? request?.tool_name}
+            </span>
+            <span className="ml-2 min-w-0 truncate font-mono text-xs text-muted-foreground">
               {request?.tool_name}
             </span>
           </DialogTitle>
@@ -106,7 +128,7 @@ export function PermissionDialog({ request, onDecide }: Props) {
         </DialogHeader>
 
         {request && (
-          <div className="space-y-3">
+          <div className="min-w-0 space-y-3">
             <PermissionPreview request={request} />
 
             {/* Raw input expandable for power users / unknown tools.
@@ -126,7 +148,7 @@ export function PermissionDialog({ request, onDecide }: Props) {
               <span>{showRaw ? "Hide" : "Show"} raw input</span>
             </button>
             {showRaw && (
-              <pre className="max-h-56 overflow-auto rounded-md border bg-muted/40 p-2 text-[11px] leading-relaxed">
+              <pre className="max-h-56 overflow-auto rounded-md border bg-muted/40 p-2 text-[11px] leading-relaxed break-all whitespace-pre-wrap">
                 {JSON.stringify(request.input, null, 2)}
               </pre>
             )}
@@ -165,6 +187,16 @@ export function PermissionDialog({ request, onDecide }: Props) {
               >
                 Deny
               </Button>
+              {canAlwaysAllow && (
+                <Button
+                  variant="secondary"
+                  disabled={busy !== null}
+                  onClick={onAlwaysAllow}
+                  title="Allow this tool call AND don't ask again for matching calls (applies the SDK's suggested rules — typically session-scoped)."
+                >
+                  {busy === "always" ? "Saving…" : "Always allow"}
+                </Button>
+              )}
               <Button disabled={busy !== null} onClick={onAllow}>
                 {busy === "allow" ? "Allowing…" : "Allow"}
               </Button>
@@ -527,7 +559,10 @@ function CodePreview({
         <span>{label}</span>
         {language && <span className="font-mono normal-case">{language}</span>}
       </div>
-      <pre className="max-h-56 overflow-auto p-3 font-mono text-[12px] leading-relaxed">
+      {/* whitespace-pre-wrap: keep newlines but wrap long lines.
+          break-all: even unbroken tokens (URLs, base64, no-space bash)
+          wrap inside the dialog instead of overflowing it. */}
+      <pre className="max-h-56 overflow-auto p-3 font-mono text-[12px] leading-relaxed break-all whitespace-pre-wrap">
         {visible}
         {truncated && (
           <span className="block pt-1 text-[11px] italic text-muted-foreground">
@@ -550,15 +585,17 @@ function DiffPreview({
   const oldLines = oldStr.split("\n");
   const newLines = newStr.split("\n");
   return (
-    <div className="overflow-hidden rounded-md border">
-      <div className="grid grid-cols-1 divide-y md:grid-cols-2 md:divide-x md:divide-y-0">
+    <div className="min-w-0 overflow-hidden rounded-md border">
+      {/* min-w-0 on each diff column so a long unwrapped line in one
+          half doesn't blow out the dialog; the inner divs handle wrap. */}
+      <div className="grid min-w-0 grid-cols-1 divide-y md:grid-cols-2 md:divide-x md:divide-y-0 *:min-w-0">
         <div>
           <div className="border-b bg-destructive/10 px-3 py-1 text-[10px] font-semibold tracking-wider uppercase text-destructive">
             − Remove
           </div>
           <pre className="max-h-56 overflow-auto bg-destructive/[0.04] p-2 font-mono text-[12px] leading-relaxed">
             {oldLines.map((l, i) => (
-              <div key={i}>
+              <div key={i} className="break-all whitespace-pre-wrap">
                 <span className="select-none pr-2 text-destructive/70">−</span>
                 {l || " "}
               </div>
@@ -571,7 +608,7 @@ function DiffPreview({
           </div>
           <pre className="max-h-56 overflow-auto bg-emerald-500/[0.04] p-2 font-mono text-[12px] leading-relaxed">
             {newLines.map((l, i) => (
-              <div key={i}>
+              <div key={i} className="break-all whitespace-pre-wrap">
                 <span className="select-none pr-2 text-emerald-600/80">+</span>
                 {l || " "}
               </div>

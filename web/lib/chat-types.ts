@@ -26,7 +26,13 @@ export type SessionStatus =
   | "thinking"
   | "awaiting_permission"
   | "errored"
-  | "closed";
+  | "closed"
+  // Loaded from disk after a server restart. Metadata + history are
+  // hydrated, but the underlying SDK Query is not running. The session
+  // is materialised lazily on first interaction (sendMessage / SSE
+  // subscribe / updateSessionOptions) via SDK `resume` and flips back
+  // to "starting"/"idle" once the binary is alive again.
+  | "interrupted";
 
 export interface SessionSummary {
   id: string;
@@ -131,17 +137,37 @@ export interface ContextUsageBreakdown {
   system_prompt_sections?: { name: string; tokens: number }[];
 }
 
+// PermissionSuggestion mirrors the SDK's PermissionUpdate union — kept
+// opaque on the wire so we can forward whatever the SDK shipped
+// (addRules / setMode / addDirectories / etc.) back as
+// `updatedPermissions` when the user clicks "Always allow". The shape
+// is owned by the SDK; the UI only checks length and forwards the
+// array.
+export type PermissionSuggestion = Record<string, unknown>;
+
 export interface PermissionRequest {
   id: string;
   tool_name: string;
   input: Record<string, unknown>;
   tool_use_id: string;
+  // SDK-suggested permission updates (e.g. "always allow Bash with this
+  // exact command for this session"). Present when the SDK has a
+  // suggestion to offer; UI uses this to decide whether to render an
+  // "Always allow" affordance. Empty/undefined → suppress that button.
+  permission_suggestions?: PermissionSuggestion[];
 }
 
 // PermissionDecision is the body the UI POSTs back to resolve a request.
-// Mirrors the SDK's PermissionResult union but with snake_case.
+// Mirrors the SDK's PermissionResult union but with snake_case. When
+// `always_allow` is set on the allow branch, the server attaches the
+// pending request's stored `permission_suggestions` as
+// `updatedPermissions` so the SDK won't ask again for matching tools.
 export type PermissionDecision =
-  | { behavior: "allow"; updated_input?: Record<string, unknown> }
+  | {
+      behavior: "allow";
+      updated_input?: Record<string, unknown>;
+      always_allow?: boolean;
+    }
   | { behavior: "deny"; message: string };
 
 // AskUserQuestion is a built-in tool the agent calls to surface

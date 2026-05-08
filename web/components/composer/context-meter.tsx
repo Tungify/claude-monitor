@@ -111,9 +111,18 @@ export function ContextMeter({ breakdown, usage, contextWindow }: Props) {
 // names like "cyan", "green"). We map those to Tailwind utility
 // classes so the dots and stacked bar agree with the CLI palette.
 function SdkBreakdown({ breakdown }: { breakdown: ContextUsageBreakdown }) {
-  const free = Math.max(0, breakdown.max_tokens - breakdown.total_tokens);
   const pctOf = (n: number) =>
     breakdown.max_tokens > 0 ? (n / breakdown.max_tokens) * 100 : 0;
+
+  // Split out the SDK's "Free space" category so it renders below the
+  // others with the dashed footer-style chip, like the previous design.
+  // Newer SDK builds always include it; older builds don't, so we fall
+  // back to computing free = max - total.
+  const isFree = (name: string) => /\bfree\b/i.test(name);
+  const usedCategories = breakdown.categories.filter((c) => !isFree(c.name));
+  const sdkFree = breakdown.categories.find((c) => isFree(c.name));
+  const freeTokens =
+    sdkFree?.tokens ?? Math.max(0, breakdown.max_tokens - breakdown.total_tokens);
 
   return (
     <div className="space-y-3">
@@ -125,14 +134,15 @@ function SdkBreakdown({ breakdown }: { breakdown: ContextUsageBreakdown }) {
       </div>
 
       <div className="flex h-2 w-full overflow-hidden rounded-full bg-muted">
-        {breakdown.categories.map((c) => {
+        {usedCategories.map((c) => {
           const w = pctOf(c.tokens);
           if (w <= 0) return null;
+          const palette = paletteFor(c.color, c.name);
           return (
             <span
               key={c.name}
               title={`${c.name}: ${fmt(c.tokens)}`}
-              className={cn("h-full", inkColorToBar(c.color))}
+              className={cn("h-full", palette.bar)}
               style={{ width: `${w}%` }}
             />
           );
@@ -140,38 +150,46 @@ function SdkBreakdown({ breakdown }: { breakdown: ContextUsageBreakdown }) {
       </div>
 
       <ul className="space-y-1.5 text-[12px]">
-        {breakdown.categories.map((c) => (
-          <li key={c.name} className="flex items-baseline gap-2">
-            <span
-              className={cn(
-                "mt-1 inline-block size-2 shrink-0 rounded-sm",
-                inkColorToDot(c.color),
-              )}
-              aria-hidden
-            />
-            <span className="min-w-0 flex-1 truncate">
-              {c.name}
-              {c.is_deferred && (
-                <span className="ml-1 text-muted-foreground">(deferred)</span>
-              )}
-            </span>
-            <span className="tabular-nums text-muted-foreground">
-              {fmt(c.tokens)}
-            </span>
-            <span className="w-10 text-right tabular-nums text-muted-foreground">
-              {pctLabel(pctOf(c.tokens))}
-            </span>
-          </li>
-        ))}
+        {usedCategories.map((c) => {
+          const palette = paletteFor(c.color, c.name);
+          return (
+            <li key={c.name} className="flex items-baseline gap-2">
+              <span
+                className={cn(
+                  "mt-1 inline-block size-2 shrink-0 rounded-sm",
+                  palette.dot,
+                )}
+                aria-hidden
+              />
+              <span className="min-w-0 flex-1 truncate">
+                {c.name}
+                {/* SDK already suffixes "(deferred)" on the category
+                    name itself — only append ours if missing, else we
+                    end up with "MCP tools (deferred) (deferred)". */}
+                {c.is_deferred && !/\(deferred\)/i.test(c.name) && (
+                  <span className="ml-1 text-muted-foreground">(deferred)</span>
+                )}
+              </span>
+              <span className="tabular-nums text-muted-foreground">
+                {fmt(c.tokens)}
+              </span>
+              <span className="w-10 text-right tabular-nums text-muted-foreground">
+                {pctLabel(pctOf(c.tokens))}
+              </span>
+            </li>
+          );
+        })}
         <li className="flex items-baseline gap-2 border-t border-border pt-1.5">
           <span
             className="mt-1 inline-block size-2 shrink-0 rounded-sm border border-dashed border-muted-foreground/40"
             aria-hidden
           />
-          <span className="min-w-0 flex-1 truncate font-medium">Free</span>
-          <span className="tabular-nums">{fmt(free)}</span>
+          <span className="min-w-0 flex-1 truncate font-medium">
+            {sdkFree?.name ?? "Free"}
+          </span>
+          <span className="tabular-nums">{fmt(freeTokens)}</span>
           <span className="w-10 text-right tabular-nums">
-            {pctLabel(pctOf(free))}
+            {pctLabel(pctOf(freeTokens))}
           </span>
         </li>
       </ul>
@@ -183,57 +201,62 @@ function SdkBreakdown({ breakdown }: { breakdown: ContextUsageBreakdown }) {
   );
 }
 
-// Ink color names → Tailwind. The SDK ships terminal palette keys
-// ("cyan", "green", "yellow", "magenta", "blue", "red", "gray",
-// "white"); /context uses these to colorize each row in the CLI. We
-// map to roughly comparable Tailwind shades so the web UI mirrors the
-// terminal at a glance. Unknown colors fall back to muted.
-function inkColorToBar(color: string): string {
-  switch (color.toLowerCase()) {
-    case "cyan":
-      return "bg-cyan-500/70";
-    case "green":
-      return "bg-emerald-500/70";
-    case "yellow":
-      return "bg-amber-500/70";
-    case "magenta":
-    case "pink":
-      return "bg-pink-500/70";
-    case "blue":
-      return "bg-sky-500/70";
-    case "red":
-      return "bg-destructive/70";
-    case "gray":
-    case "grey":
-    case "white":
-      return "bg-muted-foreground/40";
-    default:
-      return "bg-violet-500/70";
-  }
-}
+// Tailwind dot+bar color pairs. Anything that goes through paletteFor
+// resolves to one of these — keeps the popover dots and stacked bar in
+// sync without two parallel switches.
+const PALETTE: { dot: string; bar: string }[] = [
+  { dot: "bg-violet-500", bar: "bg-violet-500/70" },
+  { dot: "bg-cyan-500", bar: "bg-cyan-500/70" },
+  { dot: "bg-emerald-500", bar: "bg-emerald-500/70" },
+  { dot: "bg-amber-500", bar: "bg-amber-500/70" },
+  { dot: "bg-pink-500", bar: "bg-pink-500/70" },
+  { dot: "bg-sky-500", bar: "bg-sky-500/70" },
+  { dot: "bg-rose-500", bar: "bg-rose-500/70" },
+  { dot: "bg-indigo-500", bar: "bg-indigo-500/70" },
+];
 
-function inkColorToDot(color: string): string {
+// First try to match the SDK's color string against known chalk/ink
+// palette names. The SDK can also ship hex codes or theme tokens we
+// don't recognise — in that case fall back to a name-derived index so
+// each category still gets a stable, distinct color rather than every
+// row collapsing to the same default.
+function paletteFor(
+  color: string,
+  name: string,
+): { dot: string; bar: string } {
   switch (color.toLowerCase()) {
     case "cyan":
-      return "bg-cyan-500";
+    case "cyanbright":
+      return PALETTE[1];
     case "green":
-      return "bg-emerald-500";
+    case "greenbright":
+      return PALETTE[2];
     case "yellow":
-      return "bg-amber-500";
+    case "yellowbright":
+      return PALETTE[3];
     case "magenta":
+    case "magentabright":
     case "pink":
-      return "bg-pink-500";
+      return PALETTE[4];
     case "blue":
-      return "bg-sky-500";
+    case "bluebright":
+      return PALETTE[5];
     case "red":
-      return "bg-destructive";
-    case "gray":
-    case "grey":
-    case "white":
-      return "bg-muted-foreground/60";
-    default:
-      return "bg-violet-500";
+    case "redbright":
+      return PALETTE[6];
+    case "violet":
+    case "purple":
+      return PALETTE[0];
   }
+  // FNV-1a 32-bit on the category name keeps the assignment stable
+  // across renders and across reloads — same name always gets the same
+  // color so the popover doesn't shimmer when categories update.
+  let h = 0x811c9dc5;
+  for (let i = 0; i < name.length; i++) {
+    h ^= name.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return PALETTE[(h >>> 0) % PALETTE.length];
 }
 
 interface CategoryBar {
