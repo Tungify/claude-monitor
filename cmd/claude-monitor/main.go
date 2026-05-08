@@ -4,12 +4,16 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"log/slog"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"claude-monitor/internal/account"
 	"claude-monitor/internal/config"
 	"claude-monitor/internal/keychain"
+	"claude-monitor/internal/server"
 	"claude-monitor/internal/swap"
 	"claude-monitor/internal/tui"
 	"claude-monitor/internal/update"
@@ -31,6 +35,10 @@ var (
 		"Re-register claude-monitor with the macOS keychain so account swaps don't prompt for "+
 			"a password every time. Asks for your macOS user password once (not stored). "+
 			"No-op on Linux/Windows.")
+	flagServe = flag.String("serve", "",
+		"Run as a daemon: bind an HTTP+SSE API at the given address "+
+			"(e.g. 127.0.0.1:8788) for a separate UI to consume, and exit "+
+			"only on SIGINT/SIGTERM. The TUI is not started in this mode.")
 )
 
 // version is wired by ldflags via the Makefile.
@@ -75,6 +83,13 @@ func main() {
 	}
 
 	cfg, _ := config.Load() // missing/corrupt → defaults; not fatal
+
+	if *flagServe != "" {
+		if err := runServe(*flagServe, *flagRoot, cfg); err != nil {
+			die("daemon: %v", err)
+		}
+		return
+	}
 
 	if *flagKeychainSetup {
 		if err := keychain.RunSetup(discoverConfigDirs(*flagRoot)); err != nil {
@@ -131,6 +146,21 @@ func discoverConfigDirs(rootSpec string) []string {
 		dirs[i] = a.ConfigDir
 	}
 	return dirs
+}
+
+// runServe boots the daemon and blocks until SIGINT/SIGTERM. The
+// keychain-setup bootstrap that gates TUI startup is intentionally
+// skipped here — interactive password prompting doesn't fit a
+// long-running headless daemon. Run `claude-monitor --keychain-setup`
+// once before starting the daemon if swap prompts get noisy.
+func runServe(addr, rootSpec string, cfg config.Config) error {
+	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
+	srv := server.New(rootSpec, cfg, logger)
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	return srv.Start(ctx, addr)
 }
 
 func runUpgrade() error {
