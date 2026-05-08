@@ -75,8 +75,13 @@ interface ChatSession {
   // recent submission is shown in the panel; older ones remain on disk
   // under ~/.claude/projects/<encoded-cwd>/plans/.
   latestPlan?: PlanRecord;
-  // Token counts from the most recent `result` SDK message. The composer
-  // divides input_tokens by the model's context window for the % display.
+  // Per-API-call usage snapshot, captured from the most recent
+  // top-level `assistant` message (NOT from `result.usage`). The SDK
+  // sums `result.usage` across every API round-trip in a turn, so on
+  // a tool-heavy turn `cache_read_input_tokens` balloons to N x the
+  // real cached prefix. Reading from the assistant message gives the
+  // live cached/new-input split for that single call, which is what
+  // the context-window meter wants.
   latestUsage?: SessionUsage;
 }
 
@@ -403,10 +408,16 @@ async function driveSession(session: ChatSession): Promise<void> {
       }
       emit(session, { type: "message", data: msg });
 
-      // The SDK signals end-of-turn with a `result` message. Move back
-      // to "idle" so the UI knows it can prompt for another turn.
-      if (msg.type === "result") {
-        const u = (msg as { usage?: SessionUsage }).usage;
+      // Snapshot per-API-call usage from each top-level assistant
+      // message. Subagent (Task) assistant messages have a non-null
+      // parent_tool_use_id and run inside their own context window, so
+      // their usage must not override the main session's display.
+      if (
+        msg.type === "assistant" &&
+        !(msg as { parent_tool_use_id?: string | null }).parent_tool_use_id
+      ) {
+        const u = (msg as { message?: { usage?: Partial<SessionUsage> } })
+          .message?.usage;
         if (u) {
           session.latestUsage = {
             input_tokens: u.input_tokens ?? 0,
@@ -415,6 +426,11 @@ async function driveSession(session: ChatSession): Promise<void> {
             cache_creation_input_tokens: u.cache_creation_input_tokens ?? 0,
           };
         }
+      }
+
+      // The SDK signals end-of-turn with a `result` message. Move back
+      // to "idle" so the UI knows it can prompt for another turn.
+      if (msg.type === "result") {
         setStatus(session, "idle");
       } else if (
         (msg.type === "assistant" || msg.type === "stream_event") &&

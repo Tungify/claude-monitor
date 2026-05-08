@@ -456,10 +456,20 @@ function shortenCwd(cwd: string): string {
 function latestUsage(
   history: ReturnType<typeof useChatSession>["history"],
 ): SessionUsage | undefined {
+  // Read per-API-call usage from the latest top-level assistant
+  // message. result.usage is a SUM over the turn's tool round-trips
+  // (system prompt counted once per call), so it overstates the
+  // current cached prefix on tool-heavy turns. Subagent assistants
+  // (parent_tool_use_id != null) live in their own context window
+  // and must not override the main session's display.
   for (let i = history.length - 1; i >= 0; i--) {
     const m = history[i];
-    if (m.type !== "result") continue;
-    const u = (m as { usage?: Partial<SessionUsage> }).usage;
+    if (m.type !== "assistant") continue;
+    const parent = (m as { parent_tool_use_id?: string | null })
+      .parent_tool_use_id;
+    if (parent) continue;
+    const u = (m as { message?: { usage?: Partial<SessionUsage> } })
+      .message?.usage;
     if (!u) continue;
     return {
       input_tokens: u.input_tokens ?? 0,
@@ -1261,10 +1271,12 @@ function findAccount(
   return undefined;
 }
 
-// contextWindowUsed approximates current context size from the latest
-// turn's input + output + cache fragments. SDK ships per-turn deltas in
-// `result.usage`, so we sum the four fields rather than relying on a
-// single one — input_tokens alone undercounts cached prefix.
+// contextWindowUsed approximates current context size from one API
+// call's usage (latest assistant message). Sum of the four fields ==
+// total tokens the model processed for that call, which is also the
+// size of the context window slot it occupies. We do NOT use
+// result.usage here because that's a per-turn SUM across tool loops
+// and would overcount cache_read.
 function contextWindowUsed(u: SessionUsage | undefined): number {
   if (!u) return 0;
   return (
