@@ -31,6 +31,15 @@ type Options struct {
 // binary path. Tries the dev layout (<repo>/bin/<exe> + <repo>/web)
 // first, then a "share" install layout, then the current working
 // directory as last resort.
+//
+// A directory qualifies if it carries either of the recognized layouts:
+//
+//   - Standalone (release tarball): contains `server.js` at the root,
+//     produced by `output: "standalone"` in next.config.ts.
+//   - Dev: contains `.next/` plus `node_modules/next/dist/bin/next`,
+//     produced by a plain `next build` against the source repo.
+//
+// Launch picks the matching command based on which marker it sees.
 func FindWebDir() (string, error) {
 	exe, err := os.Executable()
 	if err != nil {
@@ -56,21 +65,44 @@ func FindWebDir() (string, error) {
 		if err != nil {
 			continue
 		}
-		// We require both `.next/` (build output) and the next binary
-		// shipped with node_modules. Either missing → not a usable build.
-		if _, err := os.Stat(filepath.Join(abs, ".next")); err != nil {
-			continue
+		if isStandaloneLayout(abs) || isDevLayout(abs) {
+			return abs, nil
 		}
-		if _, err := os.Stat(filepath.Join(abs, "node_modules", "next", "dist", "bin", "next")); err != nil {
-			continue
-		}
-		return abs, nil
 	}
 	return "", errors.New("web build not found; run `make build-web` first")
 }
 
-// Launch spawns `node node_modules/next/dist/bin/next start ...` from
-// the resolved web directory. The caller owns the returned *exec.Cmd
+// isStandaloneLayout matches release tarballs: a single self-contained
+// directory with `server.js` at the root + `.next/` for the server
+// build. Static assets (`.next/static`, `public/`) are copied alongside
+// during release packaging because Next standalone does NOT do that
+// itself.
+func isStandaloneLayout(dir string) bool {
+	if _, err := os.Stat(filepath.Join(dir, "server.js")); err != nil {
+		return false
+	}
+	if _, err := os.Stat(filepath.Join(dir, ".next")); err != nil {
+		return false
+	}
+	return true
+}
+
+// isDevLayout matches the source repo: full pnpm install plus a built
+// `.next/` directory. Used by `make build-web` and `pnpm dev`.
+func isDevLayout(dir string) bool {
+	if _, err := os.Stat(filepath.Join(dir, ".next")); err != nil {
+		return false
+	}
+	if _, err := os.Stat(filepath.Join(dir, "node_modules", "next", "dist", "bin", "next")); err != nil {
+		return false
+	}
+	return true
+}
+
+// Launch spawns the Next.js server. Standalone bundles run as
+// `node server.js` (the server reads PORT/HOSTNAME from env). Dev
+// builds fall back to `node node_modules/next/dist/bin/next start`
+// with explicit -p/-H flags. The caller owns the returned *exec.Cmd
 // and is responsible for cmd.Wait()/cmd.Process.Kill(). Stdout/Stderr
 // inherit from the parent so the user sees Next's startup banner.
 func Launch(ctx context.Context, opts Options) (*exec.Cmd, string, error) {
@@ -88,21 +120,31 @@ func Launch(ctx context.Context, opts Options) (*exec.Cmd, string, error) {
 	if opts.Port == 0 {
 		opts.Port = 3737
 	}
-	nextBin := filepath.Join(dir, "node_modules", "next", "dist", "bin", "next")
-	if _, err := os.Stat(nextBin); err != nil {
-		return nil, "", fmt.Errorf("next CLI not found at %s: %w", nextBin, err)
+
+	var cmd *exec.Cmd
+	switch {
+	case isStandaloneLayout(dir):
+		// Standalone: server.js is the entry point. PORT/HOSTNAME are
+		// the only knobs it reads — there are no equivalents to next
+		// start's -p/-H flags here.
+		cmd = exec.CommandContext(ctx, "node", "server.js")
+	case isDevLayout(dir):
+		nextBin := filepath.Join(dir, "node_modules", "next", "dist", "bin", "next")
+		cmd = exec.CommandContext(ctx, "node", nextBin, "start",
+			"-p", strconv.Itoa(opts.Port),
+			"-H", opts.Hostname,
+		)
+	default:
+		return nil, "", fmt.Errorf("web dir %s is missing both server.js and node_modules/next — rebuild via `make build-web`", dir)
 	}
-	cmd := exec.CommandContext(ctx, "node", nextBin, "start",
-		"-p", strconv.Itoa(opts.Port),
-		"-H", opts.Hostname,
-	)
 	cmd.Dir = dir
 	env := os.Environ()
 	if opts.DaemonURL != "" {
 		env = append(env, "DAEMON_INTERNAL_URL="+opts.DaemonURL)
 	}
 	// Pass PORT/HOSTNAME too so any code that reads them (e.g. Next's
-	// internal logging) agrees with the CLI flags.
+	// internal logging, or the standalone server's bind selection)
+	// agrees with the requested values.
 	env = append(env,
 		"PORT="+strconv.Itoa(opts.Port),
 		"HOSTNAME="+opts.Hostname,
