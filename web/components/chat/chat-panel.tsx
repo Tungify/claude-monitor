@@ -9,6 +9,7 @@ import { Badge } from "@/components/ui/badge";
 import type { SessionSummary } from "@/lib/chat-types";
 import { MessageBubble } from "./message-bubble";
 import { PermissionDialog } from "./permission-dialog";
+import { PlanCard } from "./plan-card";
 
 interface Props {
   session: SessionSummary;
@@ -90,6 +91,9 @@ export function ChatPanel({ session }: Props) {
           {chat.history.map((msg, i) => (
             <MessageBubble key={msg.uuid ?? `m${i}`} msg={msg} />
           ))}
+          {chat.latestPlan && (
+            <PlanCard plan={chat.latestPlan} onApprove={chat.approvePlan} />
+          )}
           {chat.errors.map((err, i) => (
             <div
               key={`e${i}`}

@@ -12,6 +12,11 @@ import {
 } from "@anthropic-ai/claude-agent-sdk";
 
 import { AsyncQueue } from "./async-queue";
+import {
+  createPlanMcpServer,
+  PLAN_MCP_SERVER_NAME,
+  SUBMIT_PLAN_FQN,
+} from "./plan-mcp";
 import type {
   ChatEvent,
   PermissionDecision,
@@ -20,6 +25,7 @@ import type {
   SessionStatus,
   SessionSummary,
 } from "@/lib/chat-types";
+import type { PlanRecord } from "@/lib/plan-types";
 
 interface PendingPermission {
   request: PermissionRequest;
@@ -40,12 +46,23 @@ interface ChatSession {
   pendingPermission?: PendingPermission;
   emitter: EventEmitter;
   abortController: AbortController;
+  // Latest plan submitted via the submit_plan MCP tool. Only the most
+  // recent submission is shown in the panel; older ones remain on disk
+  // under ~/.claude/projects/<encoded-cwd>/plans/.
+  latestPlan?: PlanRecord;
 }
 
-// Module-scoped registry. Survives across requests within a single Next.js
-// process. NOT shared across instances — for production multi-instance
-// deploys we'd need to externalize this (Redis/DB). M3 is local-only.
-const sessions = new Map<string, ChatSession>();
+// Stash the registry on globalThis so it survives Next.js dev module
+// reloads (Turbopack re-evaluates server modules unpredictably; without
+// this, every recompile drops in-flight chat sessions). Production
+// multi-instance still needs externalization (Redis/DB), but for the
+// single-process Next dev/run we use, this is enough.
+const SESSIONS_KEY = Symbol.for("claude-monitor.web.sessions");
+type SessionsGlobal = typeof globalThis & {
+  [SESSIONS_KEY]?: Map<string, ChatSession>;
+};
+const g = globalThis as SessionsGlobal;
+const sessions: Map<string, ChatSession> = (g[SESSIONS_KEY] ??= new Map());
 
 // Cap history per session to prevent unbounded memory growth from a long-
 // running chat. The full transcript stays in the SDK's session store on
@@ -107,6 +124,12 @@ export function createSession(opts: {
   };
 
   const canUseTool: CanUseTool = (toolName, input, ctx) => {
+    // submit_plan is purely informational: it persists structured plan
+    // data and emits an SSE event. Auto-allow so the model isn't blocked
+    // on a UI dialog the user doesn't need to see.
+    if (toolName === SUBMIT_PLAN_FQN) {
+      return Promise.resolve({ behavior: "allow", updatedInput: input });
+    }
     return new Promise<PermissionResult>((resolve) => {
       const request: PermissionRequest = {
         id: randomUUID(),
@@ -142,6 +165,15 @@ export function createSession(opts: {
     });
   };
 
+  const planMcp = createPlanMcpServer({
+    sessionId: id,
+    cwd: opts.cwd,
+    onPlanSubmitted: (plan) => {
+      session.latestPlan = plan;
+      emit(session, { type: "plan_submitted", data: plan });
+    },
+  });
+
   session.query = query({
     prompt: inputQueue,
     options: {
@@ -149,6 +181,7 @@ export function createSession(opts: {
       env: { ...process.env, CLAUDE_CONFIG_DIR: opts.configDir },
       permissionMode: "default",
       canUseTool,
+      mcpServers: { [PLAN_MCP_SERVER_NAME]: planMcp },
       abortController,
       sessionId: id,
     },
@@ -207,7 +240,28 @@ export function snapshotSession(id: string): SessionSnapshot | undefined {
     summary: summarize(s),
     history: s.history,
     pending_permission: s.pendingPermission?.request,
+    latest_plan: s.latestPlan,
   };
+}
+
+export function getLatestPlan(sessionId: string): PlanRecord | undefined {
+  return sessions.get(sessionId)?.latestPlan;
+}
+
+export function setLatestPlan(sessionId: string, plan: PlanRecord): void {
+  const s = sessions.get(sessionId);
+  if (!s) throw new Error("session not found");
+  s.latestPlan = plan;
+}
+
+export function emitPlanEvent(
+  sessionId: string,
+  type: "plan_approved" | "plan_failed",
+  plan: PlanRecord,
+): void {
+  const s = sessions.get(sessionId);
+  if (!s) throw new Error("session not found");
+  emit(s, { type, data: plan });
 }
 
 export function sendMessage(sessionId: string, text: string): void {

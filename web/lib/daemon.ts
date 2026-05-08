@@ -46,10 +46,15 @@ export type DaemonEvent =
   | { type: "swap"; data: SwapEvent }
   | { type: "error"; data: DaemonError };
 
-// NEXT_PUBLIC_ env vars are inlined at build time. Override in
-// web/.env.local for non-default daemon addresses.
+// Browser hits the Next.js /daemon proxy (rewrite in next.config.ts)
+// so EventSource stays same-origin — cross-port SSE hits browser
+// anti-tracking even when CORS allows *. Server-side (API routes)
+// reaches the daemon directly; relative URLs would have no base in
+// Node fetch.
 export const DAEMON_URL =
-  process.env.NEXT_PUBLIC_DAEMON_URL ?? "http://127.0.0.1:8788";
+  typeof window === "undefined"
+    ? process.env.DAEMON_INTERNAL_URL ?? "http://127.0.0.1:8788"
+    : process.env.NEXT_PUBLIC_DAEMON_URL ?? "/daemon";
 
 async function jsonOrThrow<T>(res: Response): Promise<T> {
   if (!res.ok) {
@@ -80,6 +85,33 @@ export async function swapTo(
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ ident }),
+    signal,
+  });
+  return jsonOrThrow(res);
+}
+
+// WorktreePhase + WorktreeResult mirror the Go shapes in
+// internal/server/worktrees.go. The daemon expects branch names per
+// phase; web picks the convention (currently `wo/<plan-short>/<slug>`).
+export interface WorktreePhasePayload {
+  slug: string;
+  branch: string;
+}
+
+export interface WorktreeResult {
+  phase_slug: string;
+  path: string;
+  branch: string;
+}
+
+export async function createWorktrees(
+  payload: { plan_id: string; repo_path: string; phases: WorktreePhasePayload[] },
+  signal?: AbortSignal,
+): Promise<{ worktrees: WorktreeResult[] }> {
+  const res = await fetch(`${DAEMON_URL}/api/worktrees`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
     signal,
   });
   return jsonOrThrow(res);

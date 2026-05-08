@@ -43,6 +43,18 @@ export async function GET(req: Request, { params }: Ctx) {
       if (snap.pending_permission) {
         writeEvent({ type: "permission_request", data: snap.pending_permission });
       }
+      if (snap.latest_plan) {
+        // Replay as the matching event type so the client reducer ends up
+        // in the right state (submitted vs approved vs failed) without
+        // extra branching.
+        const evType =
+          snap.latest_plan.status === "approved"
+            ? "plan_approved"
+            : snap.latest_plan.status === "failed"
+              ? "plan_failed"
+              : "plan_submitted";
+        writeEvent({ type: evType, data: snap.latest_plan });
+      }
 
       const unsubscribe = subscribe(id, writeEvent);
 

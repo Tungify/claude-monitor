@@ -3,6 +3,7 @@
 // @anthropic-ai/claude-agent-sdk — that's a type-only import, no bundle cost.
 
 import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
+import type { PlanRecord } from "./plan-types";
 
 export type SessionStatus =
   | "starting"
@@ -42,6 +43,9 @@ export type ChatEvent =
   | { type: "status"; data: { status: SessionStatus } }
   | { type: "permission_request"; data: PermissionRequest }
   | { type: "permission_resolved"; data: { id: string } }
+  | { type: "plan_submitted"; data: PlanRecord }
+  | { type: "plan_approved"; data: PlanRecord }
+  | { type: "plan_failed"; data: PlanRecord }
   | { type: "error"; data: { message: string } }
   | { type: "closed"; data: Record<string, never> };
 
@@ -51,6 +55,7 @@ export interface SessionSnapshot {
   summary: SessionSummary;
   history: SDKMessage[];
   pending_permission?: PermissionRequest;
+  latest_plan?: PlanRecord;
 }
 
 export interface CreateSessionRequest {

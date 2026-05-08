@@ -7,6 +7,7 @@ import type {
   PermissionRequest,
   SessionStatus,
 } from "@/lib/chat-types";
+import type { PlanRecord } from "@/lib/plan-types";
 
 export type ConnectionState = "connecting" | "open" | "closed";
 
@@ -14,6 +15,7 @@ interface State {
   history: SDKMessage[];
   status: SessionStatus;
   pendingPermission: PermissionRequest | null;
+  latestPlan: PlanRecord | null;
   errors: string[];
   connection: ConnectionState;
 }
@@ -23,6 +25,7 @@ type Action =
   | { kind: "status"; status: SessionStatus }
   | { kind: "permission_request"; req: PermissionRequest }
   | { kind: "permission_resolved" }
+  | { kind: "plan"; plan: PlanRecord }
   | { kind: "chat_error"; message: string }
   | { kind: "connection"; state: ConnectionState };
 
@@ -38,6 +41,8 @@ function reducer(state: State, action: Action): State {
       return { ...state, pendingPermission: action.req };
     case "permission_resolved":
       return { ...state, pendingPermission: null };
+    case "plan":
+      return { ...state, latestPlan: action.plan };
     case "chat_error":
       return { ...state, errors: [action.message, ...state.errors].slice(0, ERROR_CAP) };
     case "connection":
@@ -49,6 +54,7 @@ const initial: State = {
   history: [],
   status: "starting",
   pendingPermission: null,
+  latestPlan: null,
   errors: [],
   connection: "connecting",
 };
@@ -56,6 +62,7 @@ const initial: State = {
 export interface UseChatSession extends State {
   send: (text: string) => Promise<void>;
   decide: (decision: PermissionDecision) => Promise<void>;
+  approvePlan: (planId: string) => Promise<void>;
   stop: () => Promise<void>;
 }
 
@@ -88,6 +95,13 @@ export function useChatSession(sessionId: string): UseChatSession {
     es.addEventListener("permission_resolved", () => {
       dispatch({ kind: "permission_resolved" });
     });
+    const onPlan = (e: Event) => {
+      const plan = JSON.parse((e as MessageEvent).data) as PlanRecord;
+      dispatch({ kind: "plan", plan });
+    };
+    es.addEventListener("plan_submitted", onPlan);
+    es.addEventListener("plan_approved", onPlan);
+    es.addEventListener("plan_failed", onPlan);
     es.addEventListener("closed", () => {
       dispatch({ kind: "connection", state: "closed" });
       es.close();
@@ -140,9 +154,21 @@ export function useChatSession(sessionId: string): UseChatSession {
     }
   };
 
+  const approvePlan = async (planId: string) => {
+    const res = await fetch(`/api/chat/${sessionId}/plan/approve`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ plan_id: planId }),
+    });
+    if (!res.ok) {
+      const body = await res.text();
+      dispatch({ kind: "chat_error", message: `approve failed: ${body}` });
+    }
+  };
+
   const stop = async () => {
     await fetch(`/api/chat/${sessionId}`, { method: "DELETE" });
   };
 
-  return { ...state, send, decide, stop };
+  return { ...state, send, decide, approvePlan, stop };
 }
