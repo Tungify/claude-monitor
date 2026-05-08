@@ -8,6 +8,14 @@ const nextConfig: NextConfig = {
   // /daemon/* is proxied via the App Router route at app/daemon/[...path]/
   // — a custom handler instead of `rewrites` because rewrites buffer SSE
   // bodies, breaking EventSource for the daemon's /api/events stream.
+  //
+  // Standalone output produces `.next/standalone/server.js` with only
+  // the runtime deps copied in (no full node_modules). Lets the release
+  // bundle ship as one ~50MB tarball instead of dragging the full
+  // ~940MB pnpm store. The Go launcher (`internal/web/launcher.go`)
+  // detects server.js and spawns `node server.js`; falls back to
+  // `next start` for the legacy dev layout.
+  output: "standalone",
 };
 
 export default nextConfig;

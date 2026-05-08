@@ -6,13 +6,54 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Tag name to (re)build, e.g. v0.1.2'
+        description: 'Tag name to (re)build, e.g. v0.7.0'
         required: true
 
 permissions:
   contents: write
 
 jobs:
+  # The web bundle is platform-independent (Next standalone copies only
+  # the JS runtime deps; we don't use next/image, so sharp's native
+  # binaries don't enter the bundle). Build once on ubuntu and reuse
+  # across every per-platform tarball.
+  build-web:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          # pnpm 10 — pnpm-workspace.yaml in web/ uses
+          # `ignoredBuiltDependencies` (skip lifecycle scripts for sharp +
+          # unrs-resolver). pnpm 9 rejects that file without a packages
+          # field, so pin 10.x to match the local toolchain.
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'pnpm'
+          cache-dependency-path: web/pnpm-lock.yaml
+      - name: Install web deps
+        working-directory: web
+        run: pnpm install --frozen-lockfile
+      - name: Build web (Next standalone)
+        working-directory: web
+        run: pnpm exec next build
+      - name: Assemble web bundle
+        # Next standalone leaves static assets + public/ outside the
+        # bundle. Copy them next to server.js so the runtime serves
+        # /_next/* and /favicon.ico without 404s.
+        working-directory: web
+        run: |
+          set -eu
+          cp -R .next/static .next/standalone/.next/static
+          if [ -d public ]; then cp -R public .next/standalone/public; fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: web-bundle
+          path: web/.next/standalone
+          if-no-files-found: error
+
   # darwin builds need a macOS runner so we can ad-hoc codesign with
   # the system codesign tool. linux/windows builds cross-compile fine
   # from ubuntu and don't need any post-processing.
@@ -31,7 +72,7 @@ jobs:
         run: |
           set -eu
           version="${GITHUB_REF_NAME:-${{ github.event.inputs.tag }}}"
-          out="claude-monitor-darwin-${{ matrix.arch }}"
+          out="claude-monitor"
           GOOS=darwin GOARCH=${{ matrix.arch }} CGO_ENABLED=1 go build \
             -ldflags "-X main.version=${version} -linkmode=external" \
             -o "${out}" ./cmd/claude-monitor
@@ -39,7 +80,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: bin-darwin-${{ matrix.arch }}
-          path: claude-monitor-darwin-${{ matrix.arch }}
+          path: claude-monitor
           if-no-files-found: error
 
   build-cross:
@@ -69,23 +110,93 @@ jobs:
         run: |
           set -eu
           version="${GITHUB_REF_NAME:-${{ github.event.inputs.tag }}}"
-          out="claude-monitor-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}"
+          out="claude-monitor${{ matrix.ext }}"
           GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} CGO_ENABLED=0 go build \
             -ldflags "-X main.version=${version}" \
             -o "${out}" ./cmd/claude-monitor
       - uses: actions/upload-artifact@v4
         with:
           name: bin-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: claude-monitor-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}
+          path: claude-monitor${{ matrix.ext }}
+          if-no-files-found: error
+
+  # Bundle each platform binary with the web/ standalone folder into a
+  # single archive (tar.gz for posix, zip for windows). The archive's
+  # top-level directory matches the install layout the Go launcher's
+  # FindWebDir() expects: ./claude-monitor + ./web/.
+  package:
+    needs: [build-web, build-darwin, build-cross]
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - goos: darwin
+            goarch: amd64
+            ext: ''
+            archive: tar
+          - goos: darwin
+            goarch: arm64
+            ext: ''
+            archive: tar
+          - goos: linux
+            goarch: amd64
+            ext: ''
+            archive: tar
+          - goos: linux
+            goarch: arm64
+            ext: ''
+            archive: tar
+          - goos: windows
+            goarch: amd64
+            ext: '.exe'
+            archive: zip
+          - goos: windows
+            goarch: arm64
+            ext: '.exe'
+            archive: zip
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: bin-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: ./bin
+      - uses: actions/download-artifact@v4
+        with:
+          name: web-bundle
+          path: ./web-bundle
+      - name: Assemble bundle
+        run: |
+          set -eu
+          version="${GITHUB_REF_NAME:-${{ github.event.inputs.tag }}}"
+          name="claude-monitor-${version}-${{ matrix.goos }}-${{ matrix.goarch }}"
+          mkdir -p "${name}/web"
+          mv "./bin/claude-monitor${{ matrix.ext }}" "${name}/claude-monitor${{ matrix.ext }}"
+          chmod +x "${name}/claude-monitor${{ matrix.ext }}" || true
+          # web-bundle is the unwrapped contents of .next/standalone —
+          # move them to ${name}/web/ so launcher.go's FindWebDir picks
+          # them up via the binary's parent directory.
+          shopt -s dotglob
+          mv ./web-bundle/* "${name}/web/"
+          ls -la "${name}"
+          ls -la "${name}/web" | head -10
+          if [ "${{ matrix.archive }}" = "zip" ]; then
+            zip -r "${name}.zip" "${name}"
+          else
+            tar -czf "${name}.tar.gz" "${name}"
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pkg-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: claude-monitor-*.${{ matrix.archive == 'zip' && 'zip' || 'tar.gz' }}
           if-no-files-found: error
 
   release:
-    needs: [build-darwin, build-cross]
+    needs: [package]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
         with:
           path: dist
+          pattern: pkg-*
           merge-multiple: true
       - name: Generate checksums
         working-directory: dist
@@ -99,10 +210,6 @@ jobs:
           tag_name: ${{ github.event.inputs.tag || github.ref_name }}
           generate_release_notes: true
           files: |
-            dist/claude-monitor-darwin-amd64
-            dist/claude-monitor-darwin-arm64
-            dist/claude-monitor-linux-amd64
-            dist/claude-monitor-linux-arm64
-            dist/claude-monitor-windows-amd64.exe
-            dist/claude-monitor-windows-arm64.exe
+            dist/*.tar.gz
+            dist/*.zip
             dist/checksums.txt
