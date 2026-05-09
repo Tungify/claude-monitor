@@ -410,36 +410,16 @@ function PublicRow({
             </p>
           </div>
         </div>
-        <div className="flex items-center gap-1.5">
-          {status.enabled && (
-            // Reconfigure path: lets the user change tunnel name /
-            // hostname / allowlist without having to Disable first. The
-            // alternative — toggle off, edit, toggle back on — also
-            // briefly drops the auth gate which is annoying when LAN
-            // is sharing the same token.
-            <Button
-              size="sm"
-              variant="outline"
-              disabled={busy || partialNamed}
-              onClick={onEnable}
-              title="Restart tunnel with the current inputs"
-            >
-              {busy && <RefreshCw className="mr-1 size-3.5 animate-spin" />}
-              {!busy && <RefreshCw className="mr-1 size-3.5" />}
-              Reconfigure
-            </Button>
-          )}
-          <Button
-            size="sm"
-            variant={status.enabled ? "outline" : "default"}
-            disabled={busy || (!status.enabled && partialNamed)}
-            onClick={status.enabled ? onDisable : onEnable}
-          >
-            {busy && <RefreshCw className="mr-1 size-3.5 animate-spin" />}
-            {!busy && <Globe className="mr-1 size-3.5" />}
-            {status.enabled ? "Disable" : "Enable public"}
-          </Button>
-        </div>
+        <Button
+          size="sm"
+          variant={status.enabled ? "outline" : "default"}
+          disabled={busy || (!status.enabled && partialNamed)}
+          onClick={status.enabled ? onDisable : onEnable}
+        >
+          {busy && <RefreshCw className="mr-1 size-3.5 animate-spin" />}
+          {!busy && <Globe className="mr-1 size-3.5" />}
+          {status.enabled ? "Disable" : "Enable public"}
+        </Button>
       </header>
 
       {status.error && status.error.includes("cloudflared binary not found") && (
@@ -467,16 +447,8 @@ function PublicRow({
           </Alert>
         )}
 
-      {/* Inputs are always visible — even when public is on — so the
-          user can change tunnel name / hostname / allowlist without
-          having to disable first. The "Reconfigure" button next to
-          "Disable" applies the changes by recycling cloudflared with
-          the new args. Without this, a user who first enabled with
-          empty fields (quick tunnel) had no way to switch to a named
-          tunnel without going through Disable + Enable, and the
-          auto-start path on next boot would silently keep the quick
-          tunnel running. */}
-      <div className="space-y-3">
+      {!status.enabled && (
+        <div className="space-y-3">
           <div className="space-y-1.5">
             <label className="text-xs font-semibold tracking-wider text-muted-foreground uppercase">
               Named tunnel (recommended for SSE)
@@ -589,6 +561,7 @@ function PublicRow({
             )}
           </div>
         </div>
+      )}
 
       {status.enabled && !status.pending && status.url && (
         <PublicDetails
