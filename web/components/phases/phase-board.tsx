@@ -1,7 +1,13 @@
 "use client";
 
 import Link from "next/link";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useState,
+  useSyncExternalStore,
+} from "react";
 import {
   AlertTriangle,
   ArrowRight,
@@ -10,9 +16,11 @@ import {
   Clock,
   GitCommit,
   GitMerge,
+  KanbanSquare,
   Loader2,
   Megaphone,
   MessageSquareText,
+  Network,
   RotateCw,
   ScanLine,
   ShieldCheck,
@@ -32,8 +40,59 @@ import type {
 } from "@/lib/plan-types";
 import type { RateLimitInfo, SessionStatus, SessionSummary } from "@/lib/chat-types";
 import { Badge } from "@/components/ui/badge";
+import { DagView } from "./dag-view";
 
 type Column = "todo" | "running" | "awaiting" | "done";
+type BoardView = "kanban" | "dag";
+
+// LocalStorage key for the per-plan view preference. Per-plan rather
+// than global because plans differ — a 3-phase plan with no deps
+// reads fine in kanban; a 12-phase plan with a layered DAG is the
+// reason the dag view exists in the first place.
+function viewStorageKey(planId: string): string {
+  return `cm:phase-board:view:${planId}`;
+}
+
+// Same-tab notifier for the view-preference store. The browser only
+// fires `storage` events on OTHER tabs by default; to make
+// useSyncExternalStore re-read in the current tab after we write, we
+// pump a dispatcher of our own that subscribers attach to.
+const VIEW_PREF_EVENT = "cm:phase-board:view-changed";
+const viewPrefBus =
+  typeof window !== "undefined" ? new EventTarget() : undefined;
+
+function readBoardView(planId: string): BoardView {
+  try {
+    const v = window.localStorage.getItem(viewStorageKey(planId));
+    if (v === "dag" || v === "kanban") return v;
+  } catch {
+    // private mode / quota — ignore
+  }
+  return "kanban";
+}
+
+function writeBoardView(planId: string, view: BoardView): void {
+  try {
+    window.localStorage.setItem(viewStorageKey(planId), view);
+  } catch {
+    // ignore — preference just won't persist
+  }
+  viewPrefBus?.dispatchEvent(new CustomEvent(VIEW_PREF_EVENT));
+}
+
+function subscribeBoardView(notify: () => void): () => void {
+  if (typeof window === "undefined" || !viewPrefBus) return () => {};
+  const onCustom = () => notify();
+  const onStorage = (e: StorageEvent) => {
+    if (e.key && e.key.startsWith("cm:phase-board:view:")) notify();
+  };
+  viewPrefBus.addEventListener(VIEW_PREF_EVENT, onCustom);
+  window.addEventListener("storage", onStorage);
+  return () => {
+    viewPrefBus.removeEventListener(VIEW_PREF_EVENT, onCustom);
+    window.removeEventListener("storage", onStorage);
+  };
+}
 
 interface PhaseRow {
   phase: Phase;
@@ -130,7 +189,24 @@ export function PhaseBoard({ plan: initialPlan }: { plan: PlanRecord }) {
   const [notesOpen, setNotesOpen] = useState<boolean>(
     (initialPlan.notes?.length ?? 0) > 0,
   );
+  // View toggle: kanban (default — same swimlanes as before) or dag
+  // (depends_on rendered as a left-to-right node graph). Preference
+  // is remembered per-plan in localStorage so a user who reasons in
+  // graph form for one plan doesn't have to re-toggle every visit.
+  //
+  // Backed by useSyncExternalStore against localStorage so the view is
+  // hydration-safe (server snapshot returns "kanban", client snapshot
+  // reads the saved value) and stays in sync across tabs.
   const initialPlanId = initialPlan.id;
+  const view = useSyncExternalStore<BoardView>(
+    subscribeBoardView,
+    () => readBoardView(initialPlanId),
+    () => "kanban",
+  );
+  const handleSetView = useCallback(
+    (next: BoardView) => writeBoardView(initialPlanId, next),
+    [initialPlanId],
+  );
 
   // Poll /api/chat for live status. 1500ms is fast enough that a
   // running phase flips columns within a couple of frames after its
@@ -529,6 +605,7 @@ export function PhaseBoard({ plan: initialPlan }: { plan: PlanRecord }) {
           </div>
         </div>
         <div className="flex shrink-0 items-center gap-2 text-xs">
+          <ViewToggle value={view} onChange={handleSetView} />
           <Counter label="running" value={counters.running} tone="amber" />
           <Counter label="awaiting" value={counters.awaiting} tone="blue" />
           <Counter label="done" value={counters.done} tone="emerald" />
@@ -574,20 +651,24 @@ export function PhaseBoard({ plan: initialPlan }: { plan: PlanRecord }) {
         onToggle={() => setNotesOpen((v) => !v)}
       />
 
-      <div className="grid min-h-0 flex-1 grid-cols-1 gap-3 overflow-x-auto p-4 md:grid-cols-2 xl:grid-cols-4">
-        {COLUMNS.map((col) => (
-          <ColumnView
-            key={col.id}
-            label={col.label}
-            tint={col.tint}
-            rows={buckets[col.id]}
-            onComplete={handleComplete}
-            pendingCompleteSlug={pendingCompleteSlug}
-            onReview={handleReview}
-            pendingReviewSlug={pendingReviewSlug}
-          />
-        ))}
-      </div>
+      {view === "kanban" ? (
+        <div className="grid min-h-0 flex-1 grid-cols-1 gap-3 overflow-x-auto p-4 md:grid-cols-2 xl:grid-cols-4">
+          {COLUMNS.map((col) => (
+            <ColumnView
+              key={col.id}
+              label={col.label}
+              tint={col.tint}
+              rows={buckets[col.id]}
+              onComplete={handleComplete}
+              pendingCompleteSlug={pendingCompleteSlug}
+              onReview={handleReview}
+              pendingReviewSlug={pendingReviewSlug}
+            />
+          ))}
+        </div>
+      ) : (
+        <DagView rows={phaseRows} />
+      )}
     </div>
   );
 }
@@ -1939,6 +2020,59 @@ function formatNoteTime(iso: string): string {
   if (diff < 3_600_000) return `${Math.round(diff / 60_000)}m ago`;
   if (diff < 86_400_000) return `${Math.round(diff / 3_600_000)}h ago`;
   return new Date(t).toLocaleString();
+}
+
+// ViewToggle is a 2-button segmented control for kanban / dag. Sits in
+// the header so the user can flip without scrolling. Active button
+// gets the primary background; the inactive one stays muted so the
+// current state is unambiguous at a glance.
+function ViewToggle({
+  value,
+  onChange,
+}: {
+  value: BoardView;
+  onChange: (next: BoardView) => void;
+}) {
+  return (
+    <div
+      role="tablist"
+      aria-label="Board view"
+      className="inline-flex items-center rounded-md border bg-muted/30 p-0.5 font-mono"
+    >
+      <button
+        type="button"
+        role="tab"
+        aria-selected={value === "kanban"}
+        onClick={() => onChange("kanban")}
+        className={cn(
+          "inline-flex items-center gap-1 rounded px-2 py-1 transition-colors",
+          value === "kanban"
+            ? "bg-background text-foreground shadow-sm"
+            : "text-muted-foreground hover:text-foreground",
+        )}
+        title="Kanban swimlanes by status"
+      >
+        <KanbanSquare className="size-3" aria-hidden />
+        <span>kanban</span>
+      </button>
+      <button
+        type="button"
+        role="tab"
+        aria-selected={value === "dag"}
+        onClick={() => onChange("dag")}
+        className={cn(
+          "inline-flex items-center gap-1 rounded px-2 py-1 transition-colors",
+          value === "dag"
+            ? "bg-background text-foreground shadow-sm"
+            : "text-muted-foreground hover:text-foreground",
+        )}
+        title="Dependency graph by depends_on"
+      >
+        <Network className="size-3" aria-hidden />
+        <span>dag</span>
+      </button>
+    </div>
+  );
 }
 
 function Counter({
