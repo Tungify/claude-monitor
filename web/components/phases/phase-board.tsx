@@ -185,6 +185,13 @@ export function PhaseBoard({ plan: initialPlan }: { plan: PlanRecord }) {
   const [pendingReviewSlug, setPendingReviewSlug] = useState<string | null>(
     null,
   );
+  // Per-row pending state for the restart click. Same pattern as the
+  // complete/review buttons: spinner only on the row whose POST is in
+  // flight, so a slow restart on phase A doesn't gray out phase B's
+  // affordances.
+  const [pendingRestartSlug, setPendingRestartSlug] = useState<string | null>(
+    null,
+  );
   // Mirror the plan's merge fields locally so the panel updates without
   // a route nav after POST /merge returns. Default the input to the
   // last-used integration branch (or "main" on first run).
@@ -577,6 +584,48 @@ export function PhaseBoard({ plan: initialPlan }: { plan: PlanRecord }) {
     [initialPlanId],
   );
 
+  // Restart a phase: tears down the old chat session, spawns a fresh
+  // one in the same worktree with the same kickoff prompt. Server gates
+  // by commit_status (refuses already-committed phases). On success the
+  // session_id changes — the /api/chat poll picks up the new row on its
+  // next tick, so we just splice the new phase_sessions slice locally.
+  const handleRestart = useCallback(
+    async (slug: string) => {
+      if (pendingRestartSlug) return;
+      // Confirm before stopping a live session — restart is destructive
+      // for any in-flight model output. Errored/closed sessions don't
+      // really have anything to lose, but a single confirm path is
+      // simpler than branching on status.
+      const ok = window.confirm(
+        `Restart phase "${slug}"? The current chat session will be stopped and a fresh one will be spawned in the same worktree with the original kickoff prompt.`,
+      );
+      if (!ok) return;
+      setPendingRestartSlug(slug);
+      try {
+        const res = await fetch(
+          `/api/plans/${encodeURIComponent(initialPlanId)}/phases/${encodeURIComponent(slug)}/restart`,
+          { method: "POST" },
+        );
+        if (!res.ok) {
+          const detail = await res.text();
+          console.error(
+            `[phase-board] restart ${slug} failed:`,
+            res.status,
+            detail,
+          );
+          return;
+        }
+        const data = (await res.json()) as { plan: PlanRecord };
+        setPhaseSessions(data.plan.phase_sessions ?? []);
+      } catch (err) {
+        console.error(`[phase-board] restart ${slug} threw:`, err);
+      } finally {
+        setPendingRestartSlug(null);
+      }
+    },
+    [initialPlanId, pendingRestartSlug],
+  );
+
   // Plan-level merge — kicks the integration branch checkout +
   // `git merge --no-ff` per phase branch. Server returns the canonical
   // updated plan; we splice the merge fields into local state without
@@ -806,6 +855,8 @@ export function PhaseBoard({ plan: initialPlan }: { plan: PlanRecord }) {
               pendingCompleteSlug={pendingCompleteSlug}
               onReview={handleReview}
               pendingReviewSlug={pendingReviewSlug}
+              onRestart={handleRestart}
+              pendingRestartSlug={pendingRestartSlug}
             />
           ))}
         </div>
@@ -824,6 +875,8 @@ function ColumnView({
   pendingCompleteSlug,
   onReview,
   pendingReviewSlug,
+  onRestart,
+  pendingRestartSlug,
 }: {
   label: string;
   tint: string;
@@ -832,6 +885,8 @@ function ColumnView({
   pendingCompleteSlug: string | null;
   onReview: (slug: string) => void;
   pendingReviewSlug: string | null;
+  onRestart: (slug: string) => void;
+  pendingRestartSlug: string | null;
 }) {
   return (
     <div className="flex min-h-0 flex-col">
@@ -860,6 +915,8 @@ function ColumnView({
                 pending={pendingCompleteSlug === row.phase.slug}
                 onReview={onReview}
                 reviewPending={pendingReviewSlug === row.phase.slug}
+                onRestart={onRestart}
+                restartPending={pendingRestartSlug === row.phase.slug}
               />
             </li>
           ))
@@ -875,12 +932,16 @@ function PhaseRowCard({
   pending,
   onReview,
   reviewPending,
+  onRestart,
+  restartPending,
 }: {
   row: PhaseRow;
   onComplete: (slug: string) => void;
   pending: boolean;
   onReview: (slug: string) => void;
   reviewPending: boolean;
+  onRestart: (slug: string) => void;
+  restartPending: boolean;
 }) {
   const { phase, link, session, blockedDeps, isPending } = row;
   const status = session?.status;
@@ -905,6 +966,19 @@ function PhaseRowCard({
     !!link &&
     (link.commit_status === "clean" || link.commit_status === "committed") &&
     reviewState !== "running";
+  // Restart eligibility: agent is spawned, the run has actually settled
+  // or wedged (errored / closed / rate-limited), and we haven't already
+  // committed something — restarting a committed phase would orphan
+  // dependents that already advanced past it. The server enforces the
+  // commit-status gate too; the UI hides the button for a quieter
+  // affordance.
+  const canRestart =
+    !!link &&
+    (status === "errored" ||
+      status === "closed" ||
+      status === "rate_limited") &&
+    link.commit_status !== "clean" &&
+    link.commit_status !== "committed";
   // Local expand toggle for the findings panel. Default: open when a
   // fresh review with findings has just landed; collapse otherwise so
   // long phase lists stay compact. The user can flip it manually via
@@ -1017,6 +1091,33 @@ function PhaseRowCard({
               <span className="font-mono">open agent</span>
               <ArrowRight className="size-3" aria-hidden />
             </Link>
+            {canRestart && (
+              <button
+                type="button"
+                onClick={() => onRestart(phase.slug)}
+                disabled={restartPending}
+                className={cn(
+                  "inline-flex items-center gap-1 rounded-md border px-2 py-1 text-[11px]",
+                  "border-amber-500/40 bg-amber-500/10 text-amber-700 hover:bg-amber-500/20",
+                  "dark:text-amber-300",
+                  "disabled:cursor-not-allowed disabled:opacity-60",
+                )}
+                title={
+                  status === "errored"
+                    ? "Stop the failed session and spawn a fresh one with the original kickoff prompt"
+                    : status === "rate_limited"
+                      ? "Stop the rate-limited session and spawn a fresh one — useful when the SDK's backoff is longer than the actual rate-limit window"
+                      : "Stop the closed session and spawn a fresh one with the original kickoff prompt"
+                }
+              >
+                {restartPending ? (
+                  <Loader2 className="size-3 animate-spin" aria-hidden />
+                ) : (
+                  <RotateCw className="size-3" aria-hidden />
+                )}
+                <span className="font-mono">restart phase</span>
+              </button>
+            )}
             {canComplete && (
               <button
                 type="button"

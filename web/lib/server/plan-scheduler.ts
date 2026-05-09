@@ -1,5 +1,6 @@
 import "server-only";
 
+import type { Effort, PermissionMode } from "@/lib/chat-types";
 import type {
   Phase,
   PhasePending,
@@ -107,39 +108,74 @@ export function buildPhasePrompt(
   ].join("\n");
 }
 
-// spawnPhaseFromPending materializes one pending phase into a live
-// session: createSession with the snapshotted config, sendMessage with
-// the kickoff prompt, return the PhaseSession the caller should append
-// to plan.phase_sessions. Throws on createSession failure — caller
-// catches and decides whether to leave it pending or hard-fail.
-export function spawnPhaseFromPending(
-  plan: PlanRecord,
-  phase: Phase,
-  pending: PhasePending,
-): PhaseSession {
+// SpawnPhaseSessionInput collapses every input the spawn path needs into
+// one flat shape. Both the first-wave approve flow (via PhasePending) and
+// the on-demand restart flow build one of these and call
+// spawnPhaseSession. Per-phase overrides on `phase` (model / effort) win
+// over the `model` / `effort` fallbacks here — same precedence the
+// original approve flow used.
+export interface SpawnPhaseSessionInput {
+  plan: PlanRecord;
+  phase: Phase;
+  worktreePath: string;
+  worktreeBranch: string;
+  configDir: string;
+  accountName?: string;
+  permissionMode: PermissionMode;
+  // Fallback model/effort when the phase definition didn't pin its own.
+  // For first-wave spawn these come from the owner session snapshot; for
+  // restart they come from the previous run's session config.
+  model?: string;
+  effort?: Effort;
+}
+
+// spawnPhaseSession materializes a phase into a live chat session:
+// createSession with the resolved config, sendMessage with the kickoff
+// prompt, return the PhaseSession entry. Throws on createSession failure
+// — callers decide whether to retry, leave pending, or surface the error.
+export function spawnPhaseSession(input: SpawnPhaseSessionInput): PhaseSession {
+  const { plan, phase, worktreePath, worktreeBranch } = input;
   const summary = createSession({
-    cwd: pending.worktree_path,
-    configDir: pending.config_dir,
-    accountName: pending.account_name,
-    // Per-phase overrides take precedence over the owner snapshot.
-    // Same precedence as the original approve flow.
-    model: phase.model ?? pending.owner_model,
-    effort: phase.effort ?? pending.owner_effort,
-    permissionMode: pending.owner_permission_mode,
+    cwd: worktreePath,
+    configDir: input.configDir,
+    accountName: input.accountName,
+    model: phase.model ?? input.model,
+    effort: phase.effort ?? input.effort,
+    permissionMode: input.permissionMode,
     planId: plan.id,
     phaseSlug: phase.slug,
   });
   sendMessage(
     summary.id,
-    buildPhasePrompt(plan, phase, pending.worktree_path, pending.worktree_branch),
+    buildPhasePrompt(plan, phase, worktreePath, worktreeBranch),
   );
   return {
     phase_slug: phase.slug,
     session_id: summary.id,
-    config_dir: pending.config_dir,
-    account_name: pending.account_name,
+    config_dir: input.configDir,
+    account_name: input.accountName,
     spawned_at: new Date().toISOString(),
   };
+}
+
+// spawnPhaseFromPending is the first-wave / cascade entrypoint: takes a
+// PhasePending built at approve time and delegates to spawnPhaseSession.
+export function spawnPhaseFromPending(
+  plan: PlanRecord,
+  phase: Phase,
+  pending: PhasePending,
+): PhaseSession {
+  return spawnPhaseSession({
+    plan,
+    phase,
+    worktreePath: pending.worktree_path,
+    worktreeBranch: pending.worktree_branch,
+    configDir: pending.config_dir,
+    accountName: pending.account_name,
+    permissionMode: pending.owner_permission_mode,
+    model: pending.owner_model,
+    effort: pending.owner_effort,
+  });
 }
 
 // spawnReadyPending walks plan.pending_phases, spawns each one whose
