@@ -456,6 +456,7 @@ type appState struct {
 	cfHostname   string
 	token        string // last-known good token; preserved across toggles
 	tunnel       *tunnel.Tunnel
+	setup        *tunnel.Setup // lazily created on first named-tunnel Enable
 }
 
 func (a *appState) AllowIPs() string {
@@ -580,37 +581,43 @@ func (b tunnelBridge) Status() server.PublicStatus {
 	a := b.app
 	a.mu.Lock()
 	tu := a.tunnel
+	setup := a.setup
 	allowIPs := a.allowIPs
 	cfTunnel := a.cfTunnelName
 	cfHost := a.cfHostname
 	a.mu.Unlock()
 	token := b.mgr.Status().Token
+	var phase string
+	if setup != nil {
+		phase = string(setup.Phase())
+	}
 	if tu == nil {
 		return server.PublicStatus{
 			Enabled:      false,
 			AllowIPs:     allowIPs,
 			CfTunnelName: cfTunnel,
 			CfHostname:   cfHost,
+			SetupPhase:   phase,
 			Token:        token,
 		}
 	}
 	s := tu.Status()
+	// Auto-setup is in flight ⇒ Pending should be true even though no
+	// tunnel subprocess is running yet. Otherwise the UI would briefly
+	// show "Off" between the Enable click and the tu.Start call,
+	// which races against the React polling and can stick.
+	pending := (s.Running && !s.Registered) || phase != ""
+	enabled := s.Running || phase != ""
 	return server.PublicStatus{
-		Enabled: s.Running,
-		URL:     s.URL,
-		// Pending until cloudflared confirms it registered with the
-		// edge. Named tunnels set URL immediately on Start (the
-		// hostname comes from config), so URL-emptiness alone would
-		// flip Pending to false 60+ seconds before traffic actually
-		// flows on slow networks. Status.Registered is the right
-		// signal — it's set by scanning for cloudflared's
-		// "Registered tunnel connection" log line.
-		Pending:      s.Running && !s.Registered,
+		Enabled:      enabled,
+		URL:          s.URL,
+		Pending:      pending,
 		AllowIPs:     allowIPs,
 		CfTunnelName: cfTunnel,
 		CfHostname:   cfHost,
+		SetupPhase:   phase,
 		Token:        token,
-		Error:    s.Err,
+		Error:        s.Err,
 	}
 }
 
@@ -651,7 +658,33 @@ func (b tunnelBridge) Enable(ctx context.Context, cfg server.PublicConfig) (serv
 	// toggles preserve it.
 	b.app.SetToken(b.mgr.Status().Token)
 
-	// 3. Start cloudflared. If a tunnel is already running (e.g. from
+	// 3. Auto-setup the named tunnel if needed (login + create + route
+	//    dns). All three are idempotent: cert.pem present ⇒ login is a
+	//    no-op; tunnel name already used ⇒ create returns "already
+	//    exists" which we treat as success; same for the DNS route.
+	//    The login step opens Terminal.app and polls cert.pem so the
+	//    user just has to click "Authorize" in the browser. Quick
+	//    tunnels skip this entirely.
+	if cfTunnel != "" && cfHost != "" {
+		b.app.mu.Lock()
+		if b.app.setup == nil {
+			b.app.setup = tunnel.NewSetup(*flagCloudflared)
+		}
+		setup := b.app.setup
+		b.app.mu.Unlock()
+
+		if err := setup.EnsureLogin(ctx); err != nil {
+			return server.PublicStatus{}, fmt.Errorf("cloudflared login: %w", err)
+		}
+		if err := setup.EnsureTunnel(ctx, cfTunnel); err != nil {
+			return server.PublicStatus{}, fmt.Errorf("cloudflared create tunnel: %w", err)
+		}
+		if err := setup.EnsureRoute(ctx, cfTunnel, cfHost); err != nil {
+			return server.PublicStatus{}, fmt.Errorf("cloudflared route dns: %w", err)
+		}
+	}
+
+	// 4. Start cloudflared. If a tunnel is already running (e.g. from
 	//    auto-start at boot, or a previous Enable with different named-
 	//    tunnel config), stop it first — Start is no-op when running,
 	//    so without an explicit Stop the new Named() call wouldn't

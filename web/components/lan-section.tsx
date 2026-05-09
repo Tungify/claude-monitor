@@ -393,13 +393,19 @@ function PublicRow({
             <p className="text-sm font-medium">Public (Cloudflare Tunnel)</p>
             <p className="text-xs text-muted-foreground">
               {status.enabled
-                ? status.pending
-                  ? status.cf_hostname
-                    ? `Starting tunnel for ${status.cf_hostname}…`
-                    : "Starting tunnel…"
-                  : status.cf_hostname
-                    ? `Reachable at ${status.cf_hostname} via your named Cloudflare tunnel.`
-                    : "Reachable from anywhere via a *.trycloudflare.com URL (quick tunnel — SSE may buffer)."
+                ? status.setup_phase === "logging_in"
+                  ? "Cloudflare login in progress — approve in the Terminal/browser window…"
+                  : status.setup_phase === "creating_tunnel"
+                    ? `Creating tunnel ${status.cf_tunnel_name ?? ""}…`
+                    : status.setup_phase === "routing_dns"
+                      ? `Routing DNS ${status.cf_hostname ?? ""} → tunnel…`
+                      : status.pending
+                        ? status.cf_hostname
+                          ? `Starting tunnel for ${status.cf_hostname}…`
+                          : "Starting tunnel…"
+                        : status.cf_hostname
+                          ? `Reachable at ${status.cf_hostname} via your named Cloudflare tunnel.`
+                          : "Reachable from anywhere via a *.trycloudflare.com URL (quick tunnel — SSE may buffer)."
                 : "Off. Use this to access from a different network (e.g. mobile data)."}
             </p>
           </div>

@@ -20,6 +20,13 @@ type PublicStatus struct {
 	AllowIPs     string `json:"allow_ips,omitempty"`
 	CfTunnelName string `json:"cf_tunnel_name,omitempty"`
 	CfHostname   string `json:"cf_hostname,omitempty"`
+	// SetupPhase advertises which auto-setup step is currently running
+	// (logging_in / creating_tunnel / routing_dns). Empty when no setup
+	// is in flight. The UI reads this to show step-specific copy
+	// instead of a generic spinner — "Logging in to Cloudflare…"
+	// communicates much better than just "Starting tunnel…" when the
+	// user has to switch to a browser.
+	SetupPhase string `json:"setup_phase,omitempty"`
 	// Token is the current bearer token shared with proxy.ts. Surfaced
 	// here (in addition to LANStatus) so the public-enable handler can
 	// persist it without a second round-trip — Public uses the same
@@ -106,9 +113,12 @@ func (s *Server) handlePublicEnable(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 30s timeout: cloudflared cold-start can take ~5-15s for the
-	// public URL to propagate, plus a buffer for slow networks.
-	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	// 6m timeout: covers the named-tunnel auto-setup path which has a
+	// browser OAuth round-trip (cloudflared tunnel login). When the
+	// user has already authorized cloudflared, the login step is a
+	// no-op and we resolve in <30s. The UI shows a setup_phase
+	// indicator throughout so the user knows what's blocking.
+	ctx, cancel := context.WithTimeout(r.Context(), 6*time.Minute)
 	defer cancel()
 
 	status, err := ctrl.Enable(ctx, cfg)

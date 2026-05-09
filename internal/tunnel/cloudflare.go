@@ -25,6 +25,7 @@ import (
 	"os"
 	"os/exec"
 	"regexp"
+	"strings"
 	"sync"
 	"time"
 )
@@ -227,6 +228,10 @@ func (t *Tunnel) Start(ctx context.Context, localURL string) error {
 		t.mu.Unlock()
 		return fmt.Errorf("start cloudflared: %w", err)
 	}
+	// Log the exact invocation so debugging "why is the URL wrong?"
+	// doesn't require a second ssh into the machine. Goes to stderr
+	// alongside the [cloudflared] prefixed output.
+	fmt.Fprintf(os.Stderr, "[cloudflared] launching: %s %s\n", t.binPath, strings.Join(args, " "))
 
 	t.cmd = cmd
 	t.cancelCmd = cancel

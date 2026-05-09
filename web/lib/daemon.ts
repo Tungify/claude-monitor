@@ -182,6 +182,10 @@ export interface PublicStatus {
   // buffer text/event-stream GET responses.
   cf_tunnel_name?: string;
   cf_hostname?: string;
+  // setup_phase advertises which auto-setup step is currently running
+  // ("logging_in" / "creating_tunnel" / "routing_dns"). Empty when no
+  // setup is in flight. UI uses this to show step-specific copy.
+  setup_phase?: "logging_in" | "creating_tunnel" | "routing_dns" | "";
   error?: string;
 }
 
