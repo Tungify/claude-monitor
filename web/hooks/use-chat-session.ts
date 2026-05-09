@@ -34,6 +34,11 @@ interface State {
   // after every `result` (end-of-turn). Drives the meter directly so
   // we don't have to re-derive from `usage` deltas.
   contextUsage: ContextUsageBreakdown | null;
+  // Flips true when the SSE source emits `history_replayed` — the
+  // sentinel the events route writes after iterating snap.history.
+  // Lets ChatPanel gate Virtuoso mount until items.length is final,
+  // so `initialTopMostItemIndex` lands on the actual last message.
+  hydrated: boolean;
 }
 
 type Action =
@@ -45,6 +50,18 @@ type Action =
   | { kind: "ask_user_question_resolved" }
   | { kind: "plan"; plan: PlanRecord }
   | { kind: "context_usage"; breakdown: ContextUsageBreakdown }
+  // queue_edited: replace history entry by uuid. queue_cancelled:
+  // drop history entry by uuid. Both fire when the user mutates a
+  // queued (not yet processing) user message via the queue route.
+  | { kind: "queue_edited"; msg: SDKMessage }
+  | { kind: "queue_cancelled"; uuid: string }
+  | { kind: "hydrated" }
+  // Wipe state back to the initial shape. Dispatched whenever the
+  // hook's `sessionId` argument changes — defensive against the page-
+  // level `key={id}` failing to actually remount ChatPanel (which
+  // would otherwise leak the previous session's history into the new
+  // one and confuse Virtuoso's bottom-anchoring).
+  | { kind: "reset" }
   | { kind: "chat_error"; message: string }
   | { kind: "connection"; state: ConnectionState };
 
@@ -194,6 +211,27 @@ function reducer(state: State, action: Action): State {
       return { ...state, latestPlan: action.plan };
     case "context_usage":
       return { ...state, contextUsage: action.breakdown };
+    case "queue_edited": {
+      const incomingUuid = (action.msg as { uuid?: string }).uuid;
+      if (!incomingUuid) return state;
+      const next = state.history.map((m) =>
+        (m as { uuid?: string }).uuid === incomingUuid ? action.msg : m,
+      );
+      return { ...state, history: next };
+    }
+    case "queue_cancelled":
+      return {
+        ...state,
+        history: state.history.filter(
+          (m) => (m as { uuid?: string }).uuid !== action.uuid,
+        ),
+      };
+    case "hydrated":
+      // Idempotent — repeated history_replayed events (shouldn't
+      // happen, but guards reconnects) keep state stable.
+      return state.hydrated ? state : { ...state, hydrated: true };
+    case "reset":
+      return initial;
     case "chat_error":
       return { ...state, errors: [action.message, ...state.errors].slice(0, ERROR_CAP) };
     case "connection":
@@ -211,6 +249,7 @@ const initial: State = {
   connection: "connecting",
   streamingBlocks: [],
   contextUsage: null,
+  hydrated: false,
 };
 
 export interface UseChatSession extends State {
@@ -220,6 +259,11 @@ export interface UseChatSession extends State {
   cancelQuestion: (message?: string) => Promise<void>;
   approvePlan: (planId: string) => Promise<void>;
   stop: () => Promise<void>;
+  // Queue mutators — only valid for user messages still waiting in
+  // the SDK input queue. The server enforces that constraint and
+  // returns 409 once a message is in flight.
+  editQueued: (uuid: string, text: string) => Promise<void>;
+  cancelQueued: (uuid: string) => Promise<void>;
   // Subagent grouping derived from history. byTaskId is keyed by Task
   // tool_use_id; childrenByTaskId carries the SDKMessages emitted while
   // the subagent ran; resultTaskIds names tasks whose tool_result echo
@@ -237,8 +281,22 @@ export interface UseChatSession extends State {
 export function useChatSession(sessionId: string): UseChatSession {
   const [state, dispatch] = useReducer(reducer, initial);
   const sourceRef = useRef<EventSource | null>(null);
+  // Track the most recent sessionId we set up SSE for. When this
+  // hook is reused across navigations (i.e. ChatPanel wasn't
+  // remounted by `key={id}` for any reason — Next.js caching, parent
+  // optimisation, etc.), the [sessionId] effect below re-runs with a
+  // new id but the reducer state still holds the previous session's
+  // history + hydrated=true. We dispatch reset BEFORE opening the
+  // new EventSource to wipe that leak; the first mount sees identity
+  // unchanged and skips, so initial state isn't double-reset.
+  const lastSessionIdRef = useRef<string | null>(null);
 
   useEffect(() => {
+    if (lastSessionIdRef.current !== null && lastSessionIdRef.current !== sessionId) {
+      dispatch({ kind: "reset" });
+    }
+    lastSessionIdRef.current = sessionId;
+
     const es = new EventSource(`/api/chat/${sessionId}/events`);
     sourceRef.current = es;
 
@@ -251,6 +309,15 @@ export function useChatSession(sessionId: string): UseChatSession {
     es.addEventListener("status", (e) => {
       const { status } = JSON.parse((e as MessageEvent).data) as { status: SessionStatus };
       dispatch({ kind: "status", status });
+      // Nudge the sidebar to refetch so the row's "Awaiting permission /
+      // Working / Idle" badge reflects the new state without waiting on
+      // the 5s background poll. We piggy-back on the same event the
+      // subagent fingerprint uses; the provider's debounce coalesces.
+      if (typeof window !== "undefined") {
+        window.dispatchEvent(
+          new CustomEvent("cm:session-subagents", { detail: { sessionId } }),
+        );
+      }
     });
     es.addEventListener("permission_request", (e) => {
       const req = JSON.parse((e as MessageEvent).data) as PermissionRequest;
@@ -278,6 +345,17 @@ export function useChatSession(sessionId: string): UseChatSession {
         (e as MessageEvent).data,
       ) as ContextUsageBreakdown;
       dispatch({ kind: "context_usage", breakdown });
+    });
+    es.addEventListener("queue_edited", (e) => {
+      const msg = JSON.parse((e as MessageEvent).data) as SDKMessage;
+      dispatch({ kind: "queue_edited", msg });
+    });
+    es.addEventListener("queue_cancelled", (e) => {
+      const { uuid } = JSON.parse((e as MessageEvent).data) as { uuid: string };
+      dispatch({ kind: "queue_cancelled", uuid });
+    });
+    es.addEventListener("history_replayed", () => {
+      dispatch({ kind: "hydrated" });
     });
     es.addEventListener("closed", () => {
       dispatch({ kind: "connection", state: "closed" });
@@ -379,6 +457,32 @@ export function useChatSession(sessionId: string): UseChatSession {
     await fetch(`/api/chat/${sessionId}`, { method: "DELETE" });
   };
 
+  // editQueued + cancelQueued mutate a user message that's still
+  // sitting in the SDK input queue. The server returns 409 if the SDK
+  // already pulled it (in-flight) — we surface that as a chat_error so
+  // the user sees feedback instead of a silent no-op.
+  const editQueued = async (uuid: string, text: string) => {
+    const res = await fetch(`/api/chat/${sessionId}/queue/${uuid}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text }),
+    });
+    if (!res.ok) {
+      const body = await res.text();
+      dispatch({ kind: "chat_error", message: `edit failed: ${body}` });
+    }
+  };
+
+  const cancelQueued = async (uuid: string) => {
+    const res = await fetch(`/api/chat/${sessionId}/queue/${uuid}`, {
+      method: "DELETE",
+    });
+    if (!res.ok) {
+      const body = await res.text();
+      dispatch({ kind: "chat_error", message: `cancel failed: ${body}` });
+    }
+  };
+
   // Recompute subagent grouping when history changes. Cheap walk —
   // history is capped at 1000 messages and most chats stay under 200.
   // useMemo (not React Compiler — the input is a stable Map/Set so we
@@ -411,6 +515,8 @@ export function useChatSession(sessionId: string): UseChatSession {
     cancelQuestion,
     approvePlan,
     stop,
+    editQueued,
+    cancelQueued,
     subagents: derived.list,
     subagentsByTaskId: derived.byTaskId,
     subagentChildrenByTaskId: derived.childrenByTaskId,

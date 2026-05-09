@@ -4,6 +4,7 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { useMemo, useState, useTransition } from "react";
 import {
+  CheckCircle2,
   ChevronDown,
   Loader2,
   MessageSquare,
@@ -20,9 +21,8 @@ import type { SessionSummary, SubagentSummary } from "@/lib/chat-types";
 // running state is folded into each row directly (no separate "Running"
 // panel) since a run always belongs to exactly one session.
 export function SessionsList() {
-  const { sessions, refresh } = useSessions();
+  const { sessions, refresh, unseenDone, loaded, markVisited } = useSessions();
   const pathname = usePathname();
-  const { loaded } = useSessions();
 
   // Pull the active session id out of /chat/[id]. Avoids carrying the
   // pathname through every row.
@@ -51,7 +51,9 @@ export function SessionsList() {
           <SessionRow
             session={s}
             active={s.id === activeId}
+            done={unseenDone.has(s.id)}
             onAfterStop={refresh}
+            onVisit={markVisited}
           />
         </li>
       ))}
@@ -62,11 +64,15 @@ export function SessionsList() {
 function SessionRow({
   session,
   active,
+  done,
   onAfterStop,
+  onVisit,
 }: {
   session: SessionSummary;
   active: boolean;
+  done: boolean;
   onAfterStop: () => void;
+  onVisit: (id: string) => void;
 }) {
   const title = session.title ?? "New chat";
   const subtitle = subtitleFor(session);
@@ -117,13 +123,18 @@ function SessionRow({
           // Starting rows: same wash family but cooler, signaling
           // "booting up" vs "actively working".
           starting && !active && "bg-sky-500/[0.07]",
+          // Active row: stronger accent + a primary-colored vertical
+          // bar on the left edge so the eye snaps to it even in a long
+          // list with multiple amber/sky-washed rows. Previously the
+          // sidebar-accent wash blended in with running rows.
           active
-            ? "bg-sidebar-accent text-sidebar-accent-foreground"
+            ? "bg-sidebar-accent text-sidebar-accent-foreground font-medium ring-1 ring-sidebar-ring/40 shadow-sm before:absolute before:inset-y-1 before:-left-0.5 before:w-[3px] before:rounded-full before:bg-primary"
             : "text-sidebar-foreground/85 hover:bg-sidebar-accent/60",
         )}
       >
         <Link
           href={`/chat/${session.id}`}
+          onClick={() => onVisit(session.id)}
           className="flex min-w-0 flex-1 items-start gap-2 px-2 py-1.5 text-sm"
         >
           {running ? (
@@ -152,6 +163,14 @@ function SessionRow({
           ) : interrupted ? (
             <Moon
               className="mt-0.5 size-3.5 shrink-0 text-muted-foreground"
+              aria-hidden
+            />
+          ) : done ? (
+            // "Task just finished, you haven't checked it yet" — green
+            // check (matches the success palette used elsewhere). Clears
+            // the moment the user clicks into the chat.
+            <CheckCircle2
+              className="mt-0.5 size-3.5 shrink-0 text-emerald-500"
               aria-hidden
             />
           ) : (
@@ -189,18 +208,26 @@ function SessionRow({
                   {" · "}
                   <span>{subtitle}</span>
                 </>
+              ) : done ? (
+                <>
+                  <span className="font-medium text-emerald-600 dark:text-emerald-400">
+                    Done
+                  </span>
+                  {" · "}
+                  <span>{subtitle}</span>
+                </>
               ) : (
                 subtitle
               )}
             </div>
           </div>
           {/* Status dot still rides along when the session is NOT
-              running / starting / interrupted — those already carry
-              their own icon (spinner / moon) and a colored label, so
-              an extra dot would just be noise. Errored / closed / idle
-              keep the dot since they fall back to the generic
-              MessageSquare icon. */}
-          {!running && !starting && !interrupted && (
+              running / starting / interrupted / done — those already
+              carry their own icon (spinner / moon / green check) and a
+              colored label, so an extra dot would just be noise.
+              Errored / closed / idle keep the dot since they fall back
+              to the generic MessageSquare icon. */}
+          {!running && !starting && !interrupted && !done && (
             <StatusDot status={session.status} />
           )}
         </Link>

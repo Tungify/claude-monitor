@@ -7,6 +7,7 @@ import {
   type CanUseTool,
   type EffortLevel,
   type PermissionResult,
+  type PermissionRuleValue,
   type PermissionUpdate,
   type Query,
   type SDKMessage,
@@ -104,6 +105,15 @@ interface ChatSession {
   // /context renders. Refreshed once per turn (after `result`).
   // Preferred over derived `latestUsage` when present.
   latestContextUsage?: ContextUsageBreakdown;
+  // Session-local cache of "always allow" rules. We ship the same
+  // rules to the SDK as updatedPermissions so the underlying claude
+  // binary's matcher gates them too, but empirically that round-trip
+  // doesn't always silence subsequent canUseTool calls (the binary's
+  // session-scoped rule store and the SDK's TS matcher disagree about
+  // when a rule applies). Caching here lets makeCanUseTool short-
+  // circuit identical Bash invocations regardless of what the binary
+  // decides — matching the user's mental model of "I clicked Always".
+  alwaysAllowRules: PermissionRuleValue[];
 }
 
 // InterruptedSession is the on-restart shadow of a ChatSession: just
@@ -504,6 +514,17 @@ function makeCanUseTool(session: ChatSession): CanUseTool {
         );
       });
     }
+    // Short-circuit if a previous "Always allow" already covered this
+    // exact tool+input. The SDK is supposed to silence matching calls
+    // once we hand back updatedPermissions, but in practice it still
+    // re-asks — so we maintain a session-local cache and resolve here
+    // before bothering the user. See alwaysAllowRules on ChatSession.
+    if (matchesAlwaysAllow(session, toolName, input)) {
+      return Promise.resolve<PermissionResult>({
+        behavior: "allow",
+        updatedInput: input,
+      });
+    }
     return new Promise<PermissionResult>((resolve) => {
       // Forward SDK-suggested rules to the UI as opaque records so the
       // dialog can offer "Always allow" without our chat-types layer
@@ -636,6 +657,7 @@ function buildLiveSession(init: BuildLiveInit): ChatSession {
     latestUsage: init.latestUsage,
     latestContextUsage: init.latestContextUsage,
     latestPlan: init.latestPlan,
+    alwaysAllowRules: [],
     query: undefined as unknown as Query, // assigned below
   };
 
@@ -976,6 +998,83 @@ export function sendMessage(
   return { sent: true, deduped: false };
 }
 
+// editQueuedMessage rewrites a user message that the SDK queue still
+// holds (i.e. the SDK iterator hasn't pulled it yet). Once a message
+// is in flight we can't edit it without aborting the turn, so this
+// returns `edited: false` and the route hands back 409 Conflict.
+//
+// Both inputQueue and history are updated to point at a fresh
+// SDKUserMessage with the SAME uuid — the uuid is what the live UI
+// keys off, so reusing it lets the client patch its history slot in
+// place rather than appending a new entry.
+export function editQueuedMessage(
+  sessionId: string,
+  uuid: string,
+  text: string,
+  attachments?: Attachment[],
+): { edited: boolean; reason?: "not_queued" | "session_missing" } {
+  const s = sessions.get(sessionId);
+  if (!s) return { edited: false, reason: "session_missing" };
+  const idx = s.inputQueue.findIndex(
+    (m) => (m as { uuid?: string }).uuid === uuid,
+  );
+  if (idx < 0) return { edited: false, reason: "not_queued" };
+  // The SDK types narrow `uuid` to a UUID template-literal string;
+  // our route param comes through as plain `string`, so we cast at
+  // the boundary. The runtime check above (idx >= 0) confirms the
+  // uuid actually identifies a real message, so the value is well-
+  // formed in practice.
+  const next: SDKUserMessage = {
+    type: "user",
+    uuid: uuid as SDKUserMessage["uuid"],
+    session_id: sessionId,
+    message: { role: "user", content: buildUserContent(text, attachments) },
+    parent_tool_use_id: null,
+  };
+  s.inputQueue.replaceAt(idx, next);
+  // Mirror the change in history. Walk from the end since queued
+  // messages are always near the tail; cheaper than scanning the full
+  // 1000-message cap when an early prompt happens to share the uuid
+  // shape (it shouldn't, but defense in depth).
+  for (let i = s.history.length - 1; i >= 0; i--) {
+    const m = s.history[i];
+    if ((m as { uuid?: string }).uuid === uuid) {
+      s.history[i] = next;
+      break;
+    }
+  }
+  emit(s, { type: "queue_edited", data: next });
+  schedulePersist(s.id);
+  return { edited: true };
+}
+
+// cancelQueuedMessage yanks a queued user message back from the SDK
+// queue and drops it from history. Same constraint as editQueuedMessage
+// — once the SDK pulls it, we can't take it back without an interrupt,
+// so the route reports 409 Conflict.
+export function cancelQueuedMessage(
+  sessionId: string,
+  uuid: string,
+): { cancelled: boolean; reason?: "not_queued" | "session_missing" } {
+  const s = sessions.get(sessionId);
+  if (!s) return { cancelled: false, reason: "session_missing" };
+  const idx = s.inputQueue.findIndex(
+    (m) => (m as { uuid?: string }).uuid === uuid,
+  );
+  if (idx < 0) return { cancelled: false, reason: "not_queued" };
+  s.inputQueue.removeAt(idx);
+  for (let i = s.history.length - 1; i >= 0; i--) {
+    const m = s.history[i];
+    if ((m as { uuid?: string }).uuid === uuid) {
+      s.history.splice(i, 1);
+      break;
+    }
+  }
+  emit(s, { type: "queue_cancelled", data: { uuid } });
+  schedulePersist(s.id);
+  return { cancelled: true };
+}
+
 export function resolvePermission(
   sessionId: string,
   permissionId: string,
@@ -999,11 +1098,18 @@ export function resolvePermission(
     // "Always allow" round-trips the SDK's own suggestions back as
     // updatedPermissions. The SDK applies them across whatever
     // destinations it suggested (typically session + project rules);
-    // it then short-circuits future canUseTool calls that match — no
-    // more dialog for the same Bash command, etc. Fall through to
-    // plain allow when there were no suggestions to begin with.
+    // it then SHOULD short-circuit future canUseTool calls that match.
+    // In practice this round-trip isn't always honored, so we ALSO
+    // cache the rules locally — see rememberAlwaysAllow + the
+    // matchesAlwaysAllow short-circuit at the top of canUseTool.
     const stored = s.pendingPermission.suggestions ?? [];
     const includeSuggestions = decision.always_allow === true && stored.length > 0;
+    if (includeSuggestions) {
+      const added = rememberAlwaysAllow(s, stored);
+      console.log(
+        `[permission] always-allow cached ${added} rule(s) for session ${sessionId}`,
+      );
+    }
     result = {
       behavior: "allow",
       updatedInput: decision.updated_input ?? s.pendingPermission.request.input,
@@ -1014,9 +1120,14 @@ export function resolvePermission(
   }
   s.pendingPermission.resolve(result);
 
-  // Status stays "awaiting_permission" for one tick so the resolver can
-  // emit permission_resolved before driveSession bumps it back; the next
-  // SDK message will set it to "thinking".
+  // The resolver clears pendingPermission and emits permission_resolved
+  // synchronously. Flip status back to "thinking" right away — the SDK
+  // is now resuming work (running the tool, or threading the deny
+  // message back to the model). driveSession's existing
+  // assistant/stream_event handler does NOT auto-flip from
+  // "awaiting_permission" (it only covers starting/idle), so without
+  // this nudge the sidebar would stay stuck until the next `result`.
+  setStatus(s, "thinking");
 }
 
 // resolveAskUserQuestion ships the user's answers back to the SDK in
@@ -1041,6 +1152,10 @@ export function resolveAskUserQuestion(
       answers,
     },
   });
+  // Same status nudge as resolvePermission: driveSession won't auto-
+  // flip from "awaiting_permission" on the next assistant message, so
+  // do it explicitly here. The model is now processing the answers.
+  setStatus(s, "thinking");
 }
 
 export function cancelAskUserQuestion(
@@ -1056,6 +1171,7 @@ export function cancelAskUserQuestion(
     behavior: "deny",
     message: message || "user cancelled the question",
   });
+  setStatus(s, "thinking");
 }
 
 // updateSessionOptions mutates a running Query's model and/or effort
@@ -1170,6 +1286,72 @@ function synthesizeSuggestions(
   // Read/Glob/Grep/WebFetch/etc. could be added here as we learn the
   // canonical rule shape per tool. For now leave them to the SDK.
   return [];
+}
+
+// matchesAlwaysAllow checks whether a freshly-seen tool call matches
+// any rule the user already approved with "Always allow" earlier in
+// the session. We mirror the matcher Claude CLI uses for its
+// settings.json `permissions` block — currently Bash with the
+// `<prefix>:*` suffix-wildcard form.
+function matchesAlwaysAllow(
+  session: ChatSession,
+  toolName: string,
+  input: Record<string, unknown>,
+): boolean {
+  if (session.alwaysAllowRules.length === 0) return false;
+  for (const rule of session.alwaysAllowRules) {
+    if (rule.toolName !== toolName) continue;
+    if (matchSingleRule(rule, toolName, input)) return true;
+  }
+  return false;
+}
+
+function matchSingleRule(
+  rule: PermissionRuleValue,
+  toolName: string,
+  input: Record<string, unknown>,
+): boolean {
+  const content = (rule.ruleContent ?? "").trim();
+  if (!content) return false;
+  if (toolName === "Bash" && typeof input.command === "string") {
+    const cmd = input.command.trim();
+    if (!cmd) return false;
+    if (content.endsWith(":*")) {
+      // "git status:*" matches "git status" and "git status -s" but not
+      // "git status-foo" — the prefix must be followed by EOS or a space.
+      const prefix = content.slice(0, -2);
+      return cmd === prefix || cmd.startsWith(prefix + " ");
+    }
+    return cmd === content;
+  }
+  // Other tools don't yet have a synthesized rule shape, so an exact
+  // match on the full ruleContent is the only safe behavior.
+  return false;
+}
+
+// rememberAlwaysAllow persists the rules the user just approved into
+// the session's local cache. De-dupes against existing rules so
+// repeated "Always allow" clicks on the same command don't bloat the
+// list. Returns the count of newly added rules so the caller can log.
+function rememberAlwaysAllow(
+  session: ChatSession,
+  updates: PermissionUpdate[],
+): number {
+  let added = 0;
+  for (const upd of updates) {
+    if (upd.type !== "addRules" || upd.behavior !== "allow") continue;
+    for (const rule of upd.rules) {
+      const dup = session.alwaysAllowRules.some(
+        (r) =>
+          r.toolName === rule.toolName && r.ruleContent === rule.ruleContent,
+      );
+      if (!dup) {
+        session.alwaysAllowRules.push(rule);
+        added++;
+      }
+    }
+  }
+  return added;
 }
 
 // subscribe wires an SSE handler to a session's event bus. Returns an

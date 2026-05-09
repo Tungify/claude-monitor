@@ -63,6 +63,12 @@ interface CommonProps {
   // avoid colliding with the home|session discriminator on Props.
   permMode?: PermissionMode;
   onPermModeChange?: (m: PermissionMode) => void;
+  // localStorage key for draft persistence. When provided, the
+  // composer hydrates `text` from storage on mount + writes back on
+  // every change (debounced) + clears the entry on successful submit.
+  // Switching between chats remounts ChatPanel, so each session's
+  // unfinished draft survives the navigation.
+  draftKey?: string;
 }
 
 interface HomeProps extends CommonProps {
@@ -88,7 +94,12 @@ type Props = HomeProps | SessionProps;
 // Behavior change vs the old composer: per the user's request, Enter
 // inserts a newline and Shift+Enter (or the send button) submits.
 export function Composer(props: Props) {
-  const [text, setText] = useState("");
+  // Pull the persisted draft synchronously on mount so the textarea
+  // never flashes empty on a chat switch. We pass the initialiser to
+  // useState (function form) so this only runs once per mount.
+  const [text, setText] = useState<string>(() =>
+    readDraft(props.draftKey),
+  );
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   const [errors, setErrors] = useState<string[]>([]);
   const [dragOver, setDragOver] = useState(false);
@@ -102,6 +113,30 @@ export function Composer(props: Props) {
   // call without depending on React state, which wouldn't have
   // updated yet on the same keystroke.
   const submittingRef = useRef(false);
+
+  // Re-hydrate when the draftKey changes. Switching between chats
+  // remounts ChatPanel (different route segment), so this normally
+  // doesn't fire — but home view → another route → home view keeps
+  // the component mounted across page transitions in some flows. Keep
+  // the textarea and storage in lockstep regardless.
+  useEffect(() => {
+    if (!props.draftKey) return;
+    const stored = readDraft(props.draftKey);
+    setText(stored);
+    // Don't trigger a write back here; useEffect for persistence
+    // (below) will no-op if the value matches storage already.
+  }, [props.draftKey]);
+
+  // Persist draft on every text change. We debounce so rapid typing
+  // doesn't slam localStorage; 300ms is below human "I lost my work"
+  // threshold but above keystroke cadence so the writes coalesce.
+  useEffect(() => {
+    if (!props.draftKey) return;
+    const key = props.draftKey;
+    const trimmed = text;
+    const id = setTimeout(() => writeDraft(key, trimmed), 300);
+    return () => clearTimeout(id);
+  }, [props.draftKey, text]);
 
   // Keep the textarea height in sync with content. Capping at ~12 rows
   // matches Claude.ai's behavior — past that we scroll inside the field.
@@ -158,6 +193,11 @@ export function Composer(props: Props) {
     setText("");
     setAttachments([]);
     setMenuDismissed(false);
+    // Wipe the persisted draft now that we've committed the text.
+    // The 300ms debounce on `text` would race with this otherwise —
+    // forcing a write here keeps the storage in sync with what's
+    // actually in the textarea (empty).
+    if (props.draftKey) writeDraft(props.draftKey, "");
     try {
       await props.onSubmit({ text: textToSend, attachments: restoreAtt });
     } catch (e) {
@@ -452,4 +492,27 @@ function shorten(p: string): string {
   const parts = compact.split("/").filter(Boolean);
   if (parts.length <= 2) return compact;
   return ".../" + parts.slice(-2).join("/");
+}
+
+// readDraft / writeDraft: tiny localStorage wrappers so the composer
+// can persist the user's in-progress text across chat switches. We
+// catch around access because Safari's "private mode" throws on
+// localStorage and we'd rather lose drafts than lose the chat.
+function readDraft(key: string | undefined): string {
+  if (!key || typeof window === "undefined") return "";
+  try {
+    return window.localStorage.getItem(key) ?? "";
+  } catch {
+    return "";
+  }
+}
+
+function writeDraft(key: string, value: string): void {
+  if (typeof window === "undefined") return;
+  try {
+    if (value.length === 0) window.localStorage.removeItem(key);
+    else window.localStorage.setItem(key, value);
+  } catch {
+    // Quota exceeded / storage disabled — best-effort.
+  }
 }

@@ -20,15 +20,31 @@ interface Props {
 // Selection state per question. Single-select stores the picked option's
 // raw label string (must match exactly so the SDK can echo it back as the
 // tool result). Multi-select stores a Set of labels; we comma-join on
-// submit to match the SDK's documented format.
+// submit to match the SDK's documented format. The OTHER_LABEL sentinel
+// is reserved for the synthetic "Other" option — the actual answer is
+// the user's typed string (kept on a parallel state map), never the
+// literal "Other".
 type Selection = string | Set<string> | undefined;
+
+// Sentinel used in selection state to track the synthetic Other option.
+// Picked deliberately to avoid colliding with any real label; the SDK
+// docs reserve "Other" for this purpose ("Users will always be able to
+// select 'Other' to provide custom text input").
+const OTHER_LABEL = "__cm_other__";
 
 export function AskQuestionCard({ request, onSubmit, onCancel }: Props) {
   const [picks, setPicks] = useState<Record<number, Selection>>({});
+  // Free text typed into each question's "Other" input. Stored
+  // separately from `picks` so a user can type, click another option,
+  // come back to Other, and still see what they wrote.
+  const [otherTexts, setOtherTexts] = useState<Record<number, string>>({});
   const [busy, setBusy] = useState<"submit" | "cancel" | null>(null);
 
   const total = request.questions.length;
-  const answered = useMemo(() => countAnswered(picks, total), [picks, total]);
+  const answered = useMemo(
+    () => countAnswered(request.questions, picks, otherTexts),
+    [request.questions, picks, otherTexts],
+  );
 
   const togglePick = (qIdx: number, q: AskUserQuestionEntry, label: string) => {
     setPicks((prev) => {
@@ -49,21 +65,33 @@ export function AskQuestionCard({ request, onSubmit, onCancel }: Props) {
     });
   };
 
+  const setOtherText = (qIdx: number, q: AskUserQuestionEntry, value: string) => {
+    setOtherTexts((prev) => ({ ...prev, [qIdx]: value }));
+    // Auto-pick Other once the user starts typing — saves them a
+    // click. Only fires when going from empty → non-empty so toggling
+    // Other off and continuing to edit doesn't immediately re-toggle.
+    const wasEmpty = (otherTexts[qIdx] ?? "").trim().length === 0;
+    if (wasEmpty && value.trim().length > 0) {
+      setPicks((prev) => {
+        const current = prev[qIdx];
+        if (q.multiSelect) {
+          const next = new Set(current instanceof Set ? current : []);
+          next.add(OTHER_LABEL);
+          return { ...prev, [qIdx]: next };
+        }
+        return { ...prev, [qIdx]: OTHER_LABEL };
+      });
+    }
+  };
+
   const handleSubmit = async () => {
     setBusy("submit");
     try {
       const answers: AskUserQuestionAnswers = {};
       for (let i = 0; i < request.questions.length; i++) {
         const q = request.questions[i];
-        const pick = picks[i];
-        if (pick === undefined) continue;
-        if (pick instanceof Set) {
-          if (pick.size === 0) continue;
-          // Multi-select wire format is comma-joined labels.
-          answers[q.question] = Array.from(pick).join(", ");
-        } else if (typeof pick === "string") {
-          answers[q.question] = pick;
-        }
+        const value = computeAnswer(q, picks[i], otherTexts[i]);
+        if (value !== null) answers[q.question] = value;
       }
       await onSubmit(answers);
     } finally {
@@ -100,7 +128,9 @@ export function AskQuestionCard({ request, onSubmit, onCancel }: Props) {
             total={total}
             question={q}
             selection={picks[i]}
+            otherText={otherTexts[i] ?? ""}
             onPick={(label) => togglePick(i, q, label)}
+            onOtherTextChange={(v) => setOtherText(i, q, v)}
           />
         ))}
       </div>
@@ -131,7 +161,9 @@ interface SectionProps {
   total: number;
   question: AskUserQuestionEntry;
   selection: Selection;
+  otherText: string;
   onPick: (label: string) => void;
+  onOtherTextChange: (value: string) => void;
 }
 
 function QuestionSection({
@@ -139,8 +171,11 @@ function QuestionSection({
   total,
   question,
   selection,
+  otherText,
   onPick,
+  onOtherTextChange,
 }: SectionProps) {
+  const otherChecked = isPicked(selection, OTHER_LABEL);
   return (
     <section className="rounded-md border bg-background p-3">
       <div className="mb-2 flex flex-wrap items-baseline gap-2">
@@ -174,6 +209,16 @@ function QuestionSection({
             />
           );
         })}
+        {/* "Other" is always present so the user has an escape hatch
+            when none of the proposed options fit. The harness adds it
+            automatically for CLI users — we mirror that here. */}
+        <OtherRow
+          multiSelect={!!question.multiSelect}
+          checked={otherChecked}
+          text={otherText}
+          onPick={() => onPick(OTHER_LABEL)}
+          onTextChange={onOtherTextChange}
+        />
       </div>
     </section>
   );
@@ -235,6 +280,71 @@ function OptionRow({ option, multiSelect, checked, onClick }: OptionRowProps) {
   );
 }
 
+interface OtherRowProps {
+  multiSelect: boolean;
+  checked: boolean;
+  text: string;
+  onPick: () => void;
+  onTextChange: (value: string) => void;
+}
+
+// OtherRow renders the synthetic "Other" entry alongside the model's
+// proposed options. Visually it matches OptionRow, but the description
+// slot becomes a text input for the user's free-form answer.
+function OtherRow({
+  multiSelect,
+  checked,
+  text,
+  onPick,
+  onTextChange,
+}: OtherRowProps) {
+  return (
+    <div
+      className={cn(
+        "flex w-full items-start gap-3 rounded-md border bg-background p-2.5 text-left transition",
+        checked
+          ? "border-primary bg-primary/5 ring-1 ring-primary"
+          : "hover:border-foreground/30 hover:bg-muted/40",
+      )}
+    >
+      {/* The radio/checkbox toggle is its own button so clicks on the
+          input don't accidentally pick (or unpick) the row. */}
+      <button
+        type="button"
+        onClick={onPick}
+        aria-pressed={checked}
+        aria-label={checked ? "Unpick Other" : "Pick Other"}
+        className={cn(
+          "mt-0.5 flex size-4 shrink-0 items-center justify-center border",
+          multiSelect ? "rounded-sm" : "rounded-full",
+          checked ? "border-primary bg-primary" : "border-muted-foreground/40",
+        )}
+      >
+        {checked &&
+          (multiSelect ? (
+            <CheckIcon className="h-3 w-3 text-primary-foreground" />
+          ) : (
+            <span className="h-1.5 w-1.5 rounded-full bg-primary-foreground" />
+          ))}
+      </button>
+      <div className="min-w-0 flex-1 space-y-1">
+        <div className="text-sm font-medium leading-snug">Khác (tự nhập)</div>
+        <input
+          type="text"
+          value={text}
+          onChange={(e) => onTextChange(e.target.value)}
+          placeholder="Nhập câu trả lời tùy ý…"
+          className="w-full rounded-md border bg-background px-2 py-1 text-sm outline-none focus:border-ring"
+          // Pressing Enter inside the input shouldn't submit the form —
+          // there's no <form> here, but base-ui dialogs can swallow Enter
+          // for default actions. Stop the bubble to be safe.
+          onKeyDown={(e) => e.key === "Enter" && e.stopPropagation()}
+        />
+      </div>
+    </div>
+  );
+}
+
 function CheckIcon({ className }: { className?: string }) {
   return (
     <svg
@@ -270,16 +380,43 @@ function isPicked(selection: Selection, label: string): boolean {
   return selection === label;
 }
 
-function countAnswered(picks: Record<number, Selection>, total: number): number {
+function countAnswered(
+  questions: AskUserQuestionEntry[],
+  picks: Record<number, Selection>,
+  otherTexts: Record<number, string>,
+): number {
   let n = 0;
-  for (let i = 0; i < total; i++) {
-    const v = picks[i];
-    if (v === undefined) continue;
-    if (v instanceof Set) {
-      if (v.size > 0) n++;
-    } else if (typeof v === "string" && v.length > 0) {
-      n++;
-    }
+  for (let i = 0; i < questions.length; i++) {
+    if (computeAnswer(questions[i], picks[i], otherTexts[i]) !== null) n++;
   }
   return n;
+}
+
+// computeAnswer resolves a single question's selection state into the
+// string we'll ship back to the SDK. Returns null when the question is
+// effectively unanswered (no picks, or only Other is picked but no
+// text was entered). For multi-select with Other + options, the typed
+// text gets appended to the comma list.
+function computeAnswer(
+  q: AskUserQuestionEntry,
+  pick: Selection,
+  otherText: string | undefined,
+): string | null {
+  const trimmed = (otherText ?? "").trim();
+  if (pick === undefined) return null;
+  if (pick instanceof Set) {
+    if (pick.size === 0) return null;
+    const parts: string[] = [];
+    for (const label of pick) {
+      if (label === OTHER_LABEL) {
+        if (trimmed) parts.push(trimmed);
+      } else {
+        parts.push(label);
+      }
+    }
+    if (parts.length === 0) return null;
+    return parts.join(", ");
+  }
+  if (pick === OTHER_LABEL) return trimmed || null;
+  return pick;
 }

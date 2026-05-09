@@ -212,6 +212,18 @@ export type ChatEvent =
   | { type: "plan_approved"; data: PlanRecord }
   | { type: "plan_failed"; data: PlanRecord }
   | { type: "context_usage"; data: ContextUsageBreakdown }
+  // queue_edited carries the FULL replaced SDKMessage so the client
+  // reducer can swap by uuid. Fired when the user rewrites a queued
+  // user message via PATCH /api/chat/<id>/queue/<uuid>.
+  | { type: "queue_edited"; data: SDKMessage }
+  | { type: "queue_cancelled"; data: { uuid: string } }
+  // Sentinel emitted by the SSE route AFTER it finishes replaying
+  // history. The client uses this to know when items.length is final
+  // (no more historical messages will arrive in this burst), so the
+  // chat panel can mount Virtuoso with the correct
+  // `initialTopMostItemIndex` baked in. Eliminates the heuristic
+  // 150ms idle-window approach which fails on bursty SSE delivery.
+  | { type: "history_replayed"; data: Record<string, never> }
   | { type: "error"; data: { message: string } }
   | { type: "closed"; data: Record<string, never> };
 

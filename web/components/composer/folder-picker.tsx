@@ -1,13 +1,14 @@
 "use client";
 
 import { useState } from "react";
-import { Folder, Check, AlertCircle } from "lucide-react";
+import { Folder, Check, AlertCircle, FolderTree } from "lucide-react";
 import {
   Popover,
   PopoverContent,
   PopoverTrigger,
 } from "@/components/ui/popover";
 import { Button } from "@/components/ui/button";
+import { FolderBrowserDialog } from "./folder-browser-dialog";
 
 interface Props {
   value: string;
@@ -15,15 +16,17 @@ interface Props {
   recents?: string[];
 }
 
-// FolderPicker provides a popover with: a default repo-root chip, a list
-// of cwd paths recently used by other sessions, and a manual text entry
-// validated through /api/fs/validate. We can't reach for the OS folder
-// dialog from the browser, but text + recents covers >90% of the flow.
+// FolderPicker provides a popover with: a default repo-root chip, a
+// list of recent cwds from past sessions, a manual text entry validated
+// through /api/fs/validate, and a "Browse…" button that opens a
+// FolderBrowserDialog backed by /api/fs/list (server-side readdir, the
+// closest thing to a native folder picker we can do from a browser).
 export function FolderPicker({ value, onChange, recents = [] }: Props) {
   const [open, setOpen] = useState(false);
   const [draft, setDraft] = useState(value);
   const [validating, setValidating] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [browseOpen, setBrowseOpen] = useState(false);
 
   // Reset the draft to the current `value` whenever the popover opens.
   // Avoids the lint-fighting `useEffect(() => setDraft(value), [value])`
@@ -140,7 +143,21 @@ export function FolderPicker({ value, onChange, recents = [] }: Props) {
               <span>{error}</span>
             </div>
           )}
-          <div className="mt-2 flex justify-end">
+          <div className="mt-2 flex items-center justify-between gap-2">
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => {
+                // Close the popover first so the dialog isn't fighting
+                // base-ui's outside-click handling. The dialog owns the
+                // overlay anyway — popover stays out of its way.
+                setOpen(false);
+                setBrowseOpen(true);
+              }}
+            >
+              <FolderTree className="size-3.5" />
+              Browse…
+            </Button>
             <Button
               size="sm"
               disabled={validating || !draft.trim()}
@@ -151,6 +168,17 @@ export function FolderPicker({ value, onChange, recents = [] }: Props) {
           </div>
         </div>
       </PopoverContent>
+
+      <FolderBrowserDialog
+        open={browseOpen}
+        onOpenChange={setBrowseOpen}
+        initialPath={value || draft}
+        onChoose={(p) => {
+          // Listing returned this path so it's already known to be a
+          // real directory — skip the extra /api/fs/validate roundtrip.
+          onChange(p);
+        }}
+      />
     </Popover>
   );
 }

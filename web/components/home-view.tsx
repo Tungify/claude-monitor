@@ -151,6 +151,10 @@ export function HomeView() {
           busy={busy}
           disabled={!active}
           commands={HOME_COMMANDS}
+          // Persist the home draft too — bouncing between Home and a
+          // chat is common, and losing the partial prompt on every
+          // round-trip is annoying.
+          draftKey="cm-draft:home"
           placeholder={
             active
               ? "Describe a task or ask a question · type / for commands"

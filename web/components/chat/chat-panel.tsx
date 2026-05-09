@@ -1,7 +1,8 @@
 "use client";
 
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
+import { ArrowDown } from "lucide-react";
 import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 import { Virtuoso, type VirtuosoHandle } from "react-virtuoso";
 import { useChatSession } from "@/hooks/use-chat-session";
@@ -86,6 +87,20 @@ export function ChatPanel({ session }: Props) {
   );
   const [commandLog, setCommandLog] = useState<CommandLog[]>([]);
   const virtuosoRef = useRef<VirtuosoHandle>(null);
+  // Track viewport position so we can show a "scroll to latest" button
+  // when the user has read-up. Virtuoso fires atBottomStateChange when
+  // the threshold is crossed in either direction.
+  const [atBottom, setAtBottom] = useState(true);
+  // Mount Virtuoso only after the SSE source emits `history_replayed`
+  // — a sentinel the events route writes immediately after iterating
+  // snap.history. The hook also dispatches `reset` when sessionId
+  // changes, so on tab switch `hydrated` is back to false until the
+  // new session's history finishes replaying.
+  // Track which session.id we last did the imperative scroll-to-
+  // bottom for. Belt-and-suspenders against `initialTopMostItemIndex`
+  // not landing the right way on every system / scroll-restoration
+  // setup. Cleared by ref-reset on session.id change.
+  const initialScrollSessionRef = useRef<string | null>(null);
 
   // Match the session to one of the daemon's known accounts so /usage,
   // /account, /stats, /status can read live OAuth quota windows. Match by
@@ -226,6 +241,47 @@ export function ChatPanel({ session }: Props) {
     subagentDerivation,
   ]);
 
+  // Mirror items.length onto a ref so the retry loop below can read
+  // the LATEST count without taking items.length as a dep. If we
+  // depended on it, every new message during the 700ms retry window
+  // would re-run the effect → cleanup → cancel pending retries.
+  const itemsLengthRef = useRef(items.length);
+  useEffect(() => {
+    itemsLengthRef.current = items.length;
+  }, [items.length]);
+
+  // After hydration, imperatively scroll to the latest message — but
+  // RETRY across multiple delays. Why: chat items have wildly
+  // variable heights (a 1-line user message vs a 400px assistant
+  // turn with code + thinking + tool calls). Virtuoso's first paint
+  // uses `defaultItemHeight={48}` to estimate, then re-measures as
+  // it actually renders rows. A single scrollToIndex() at one fixed
+  // delay lands wherever the estimate was at that instant — usually
+  // mid-list, because real heights >> estimated. Retrying at 50ms /
+  // 150ms / 350ms / 700ms catches each measurement stage; the last
+  // call fires after Virtuoso has measured all visible rows and the
+  // scroll lands at the actual bottom.
+  // Per session.id ref guard so subsequent appends (user typing)
+  // don't trigger this — they go through followOutput naturally.
+  useEffect(() => {
+    if (!chat.hydrated) return;
+    if (initialScrollSessionRef.current === session.id) return;
+    initialScrollSessionRef.current = session.id;
+    const timers = [50, 150, 350, 700].map((delay) =>
+      setTimeout(() => {
+        const len = itemsLengthRef.current;
+        if (len === 0) return;
+        virtuosoRef.current?.scrollToIndex({
+          index: len - 1,
+          align: "end",
+        });
+      }, delay),
+    );
+    return () => {
+      for (const t of timers) clearTimeout(t);
+    };
+  }, [chat.hydrated, session.id]);
+
   // Derive the visible queue from history. Anything user-typed after
   // the latest `result` is unprocessed; the oldest is in flight (or
   // about to be) and the rest are strictly waiting.
@@ -301,10 +357,16 @@ export function ChatPanel({ session }: Props) {
           </div>
         </header>
 
-        <div className="min-h-0 flex-1">
-          {items.length === 0 && chat.status === "starting" ? (
+        <div className="relative min-h-0 flex-1">
+          {!chat.hydrated ? (
+            // Loading state until the SSE `history_replayed` sentinel
+            // fires. We MUST gate Virtuoso behind this — its
+            // `initialTopMostItemIndex` is only consulted on first
+            // paint, so it has to land on the FINAL items.length.
             <div className="flex h-full items-center justify-center text-sm text-muted-foreground">
-              Starting Claude Code…
+              {chat.status === "starting"
+                ? "Starting Claude Code…"
+                : "Loading…"}
             </div>
           ) : (
             <Virtuoso<ChatItem>
@@ -315,9 +377,24 @@ export function ChatPanel({ session }: Props) {
               defaultItemHeight={48}
               increaseViewportBy={{ top: 200, bottom: 600 }}
               followOutput={(atBottom) => (atBottom ? "smooth" : false)}
+              atBottomStateChange={setAtBottom}
+              // Anchor on first paint to the latest message at the
+              // BOTTOM of the viewport. Critical detail: passing just
+              // a number defaults to `align: "start"`, which puts the
+              // last item at the TOP of the viewport with empty space
+              // below — not what chat UX wants. The object form
+              // `{ index: "LAST", align: "end" }` is the canonical
+              // pattern (per Virtuoso docs at virtuoso.dev/message-
+              // list/scroll-modifier). Gated behind `chat.hydrated`
+              // (set when SSE emits `history_replayed`), so
+              // items.length here is the FINAL replayed history.
               initialTopMostItemIndex={
-                items.length > 0 ? items.length - 1 : undefined
+                items.length > 0 ? { index: "LAST", align: "end" } : undefined
               }
+              // alignToBottom keeps short threads (items don't fill
+              // the viewport) docked at the bottom of the panel,
+              // matching standard chat UX.
+              alignToBottom
               computeItemKey={itemKey}
               // Top spacer matches the floating header's vertical footprint
               // so the first message clears the absolute header on initial
@@ -334,12 +411,37 @@ export function ChatPanel({ session }: Props) {
               )}
             />
           )}
+          {/* Floating "jump to latest" — visible only while the user
+              has scrolled up. Sits inside the virtuoso wrapper so it
+              hovers above the messages without overlapping the
+              composer footer (which is a sibling below). */}
+          {!atBottom && items.length > 0 && (
+            <button
+              type="button"
+              onClick={() =>
+                virtuosoRef.current?.scrollToIndex({
+                  index: items.length - 1,
+                  align: "end",
+                  behavior: "smooth",
+                })
+              }
+              aria-label="Scroll to latest message"
+              title="Scroll to latest"
+              className="absolute right-4 bottom-3 z-10 flex size-9 items-center justify-center rounded-full border bg-background/95 text-muted-foreground shadow-md backdrop-blur-sm transition-colors hover:text-foreground"
+            >
+              <ArrowDown className="size-4" />
+            </button>
+          )}
         </div>
 
         <footer className="px-4 py-3">
           <div className="mx-auto max-w-3xl space-y-2">
             {queuedMessages.length > 0 && (
-              <QueueIndicator queued={queuedMessages} />
+              <QueueIndicator
+                queued={queuedMessages}
+                onEdit={chat.editQueued}
+                onCancel={chat.cancelQueued}
+              />
             )}
             <Composer
               mode="session"
@@ -355,6 +457,10 @@ export function ChatPanel({ session }: Props) {
               usage={liveUsage}
               contextUsage={chat.contextUsage ?? session.context_usage ?? null}
               commands={CHAT_COMMANDS}
+              // Per-session draft key — switching tabs unmounts this
+              // ChatPanel; the user comes back to the same chat and
+              // expects their unfinished text still there.
+              draftKey={`cm-draft:session:${session.id}`}
               placeholder={
                 closed
                   ? "Session ended — start a new one"

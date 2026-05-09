@@ -39,6 +39,11 @@ export async function GET(req: Request, { params }: Ctx) {
       for (const msg of snap.history) {
         writeEvent({ type: "message", data: msg });
       }
+      // Sentinel marker: history replay is done. The client uses this
+      // to know when it's safe to mount the virtualized list with the
+      // correct bottom-anchor — heuristic timers (idle-window) fail
+      // on bursty SSE delivery and the user lands mid-history.
+      writeEvent({ type: "history_replayed", data: {} });
       writeEvent({ type: "status", data: { status: snap.summary.status } });
       // Replay the latest context-usage breakdown so a tab reload
       // doesn't show an empty meter until the next turn finishes.

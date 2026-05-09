@@ -10,6 +10,7 @@ import { ThemeToggle } from "@/components/theme-toggle";
 import { SessionsProvider } from "@/lib/sessions-context";
 import { SessionsList } from "./sessions-list";
 import { AccountChip } from "./account-chip";
+import { AttentionIndicator } from "./attention-indicator";
 
 // Fixed-width left rail. Layout grid in WorkspaceShell, not here, so the
 // sidebar is just stacked content.
@@ -23,6 +24,10 @@ export function AppSidebar() {
 
   return (
     <SessionsProvider>
+      {/* Background-only effects: title prefix + favicon badge for
+          sessions that need user input. Renders nothing — placement
+          inside SessionsProvider is what matters. */}
+      <AttentionIndicator />
       <aside className="flex h-full w-72 shrink-0 flex-col border-r bg-sidebar text-sidebar-foreground">
         <div className="flex items-center justify-between gap-2 px-3 py-3">
           <Link
