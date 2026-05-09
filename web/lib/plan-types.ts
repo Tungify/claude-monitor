@@ -163,6 +163,20 @@ export interface PhaseMergeResult {
 // phases, redundant implementations, integration-only test gaps, ...).
 export type PlanIntegrationReviewStatus = "running" | "complete" | "failed";
 
+// PhaseNote is a broadcast a phase can post to siblings via the
+// submit_phase_note MCP tool. Use case: phase A renames a public API,
+// changes a schema, swaps a library — notify siblings who might rely
+// on the old shape so they can adapt without integration-time churn.
+// Notes are append-only (no edit/delete from the agent side); list
+// order is newest-first when surfaced.
+export interface PhaseNote {
+  id: string;
+  phase_slug: string;
+  body: string;
+  tags?: string[];
+  created_at: string;
+}
+
 export interface PlanRecord {
   id: string;
   session_id: string;
@@ -174,6 +188,11 @@ export interface PlanRecord {
   approved_at?: string;
   worktrees?: WorktreeInfo[];
   phase_sessions?: PhaseSession[];
+  // Inter-phase broadcast log. Phases write via submit_phase_note and
+  // read via list_phase_notes (both exposed by the phase_notes MCP
+  // server, registered on each phase session). Persisted on the plan
+  // so the UI can show them and so notes survive a session restart.
+  notes?: PhaseNote[];
   error?: string;
   merge_status?: PlanMergeStatus;
   merge_branch?: string;

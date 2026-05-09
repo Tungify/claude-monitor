@@ -22,6 +22,12 @@ import {
   SUBMIT_PLAN_FQN,
 } from "./plan-mcp";
 import {
+  createNotesMcpServer,
+  LIST_NOTES_FQN,
+  NOTES_MCP_SERVER_NAME,
+  SUBMIT_NOTE_FQN,
+} from "./notes-mcp";
+import {
   deleteStoredSession,
   loadAllStoredSessions,
   persistStoredSession,
@@ -536,6 +542,13 @@ function makeCanUseTool(session: ChatSession): CanUseTool {
     if (toolName === SUBMIT_PLAN_FQN) {
       return Promise.resolve({ behavior: "allow", updatedInput: input });
     }
+    // Phase notes are sibling broadcasts — the MCP closure scopes them
+    // to this session's plan + phase, so there is no privileged surface
+    // for the user to gate. Auto-allow both the writer and the reader
+    // for the same reason submit_plan is auto-allowed.
+    if (toolName === SUBMIT_NOTE_FQN || toolName === LIST_NOTES_FQN) {
+      return Promise.resolve({ behavior: "allow", updatedInput: input });
+    }
     // AskUserQuestion is a conversational tool, not a privileged action.
     // Route it through its own form UI instead of the generic permission
     // gate — the user picks an option, and we ship the answers back to
@@ -678,6 +691,23 @@ function makePlanMcp(session: ChatSession) {
   });
 }
 
+// makeNotesMcp returns a session-bound phase-notes MCP server. Only
+// meaningful for phase sessions (planId + phaseSlug both set); the
+// caller checks before invoking. Closure pins the planId/phaseSlug at
+// build time so submit_phase_note can append without the agent having
+// to identify itself in every call.
+function makeNotesMcp(session: ChatSession) {
+  if (!session.planId || !session.phaseSlug) {
+    throw new Error(
+      "makeNotesMcp requires session.planId and session.phaseSlug",
+    );
+  }
+  return createNotesMcpServer({
+    planId: session.planId,
+    phaseSlug: session.phaseSlug,
+  });
+}
+
 interface BuildLiveInit {
   id: string;
   cwd: string;
@@ -763,7 +793,15 @@ function buildLiveSession(init: BuildLiveInit): ChatSession {
       // `--allow-dangerously-skip-permissions` flag.
       allowDangerouslySkipPermissions: true,
       canUseTool: makeCanUseTool(session),
-      mcpServers: { [PLAN_MCP_SERVER_NAME]: makePlanMcp(session) },
+      mcpServers: {
+        [PLAN_MCP_SERVER_NAME]: makePlanMcp(session),
+        // Notes server only registers for phase sessions; owner sessions
+        // (no planId) skip it because there are no siblings to broadcast
+        // to and the tools would be no-ops.
+        ...(session.planId && session.phaseSlug
+          ? { [NOTES_MCP_SERVER_NAME]: makeNotesMcp(session) }
+          : {}),
+      },
       abortController,
       // Resume vs fresh: `resume` loads the session's transcript via
       // claude's own jsonl on disk; `sessionId` opens a fresh session

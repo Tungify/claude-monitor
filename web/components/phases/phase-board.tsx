@@ -11,6 +11,7 @@ import {
   GitCommit,
   GitMerge,
   Loader2,
+  Megaphone,
   MessageSquareText,
   RotateCw,
   ScanLine,
@@ -21,6 +22,7 @@ import { cn } from "@/lib/utils";
 import type {
   Phase,
   PhaseMergeResult,
+  PhaseNote,
   PhaseSession,
   PlanIntegrationReviewStatus,
   PlanMergeStatus,
@@ -118,6 +120,16 @@ export function PhaseBoard({ plan: initialPlan }: { plan: PlanRecord }) {
       ((initialPlan.integration_review_findings?.length ?? 0) > 0 ||
         !!initialPlan.integration_review_summary),
   );
+  // Phase notes — sibling broadcasts written via the phase_notes MCP
+  // tool. Append-only on the agent side; the plan-record poll below
+  // refreshes the local mirror as new notes land. Default panel state
+  // is open when the plan ships with notes already (resumed view).
+  const [phaseNotes, setPhaseNotes] = useState<PhaseNote[]>(
+    initialPlan.notes ?? [],
+  );
+  const [notesOpen, setNotesOpen] = useState<boolean>(
+    (initialPlan.notes?.length ?? 0) > 0,
+  );
   const initialPlanId = initialPlan.id;
 
   // Poll /api/chat for live status. 1500ms is fast enough that a
@@ -153,6 +165,9 @@ export function PhaseBoard({ plan: initialPlan }: { plan: PlanRecord }) {
         // poll's lifecycle (background agent writes to disk, UI reads
         // back).
         setIntegrationReview(snapshotIntegrationReview(next));
+        // Notes also land async (any phase agent can append at any
+        // time). Mirror them so the panel updates without a route nav.
+        setPhaseNotes(next.notes ?? []);
       } catch {
         // ignore; tick again
       }
@@ -201,19 +216,36 @@ export function PhaseBoard({ plan: initialPlan }: { plan: PlanRecord }) {
     };
   }, [refetch]);
 
-  // Plan-record poll, gated on having any in-flight review. Reviews
-  // typically complete in 30s-3min; 3000ms balances "user sees results
-  // promptly" with "don't hammer disk for a single-row state change."
-  // Stops as soon as no phase is running so an idle PhaseBoard doesn't
-  // pay the cost.
+  // Plan-record poll. Gated on either an in-flight review OR any
+  // phase still actively executing — phase agents can append notes at
+  // any time during their run via the phase_notes MCP tool, and the
+  // only way the UI sees them land is by re-reading plan.json. Stops
+  // once every phase has settled (idle/closed/errored) AND no review
+  // is running, so an inert PhaseBoard doesn't pay the cost.
   const anyReviewRunning = useMemo(
     () =>
       phaseSessions.some((p) => p.review_status === "running") ||
       integrationReview.status === "running",
     [phaseSessions, integrationReview.status],
   );
+  const anyPhaseActive = useMemo(() => {
+    for (const s of sessions) {
+      if (s.plan_id !== initialPlanId || !s.phase_slug) continue;
+      const st = s.status;
+      if (
+        st === "starting" ||
+        st === "thinking" ||
+        st === "awaiting_permission" ||
+        st === "rate_limited"
+      ) {
+        return true;
+      }
+    }
+    return false;
+  }, [sessions, initialPlanId]);
+  const planPollActive = anyReviewRunning || anyPhaseActive;
   useEffect(() => {
-    if (!anyReviewRunning) return;
+    if (!planPollActive) return;
     const ctrl = new AbortController();
     let timer: ReturnType<typeof setInterval> | null = null;
     const tick = () => {
@@ -251,7 +283,7 @@ export function PhaseBoard({ plan: initialPlan }: { plan: PlanRecord }) {
       stop();
       document.removeEventListener("visibilitychange", onVisibility);
     };
-  }, [anyReviewRunning, refetchPlan]);
+  }, [planPollActive, refetchPlan]);
 
   const phaseRows = useMemo<PhaseRow[]>(() => {
     const sessionByPhaseSlug = new Map<string, SessionSummary>();
@@ -510,6 +542,9 @@ export function PhaseBoard({ plan: initialPlan }: { plan: PlanRecord }) {
           {counters.errored > 0 && (
             <Counter label="errored" value={counters.errored} tone="rose" />
           )}
+          {phaseNotes.length > 0 && (
+            <Counter label="notes" value={phaseNotes.length} tone="violet" />
+          )}
         </div>
       </header>
 
@@ -531,6 +566,12 @@ export function PhaseBoard({ plan: initialPlan }: { plan: PlanRecord }) {
         }
         onIntegrationReview={handleIntegrationReview}
         integrationReviewPending={integrationReviewPending}
+      />
+
+      <NotesPanel
+        notes={phaseNotes}
+        open={notesOpen}
+        onToggle={() => setNotesOpen((v) => !v)}
       />
 
       <div className="grid min-h-0 flex-1 grid-cols-1 gap-3 overflow-x-auto p-4 md:grid-cols-2 xl:grid-cols-4">
@@ -1804,6 +1845,102 @@ function MergeResultChip({ result }: { result: PhaseMergeResult }) {
   );
 }
 
+// NotesPanel surfaces the phase_notes broadcast log. Phases write via
+// the submit_phase_note MCP tool; the plan-record poll above picks them
+// up. Collapsible because the list grows over the plan's lifetime —
+// users glance at recent activity, occasionally expand for the full
+// history. Latest-first ordering matches list_phase_notes.
+function NotesPanel({
+  notes,
+  open,
+  onToggle,
+}: {
+  notes: PhaseNote[];
+  open: boolean;
+  onToggle: () => void;
+}) {
+  const sorted = useMemo(() => {
+    return [...notes].sort((a, b) =>
+      a.created_at < b.created_at ? 1 : a.created_at > b.created_at ? -1 : 0,
+    );
+  }, [notes]);
+  if (notes.length === 0) {
+    // Suppress entirely when empty so the board doesn't gain a hollow
+    // strip pre-broadcast. The header chip drives discoverability once
+    // the first note lands.
+    return null;
+  }
+  const latest = sorted[0];
+  return (
+    <div className="border-b bg-violet-500/5 px-6 py-2 text-xs">
+      <button
+        type="button"
+        onClick={onToggle}
+        className="flex w-full items-center gap-2 text-left text-muted-foreground transition-colors hover:text-foreground"
+      >
+        <Megaphone className="size-3.5 text-violet-500" aria-hidden />
+        <span className="font-medium uppercase tracking-wide">
+          Phase notes
+        </span>
+        <span className="rounded-full bg-violet-500/15 px-1.5 py-0.5 font-mono text-[10px] tabular-nums text-violet-600 dark:text-violet-300">
+          {notes.length}
+        </span>
+        {!open && latest && (
+          <span className="min-w-0 flex-1 truncate text-foreground/70">
+            <span className="font-mono text-[11px]">{latest.phase_slug}</span>
+            <span className="opacity-70"> — {latest.body}</span>
+          </span>
+        )}
+        {open ? (
+          <ChevronDown className="ml-auto size-3.5" aria-hidden />
+        ) : (
+          <ChevronRight className="size-3.5" aria-hidden />
+        )}
+      </button>
+      {open && (
+        <ul className="mt-2 flex flex-col gap-2 pb-1">
+          {sorted.map((note) => (
+            <li
+              key={note.id}
+              className="rounded-md border border-violet-500/20 bg-background px-3 py-2"
+            >
+              <div className="flex flex-wrap items-center gap-2 text-[11px] text-muted-foreground">
+                <span className="font-mono text-foreground/80">
+                  {note.phase_slug}
+                </span>
+                <span className="opacity-70">
+                  {formatNoteTime(note.created_at)}
+                </span>
+                {note.tags?.map((t) => (
+                  <span
+                    key={t}
+                    className="rounded-full bg-violet-500/10 px-1.5 py-0.5 font-mono text-[10px] text-violet-600 dark:text-violet-300"
+                  >
+                    {t}
+                  </span>
+                ))}
+              </div>
+              <p className="mt-1 whitespace-pre-wrap text-sm text-foreground">
+                {note.body}
+              </p>
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
+function formatNoteTime(iso: string): string {
+  const t = Date.parse(iso);
+  if (Number.isNaN(t)) return iso;
+  const diff = Date.now() - t;
+  if (diff < 60_000) return "just now";
+  if (diff < 3_600_000) return `${Math.round(diff / 60_000)}m ago`;
+  if (diff < 86_400_000) return `${Math.round(diff / 3_600_000)}h ago`;
+  return new Date(t).toLocaleString();
+}
+
 function Counter({
   label,
   value,
@@ -1811,7 +1948,7 @@ function Counter({
 }: {
   label: string;
   value: number;
-  tone: "amber" | "blue" | "emerald" | "rose";
+  tone: "amber" | "blue" | "emerald" | "rose" | "violet";
 }) {
   const dot =
     tone === "amber"
@@ -1820,7 +1957,9 @@ function Counter({
         ? "bg-blue-500"
         : tone === "emerald"
           ? "bg-emerald-500"
-          : "bg-rose-500";
+          : tone === "violet"
+            ? "bg-violet-500"
+            : "bg-rose-500";
   return (
     <span className="inline-flex items-center gap-1.5 rounded-md border bg-muted/40 px-2 py-1 font-mono">
       <span className={cn("size-1.5 rounded-full", dot)} aria-hidden />
