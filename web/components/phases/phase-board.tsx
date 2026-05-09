@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { ArrowRight } from "lucide-react";
+import { ArrowRight, GitCommit, Loader2, RotateCw, ShieldCheck } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { Phase, PhaseSession, PlanRecord } from "@/lib/plan-types";
 import type { SessionStatus, SessionSummary } from "@/lib/chat-types";
@@ -31,9 +31,21 @@ function bucketFor(status: SessionStatus | undefined): Column {
   return "done"; // idle | closed | errored — colored at row level
 }
 
-export function PhaseBoard({ plan }: { plan: PlanRecord }) {
+export function PhaseBoard({ plan: initialPlan }: { plan: PlanRecord }) {
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
-  const initialPlanId = plan.id;
+  // The page-level server component hydrates `initialPlan` once; the
+  // commit/complete action mutates `phase_sessions[].commit_*` on the
+  // server and returns the updated record. Mirror it locally so the
+  // badge updates without a route nav. Plan id/cwd/phases are
+  // immutable post-approval, so we only need to track the slice that
+  // can change.
+  const [phaseSessions, setPhaseSessions] = useState<PhaseSession[]>(
+    initialPlan.phase_sessions ?? [],
+  );
+  const [pendingCompleteSlug, setPendingCompleteSlug] = useState<string | null>(
+    null,
+  );
+  const initialPlanId = initialPlan.id;
 
   // Poll /api/chat for live status. 1500ms is fast enough that a
   // running phase flips columns within a couple of frames after its
@@ -99,14 +111,49 @@ export function PhaseBoard({ plan }: { plan: PlanRecord }) {
       }
     }
     const linkByPhase = new Map<string, PhaseSession>(
-      (plan.phase_sessions ?? []).map((p) => [p.phase_slug, p]),
+      phaseSessions.map((p) => [p.phase_slug, p]),
     );
-    return plan.phases.map((phase) => ({
+    return initialPlan.phases.map((phase) => ({
       phase,
       link: linkByPhase.get(phase.slug),
       session: sessionByPhaseSlug.get(phase.slug),
     }));
-  }, [plan.phase_sessions, plan.phases, sessions, initialPlanId]);
+  }, [phaseSessions, initialPlan.phases, sessions, initialPlanId]);
+
+  // Fire the commit action and merge the server's updated PhaseSession
+  // back into local state. We don't refetch the whole plan — the route
+  // already returns the canonical phase_session, and replacing in place
+  // keeps the row's transition animations smooth.
+  const handleComplete = useCallback(
+    async (slug: string) => {
+      setPendingCompleteSlug(slug);
+      try {
+        const res = await fetch(
+          `/api/plans/${encodeURIComponent(initialPlanId)}/phases/${encodeURIComponent(slug)}/complete`,
+          { method: "POST" },
+        );
+        if (!res.ok) {
+          const detail = await res.text();
+          console.error(
+            `[phase-board] complete ${slug} failed:`,
+            res.status,
+            detail,
+          );
+          return;
+        }
+        const data = (await res.json()) as {
+          plan: PlanRecord;
+          phase_session?: PhaseSession;
+        };
+        setPhaseSessions(data.plan.phase_sessions ?? []);
+      } catch (err) {
+        console.error(`[phase-board] complete ${slug} threw:`, err);
+      } finally {
+        setPendingCompleteSlug(null);
+      }
+    },
+    [initialPlanId],
+  );
 
   const buckets = useMemo(() => {
     const map: Record<Column, PhaseRow[]> = {
@@ -140,13 +187,13 @@ export function PhaseBoard({ plan }: { plan: PlanRecord }) {
       <header className="flex flex-wrap items-center gap-3 border-b px-6 py-4">
         <div className="min-w-0 flex-1">
           <div className="flex items-center gap-2">
-            <h1 className="truncate text-base font-semibold">{plan.title}</h1>
-            <PlanStatusBadge status={plan.status} />
+            <h1 className="truncate text-base font-semibold">{initialPlan.title}</h1>
+            <PlanStatusBadge status={initialPlan.status} />
           </div>
           <div className="font-mono text-xs text-muted-foreground">
-            plan {plan.id.slice(0, 8)} · {plan.phases.length} phase
-            {plan.phases.length === 1 ? "" : "s"} ·{" "}
-            <span className="select-all">{plan.cwd}</span>
+            plan {initialPlan.id.slice(0, 8)} · {initialPlan.phases.length} phase
+            {initialPlan.phases.length === 1 ? "" : "s"} ·{" "}
+            <span className="select-all">{initialPlan.cwd}</span>
           </div>
         </div>
         <div className="flex shrink-0 items-center gap-2 text-xs">
@@ -166,6 +213,8 @@ export function PhaseBoard({ plan }: { plan: PlanRecord }) {
             label={col.label}
             tint={col.tint}
             rows={buckets[col.id]}
+            onComplete={handleComplete}
+            pendingCompleteSlug={pendingCompleteSlug}
           />
         ))}
       </div>
@@ -177,10 +226,14 @@ function ColumnView({
   label,
   tint,
   rows,
+  onComplete,
+  pendingCompleteSlug,
 }: {
   label: string;
   tint: string;
   rows: PhaseRow[];
+  onComplete: (slug: string) => void;
+  pendingCompleteSlug: string | null;
 }) {
   return (
     <div className="flex min-h-0 flex-col">
@@ -203,7 +256,11 @@ function ColumnView({
         ) : (
           rows.map((row) => (
             <li key={row.phase.slug}>
-              <PhaseRowCard row={row} />
+              <PhaseRowCard
+                row={row}
+                onComplete={onComplete}
+                pending={pendingCompleteSlug === row.phase.slug}
+              />
             </li>
           ))
         )}
@@ -212,9 +269,28 @@ function ColumnView({
   );
 }
 
-function PhaseRowCard({ row }: { row: PhaseRow }) {
+function PhaseRowCard({
+  row,
+  onComplete,
+  pending,
+}: {
+  row: PhaseRow;
+  onComplete: (slug: string) => void;
+  pending: boolean;
+}) {
   const { phase, link, session } = row;
   const status = session?.status;
+  // Show the commit affordance only once the agent has actually been
+  // spawned (link exists) AND it isn't actively working: idle/closed/
+  // errored mean the user can reasonably decide "this phase is done,
+  // commit whatever's there." Hiding it during thinking/awaiting also
+  // prevents racing the model's own commit attempt.
+  const sessionIdleLike =
+    !!session &&
+    (session.status === "idle" ||
+      session.status === "closed" ||
+      session.status === "errored");
+  const canComplete = !!link && sessionIdleLike && !link.commit_status;
   return (
     <div
       className={cn(
@@ -271,19 +347,103 @@ function PhaseRowCard({ row }: { row: PhaseRow }) {
       </div>
 
       {link ? (
-        <Link
-          href={`/chat/${link.session_id}`}
-          className="mt-3 inline-flex items-center gap-1 rounded-md border bg-muted/40 px-2 py-1 text-[11px] hover:bg-muted"
-        >
-          <span className="font-mono">open agent</span>
-          <ArrowRight className="size-3" aria-hidden />
-        </Link>
+        <div className="mt-3 flex flex-wrap items-center gap-2">
+          <Link
+            href={`/chat/${link.session_id}`}
+            className="inline-flex items-center gap-1 rounded-md border bg-muted/40 px-2 py-1 text-[11px] hover:bg-muted"
+          >
+            <span className="font-mono">open agent</span>
+            <ArrowRight className="size-3" aria-hidden />
+          </Link>
+          {canComplete && (
+            <button
+              type="button"
+              onClick={() => onComplete(phase.slug)}
+              disabled={pending}
+              className={cn(
+                "inline-flex items-center gap-1 rounded-md border px-2 py-1 text-[11px]",
+                "border-emerald-500/40 bg-emerald-500/10 text-emerald-700 hover:bg-emerald-500/20",
+                "dark:text-emerald-300",
+                "disabled:cursor-not-allowed disabled:opacity-60",
+              )}
+            >
+              {pending ? (
+                <Loader2 className="size-3 animate-spin" aria-hidden />
+              ) : (
+                <ShieldCheck className="size-3" aria-hidden />
+              )}
+              <span className="font-mono">commit & complete</span>
+            </button>
+          )}
+          <CommitBadge link={link} onRetry={() => onComplete(phase.slug)} pending={pending} />
+        </div>
       ) : (
         <div className="mt-3 inline-flex items-center gap-1 text-[11px] italic text-muted-foreground">
           no agent spawned
         </div>
       )}
     </div>
+  );
+}
+
+// CommitBadge surfaces the result of the most recent /complete call.
+// `clean` is intentionally low-key (the model already committed and the
+// safety net was a no-op); `committed` shows the short sha; `failed`
+// gives the user a one-click retry plus the captured stderr in a
+// title attribute for hover-reveal.
+function CommitBadge({
+  link,
+  onRetry,
+  pending,
+}: {
+  link: PhaseSession;
+  onRetry: () => void;
+  pending: boolean;
+}) {
+  if (!link.commit_status) return null;
+  if (link.commit_status === "clean") {
+    return (
+      <span className="inline-flex items-center gap-1 rounded-md border bg-muted/40 px-2 py-1 font-mono text-[11px] text-muted-foreground">
+        <ShieldCheck className="size-3" aria-hidden />
+        no changes
+      </span>
+    );
+  }
+  if (link.commit_status === "committed") {
+    const short = link.commit_sha?.slice(0, 7) ?? "?";
+    return (
+      <span
+        className={cn(
+          "inline-flex items-center gap-1 rounded-md border px-2 py-1 font-mono text-[11px]",
+          "border-emerald-500/40 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300",
+        )}
+        title={link.committed_at ? `committed ${link.committed_at}` : undefined}
+      >
+        <GitCommit className="size-3" aria-hidden />
+        {short}
+      </span>
+    );
+  }
+  // failed
+  return (
+    <button
+      type="button"
+      onClick={onRetry}
+      disabled={pending}
+      title={link.commit_error}
+      className={cn(
+        "inline-flex items-center gap-1 rounded-md border px-2 py-1 font-mono text-[11px]",
+        "border-destructive/40 bg-destructive/10 text-destructive hover:bg-destructive/20",
+        "disabled:cursor-not-allowed disabled:opacity-60",
+      )}
+    >
+      {pending ? (
+        <Loader2 className="size-3 animate-spin" aria-hidden />
+      ) : (
+        <RotateCw className="size-3" aria-hidden />
+      )}
+      commit failed — retry
+    </button>
   );
 }
 
