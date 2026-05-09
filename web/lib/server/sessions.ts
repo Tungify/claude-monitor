@@ -74,6 +74,11 @@ interface ChatSession {
   model?: string;
   effort?: EffortLevel;
   permissionMode: PermissionMode;
+  // Set when this session is a phase executor (spawned from plan approve).
+  // Sidebar uses these to group phase sessions under their owning plan;
+  // PhaseBoard joins on (plan_id, phase_slug) to attach live status.
+  planId?: string;
+  phaseSlug?: string;
 
   inputQueue: AsyncQueue<SDKUserMessage>;
   query: Query;
@@ -135,6 +140,8 @@ interface InterruptedSession {
   latestUsage?: SessionUsage;
   latestContextUsage?: ContextUsageBreakdown;
   latestPlan?: PlanRecord;
+  planId?: string;
+  phaseSlug?: string;
 }
 
 // Stash the registries on globalThis so they survive Next.js dev module
@@ -196,6 +203,8 @@ async function initFromDisk(): Promise<void> {
         latestUsage: s.latest_usage,
         latestContextUsage: s.latest_context_usage,
         latestPlan: s.latest_plan,
+        planId: s.plan_id,
+        phaseSlug: s.phase_slug,
       });
     }
     if (stored.length > 0) {
@@ -244,6 +253,8 @@ async function persistNow(id: string): Promise<void> {
       latest_usage: s.latestUsage,
       latest_context_usage: s.latestContextUsage,
       latest_plan: s.latestPlan,
+      plan_id: s.planId,
+      phase_slug: s.phaseSlug,
     };
     await persistStoredSession(stored);
   } catch (err) {
@@ -291,6 +302,8 @@ function summarize(session: ChatSession): SessionSummary {
     usage: session.latestUsage,
     context_usage: session.latestContextUsage,
     subagents: subagents.length > 0 ? subagents : undefined,
+    plan_id: session.planId,
+    phase_slug: session.phaseSlug,
   };
 }
 
@@ -619,6 +632,8 @@ interface BuildLiveInit {
   latestUsage?: SessionUsage;
   latestContextUsage?: ContextUsageBreakdown;
   latestPlan?: PlanRecord;
+  planId?: string;
+  phaseSlug?: string;
   // isResume → query() is launched with `resume` instead of
   // `sessionId`, telling the claude binary to load the session's
   // transcript from ~/.claude/projects/<dir>/<id>.jsonl and continue
@@ -648,6 +663,8 @@ function buildLiveSession(init: BuildLiveInit): ChatSession {
     model: init.model,
     effort: init.effort,
     permissionMode: init.permissionMode,
+    planId: init.planId,
+    phaseSlug: init.phaseSlug,
     inputQueue,
     history: init.history,
     status: "starting",
@@ -711,6 +728,8 @@ export function createSession(opts: {
   model?: string;
   effort?: EffortLevel;
   permissionMode?: PermissionMode;
+  planId?: string;
+  phaseSlug?: string;
 }): SessionSummary {
   const id = randomUUID();
   const session = buildLiveSession({
@@ -722,6 +741,8 @@ export function createSession(opts: {
     model: opts.model,
     effort: opts.effort,
     permissionMode: opts.permissionMode ?? "default",
+    planId: opts.planId,
+    phaseSlug: opts.phaseSlug,
     history: [],
     isResume: false,
   });
@@ -745,6 +766,8 @@ function resumeSession(stored: InterruptedSession): ChatSession {
     model: stored.model,
     effort: stored.effort,
     permissionMode: stored.permissionMode,
+    planId: stored.planId,
+    phaseSlug: stored.phaseSlug,
     history: stored.history,
     latestUsage: stored.latestUsage,
     latestContextUsage: stored.latestContextUsage,
@@ -873,6 +896,8 @@ function summarizeInterrupted(s: InterruptedSession): SessionSummary {
     usage: s.latestUsage,
     context_usage: s.latestContextUsage,
     subagents: subagents.length > 0 ? subagents : undefined,
+    plan_id: s.planId,
+    phase_slug: s.phaseSlug,
   };
 }
 

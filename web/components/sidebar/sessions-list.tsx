@@ -9,6 +9,7 @@ import {
   Loader2,
   MessageSquare,
   Moon,
+  Network,
   ShieldAlert,
   Square,
 } from "lucide-react";
@@ -16,10 +17,22 @@ import { cn } from "@/lib/utils";
 import { useSessions, stopSessionRemote } from "@/lib/sessions-context";
 import type { SessionSummary, SubagentSummary } from "@/lib/chat-types";
 
+interface PlanGroup {
+  planId: string;
+  // The first session created in this plan group anchors a stable
+  // display order. Plans whose newest phase session is most recent
+  // bubble to the top of the plans block.
+  newestCreatedAt: string;
+  sessions: SessionSummary[];
+}
+
 // SessionsList consumes the shared SessionsProvider so the sidebar
 // renders rows from one /api/chat poll instead of opening many. The
 // running state is folded into each row directly (no separate "Running"
 // panel) since a run always belongs to exactly one session.
+//
+// Phase sessions (those with a plan_id) are visually grouped under
+// their owning plan. Standalone chats render flat at the top.
 export function SessionsList() {
   const { sessions, refresh, unseenDone, loaded, markVisited } = useSessions();
   const pathname = usePathname();
@@ -29,6 +42,37 @@ export function SessionsList() {
   const activeId = pathname?.startsWith("/chat/")
     ? pathname.slice("/chat/".length).split("/")[0]
     : undefined;
+
+  // Bucket sessions by plan_id. /api/chat already returns sessions
+  // sorted newest-first, so within each plan the order matches the
+  // order phase agents were spawned (sequential in approve route).
+  const { standalone, plans } = useMemo(() => {
+    const standalone: SessionSummary[] = [];
+    const planMap = new Map<string, PlanGroup>();
+    for (const s of sessions) {
+      if (!s.plan_id) {
+        standalone.push(s);
+        continue;
+      }
+      let group = planMap.get(s.plan_id);
+      if (!group) {
+        group = {
+          planId: s.plan_id,
+          newestCreatedAt: s.created_at,
+          sessions: [],
+        };
+        planMap.set(s.plan_id, group);
+      }
+      group.sessions.push(s);
+      if (s.created_at > group.newestCreatedAt) {
+        group.newestCreatedAt = s.created_at;
+      }
+    }
+    const plans = Array.from(planMap.values()).sort((a, b) =>
+      b.newestCreatedAt.localeCompare(a.newestCreatedAt),
+    );
+    return { standalone, plans };
+  }, [sessions]);
 
   if (!loaded) {
     return (
@@ -45,19 +89,105 @@ export function SessionsList() {
   }
 
   return (
-    <ul className="space-y-0.5 px-1">
-      {sessions.map((s) => (
-        <li key={s.id}>
-          <SessionRow
-            session={s}
-            active={s.id === activeId}
-            done={unseenDone.has(s.id)}
-            onAfterStop={refresh}
-            onVisit={markVisited}
-          />
-        </li>
+    <div className="space-y-3">
+      {standalone.length > 0 && (
+        <ul className="space-y-0.5 px-1">
+          {standalone.map((s) => (
+            <li key={s.id}>
+              <SessionRow
+                session={s}
+                active={s.id === activeId}
+                done={unseenDone.has(s.id)}
+                onAfterStop={refresh}
+                onVisit={markVisited}
+              />
+            </li>
+          ))}
+        </ul>
+      )}
+      {plans.map((group) => (
+        <PlanGroupBlock
+          key={group.planId}
+          group={group}
+          activeId={activeId}
+          unseenDone={unseenDone}
+          onAfterStop={refresh}
+          onVisit={markVisited}
+        />
       ))}
-    </ul>
+    </div>
+  );
+}
+
+function PlanGroupBlock({
+  group,
+  activeId,
+  unseenDone,
+  onAfterStop,
+  onVisit,
+}: {
+  group: PlanGroup;
+  activeId?: string;
+  unseenDone: Set<string>;
+  onAfterStop: () => void;
+  onVisit: (id: string) => void;
+}) {
+  // Default-open so newly spawned plan groups surface their phases
+  // without an extra click; the user can collapse if it gets noisy.
+  const [open, setOpen] = useState<boolean>(true);
+  const planShort = group.planId.slice(0, 8);
+  const runningCount = group.sessions.filter(
+    (s) => s.status === "thinking" || s.status === "starting",
+  ).length;
+
+  return (
+    <div className="px-1">
+      <div className="flex w-full items-center gap-1 rounded-md px-1.5 py-1 text-[11px] font-mono uppercase tracking-wide text-muted-foreground transition-colors hover:bg-sidebar-accent/50">
+        <Link
+          href={`/plans/${group.planId}`}
+          title="Open phase board"
+          className="flex min-w-0 flex-1 items-center gap-1.5 hover:text-foreground"
+        >
+          <Network className="size-3 shrink-0" aria-hidden />
+          <span className="truncate">plan {planShort}</span>
+        </Link>
+        <span className="shrink-0 normal-case tabular-nums">
+          {runningCount > 0
+            ? `${runningCount}/${group.sessions.length} running`
+            : `${group.sessions.length} phases`}
+        </span>
+        <button
+          type="button"
+          onClick={() => setOpen((v) => !v)}
+          aria-expanded={open}
+          aria-label={open ? "Collapse plan" : "Expand plan"}
+          className="shrink-0 rounded p-0.5 hover:text-foreground"
+        >
+          <ChevronDown
+            className={cn(
+              "size-3 transition-transform",
+              open ? "rotate-0" : "-rotate-90",
+            )}
+            aria-hidden
+          />
+        </button>
+      </div>
+      {open && (
+        <ul className="mt-1 ml-2 space-y-0.5 border-l border-border/60 pl-2">
+          {group.sessions.map((s) => (
+            <li key={s.id}>
+              <SessionRow
+                session={s}
+                active={s.id === activeId}
+                done={unseenDone.has(s.id)}
+                onAfterStop={onAfterStop}
+                onVisit={onVisit}
+              />
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
   );
 }
 
@@ -74,7 +204,11 @@ function SessionRow({
   onAfterStop: () => void;
   onVisit: (id: string) => void;
 }) {
-  const title = session.title ?? "New chat";
+  // Phase sessions surface their slug as the headline — that's what
+  // the user thinks of them as ("the publish phase", not the kickoff
+  // prompt's first line). Standalone chats keep the user-text title.
+  const title = session.phase_slug ?? session.title ?? "New chat";
+  const titleIsSlug = Boolean(session.phase_slug);
   const subtitle = subtitleFor(session);
   // Only surface subagents that are still working: once a Task completes,
   // the user doesn't need it cluttering the sidebar tree. Filter inside
@@ -177,7 +311,7 @@ function SessionRow({
             <MessageSquare className="mt-0.5 size-3.5 shrink-0 opacity-70" />
           )}
           <div className="min-w-0 flex-1 leading-tight">
-            <div className="truncate">{title}</div>
+            <div className={cn("truncate", titleIsSlug && "font-mono")}>{title}</div>
             <div className="truncate text-[11px] text-muted-foreground">
               {running ? (
                 <>

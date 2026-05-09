@@ -39,6 +39,8 @@ export async function POST(req: Request) {
       model: body.model,
       effort: body.effort,
       permissionMode: body.permission_mode,
+      planId: body.plan_id,
+      phaseSlug: body.phase_slug,
     });
     return NextResponse.json(summary, { status: 201 });
   } catch (err) {

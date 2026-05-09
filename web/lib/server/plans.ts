@@ -51,3 +51,32 @@ export async function updatePlan(
   await writePlan(plan);
   return plan;
 }
+
+// findPlanById walks every project's plans/ directory under
+// ~/.claude/projects/*/plans/ looking for <planId>.json. The PhaseBoard
+// page identifies plans by id only — the encoded-cwd part of the path
+// is recoverable from the plan body, so we don't burden URLs with it.
+// O(projects) directory reads per lookup, but the on-disk layout is
+// shallow (one plan dir per project) and the user typically has fewer
+// than a dozen indexed projects, so the cost is fine for an interactive
+// page-load.
+export async function findPlanById(planId: string): Promise<PlanRecord | null> {
+  const projectsRoot = path.join(homedir(), ".claude", "projects");
+  let projects: string[];
+  try {
+    projects = await fs.readdir(projectsRoot);
+  } catch {
+    return null;
+  }
+  for (const project of projects) {
+    const file = path.join(projectsRoot, project, "plans", `${planId}.json`);
+    try {
+      const buf = await fs.readFile(file, "utf8");
+      return JSON.parse(buf) as PlanRecord;
+    } catch {
+      // ENOENT for this project — try next.
+      continue;
+    }
+  }
+  return null;
+}

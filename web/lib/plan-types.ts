@@ -17,6 +17,18 @@ export interface WorktreeInfo {
   branch: string;
 }
 
+// PhaseSession links a phase to the chat session that's executing it.
+// One session per phase, spawned by the approve route after worktrees
+// are created. Persisted on the plan so the UI can rebuild the link
+// after a reload (chat sessions live in-memory; plans live on disk).
+export interface PhaseSession {
+  phase_slug: string;
+  session_id: string;
+  config_dir: string;
+  account_name?: string;
+  spawned_at: string;
+}
+
 export type PlanStatus = "submitted" | "approved" | "failed";
 
 export interface PlanRecord {
@@ -29,5 +41,6 @@ export interface PlanRecord {
   created_at: string;
   approved_at?: string;
   worktrees?: WorktreeInfo[];
+  phase_sessions?: PhaseSession[];
   error?: string;
 }

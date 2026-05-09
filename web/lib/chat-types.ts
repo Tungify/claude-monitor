@@ -64,6 +64,11 @@ export interface SessionSummary {
   // Server derives from history so the sidebar can show a tree without
   // each client re-walking transcripts. Empty/omitted when none yet.
   subagents?: SubagentSummary[];
+  // Set when this session was spawned as a phase executor by the plan
+  // approve route. Sidebar groups sessions sharing the same plan_id
+  // under a "Plan" header so phase fanout is visible at a glance.
+  plan_id?: string;
+  phase_slug?: string;
 }
 
 // SubagentSummary describes one Task tool_use spawn. The Task tool's
@@ -251,6 +256,10 @@ export interface CreateSessionRequest {
   // Active permission mode. Drives auto-allow behavior server-side
   // and the mode chip in the composer toolbar client-side.
   permission_mode?: PermissionMode;
+  // Set by the plan approve route when spawning a phase executor.
+  // Sidebar uses these to group phase sessions under their owning plan.
+  plan_id?: string;
+  phase_slug?: string;
 }
 
 // Inline image attachment for the input route. Source is a data URL the

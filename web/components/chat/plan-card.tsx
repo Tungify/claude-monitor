@@ -1,6 +1,8 @@
 "use client";
 
+import Link from "next/link";
 import { useState } from "react";
+import { ArrowRight, LayoutGrid } from "lucide-react";
 import type { PlanRecord } from "@/lib/plan-types";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -35,16 +37,28 @@ export function PlanCard({ plan, onApprove }: Props) {
             {plan.phases.length === 1 ? "" : "s"}
           </div>
         </div>
-        {plan.status !== "approved" && (
-          <Button size="sm" onClick={onClick} disabled={busy}>
-            {busy ? "Creating worktrees…" : plan.status === "failed" ? "Retry" : "Approve"}
-          </Button>
-        )}
+        <div className="flex shrink-0 items-center gap-2">
+          {plan.status === "approved" && (
+            <Link
+              href={`/plans/${plan.id}`}
+              className="inline-flex items-center gap-1 rounded-md border bg-background px-2.5 py-1.5 text-xs font-medium hover:bg-muted"
+            >
+              <LayoutGrid className="size-3.5" aria-hidden />
+              <span>Open board</span>
+            </Link>
+          )}
+          {plan.status !== "approved" && (
+            <Button size="sm" onClick={onClick} disabled={busy}>
+              {busy ? "Spawning phase agents…" : plan.status === "failed" ? "Retry" : "Approve & spawn agents"}
+            </Button>
+          )}
+        </div>
       </div>
 
       <ol className="mt-3 space-y-2">
         {plan.phases.map((phase, i) => {
           const wt = plan.worktrees?.find((w) => w.phase_slug === phase.slug);
+          const ps = plan.phase_sessions?.find((s) => s.phase_slug === phase.slug);
           return (
             <li key={phase.slug} className="rounded-md border bg-background p-3">
               <div className="flex items-center gap-2 text-sm">
@@ -69,6 +83,19 @@ export function PlanCard({ plan, onApprove }: Props) {
                   <span className="mx-1 text-muted-foreground">·</span>
                   <span>{wt.branch}</span>
                 </div>
+              )}
+              {ps && (
+                <Link
+                  href={`/chat/${ps.session_id}`}
+                  className="mt-2 inline-flex items-center gap-1 rounded-md border bg-muted/40 px-2 py-1 font-mono text-[11px] hover:bg-muted"
+                >
+                  <span className="text-muted-foreground">agent:</span>
+                  <span>{ps.session_id.slice(0, 8)}</span>
+                  {ps.account_name && (
+                    <span className="text-muted-foreground">· {ps.account_name}</span>
+                  )}
+                  <ArrowRight className="size-3" aria-hidden />
+                </Link>
               )}
             </li>
           );

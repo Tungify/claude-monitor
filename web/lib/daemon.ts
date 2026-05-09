@@ -150,6 +150,31 @@ export async function createWorktrees(
   return jsonOrThrow(res);
 }
 
+// PhaseAssignment mirrors the Go shape in internal/server/phases.go.
+// Daemon ranks accounts by 5h utilization (ascending) and round-robins
+// when count exceeds the eligible pool, so callers always get exactly
+// `count` entries back.
+export interface PhaseAssignment {
+  config_dir: string;
+  account_name: string;
+  account_uuid?: string;
+  five_hour_utilization: number;
+  weekly_utilization: number;
+}
+
+export async function assignPhaseAccounts(
+  payload: { count: number; exclude?: string[] },
+  signal?: AbortSignal,
+): Promise<{ assignments: PhaseAssignment[] }> {
+  const res = await fetch(`${DAEMON_URL}/api/phases/assign`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+    signal,
+  });
+  return jsonOrThrow(res);
+}
+
 // LANStatus mirrors server.LANStatus in the Go side. Driven by
 // /api/lan/{status,enable,disable} — see internal/server/lan.go.
 //

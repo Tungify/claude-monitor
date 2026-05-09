@@ -336,6 +336,17 @@ export function useChatSession(sessionId: string): UseChatSession {
     const onPlan = (e: Event) => {
       const plan = JSON.parse((e as MessageEvent).data) as PlanRecord;
       dispatch({ kind: "plan", plan });
+      // Approval spawns one chat session per phase; nudge the sidebar
+      // so the new plan group + phase rows appear without a route nav.
+      // SessionsProvider listens for cm:session-subagents internally
+      // and refetches /api/chat on the same coalesced timer.
+      if (plan.status === "approved" && typeof window !== "undefined") {
+        window.dispatchEvent(
+          new CustomEvent("cm:session-subagents", {
+            detail: { sessionId, reason: "plan_approved" },
+          }),
+        );
+      }
     };
     es.addEventListener("plan_submitted", onPlan);
     es.addEventListener("plan_approved", onPlan);

@@ -129,6 +129,7 @@ func (s *Server) Routes() *http.ServeMux {
 	mux.HandleFunc("POST /api/account/add", s.handleAccountAdd)
 	mux.HandleFunc("GET /api/events", s.handleEvents)
 	mux.HandleFunc("POST /api/worktrees", s.handleCreateWorktrees)
+	mux.HandleFunc("POST /api/phases/assign", s.handleAssignPhases)
 	// LAN exposure toggle. Available only when the orchestrator wired
 	// a controller via SetLANController; otherwise these endpoints
 	// reply 501 (see handleLAN*).

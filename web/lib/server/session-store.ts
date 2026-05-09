@@ -35,6 +35,13 @@ export interface StoredSession {
   latest_usage?: SessionUsage;
   latest_context_usage?: ContextUsageBreakdown;
   latest_plan?: PlanRecord;
+  // Phase-executor metadata. Set when this session was spawned by the
+  // plan approve route to run a single phase. Persisted so the link
+  // survives a daemon restart — phase boards rebuild from
+  // PlanRecord.phase_sessions[], but the session row's grouping in the
+  // sidebar still reads these fields directly.
+  plan_id?: string;
+  phase_slug?: string;
 }
 
 // One JSON file per session keeps writes scoped (a 5MB conversation
