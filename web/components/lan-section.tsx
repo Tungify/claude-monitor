@@ -358,8 +358,17 @@ function PublicRow({
   onEnable: () => void;
   onDisable: () => void;
 }) {
-  const namedTunnelOK =
-    cfTunnelInput.trim() !== "" && cfHostInput.trim() !== "";
+  const tunnelTrim = cfTunnelInput.trim();
+  const hostTrim = cfHostInput.trim();
+  const namedTunnelOK = tunnelTrim !== "" && hostTrim !== "";
+  // partialNamed = exactly one of name/host is filled. We can't run a
+  // named tunnel with only the hostname (cloudflared needs the tunnel
+  // name to look up credentials in ~/.cloudflared/<UUID>.json) and we
+  // shouldn't silently fall back to a quick tunnel — the user clearly
+  // intended a specific public hostname, and ending up at a random
+  // *.trycloudflare.com URL is confusing.
+  const partialNamed =
+    !namedTunnelOK && (tunnelTrim !== "" || hostTrim !== "");
   // Public requires the orchestrator endpoint; if status is null we
   // either failed to fetch or the daemon is in --serve mode. The
   // outer LANSection already filters --serve, so a null here is most
@@ -398,7 +407,7 @@ function PublicRow({
         <Button
           size="sm"
           variant={status.enabled ? "outline" : "default"}
-          disabled={busy}
+          disabled={busy || (!status.enabled && partialNamed)}
           onClick={status.enabled ? onDisable : onEnable}
         >
           {busy && <RefreshCw className="mr-1 size-3.5 animate-spin" />}
@@ -447,7 +456,19 @@ function PublicRow({
                 className="w-full rounded border bg-background px-2 py-1.5 font-mono text-xs sm:py-1"
               />
             </div>
-            {!namedTunnelOK ? (
+            {partialNamed ? (
+              <p className="flex items-start gap-1 text-[11px] text-amber-600 dark:text-amber-400">
+                <ShieldAlert className="mt-0.5 size-3.5 shrink-0" aria-hidden />
+                {tunnelTrim === ""
+                  ? "Tunnel name is required when a hostname is set — cloudflared looks up credentials by name. Leave both fields empty to fall back to a quick tunnel (random *.trycloudflare.com URL)."
+                  : "Hostname is required when a tunnel name is set. Leave both fields empty to fall back to a quick tunnel (random *.trycloudflare.com URL)."}
+              </p>
+            ) : namedTunnelOK ? (
+              <p className="text-[11px] text-emerald-600 dark:text-emerald-400">
+                Will use named tunnel <code className="font-mono">{tunnelTrim}</code>{" "}
+                routed at <code className="font-mono">{hostTrim}</code>.
+              </p>
+            ) : (
               <details className="text-[11px] text-muted-foreground">
                 <summary className="cursor-pointer select-none underline-offset-2 hover:underline">
                   Empty = quick tunnel (no setup, but UI may show empty
@@ -479,11 +500,6 @@ function PublicRow({
                   <li>Fill both fields above and click Enable.</li>
                 </ol>
               </details>
-            ) : (
-              <p className="text-[11px] text-emerald-600 dark:text-emerald-400">
-                Will use named tunnel <code className="font-mono">{cfTunnelInput.trim()}</code>{" "}
-                routed at <code className="font-mono">{cfHostInput.trim()}</code>.
-              </p>
             )}
           </div>
           <div className="space-y-1.5">

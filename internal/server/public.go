@@ -93,6 +93,18 @@ func (s *Server) handlePublicEnable(w http.ResponseWriter, r *http.Request) {
 		CfTunnelName: strings.TrimSpace(body.CfTunnelName),
 		CfHostname:   strings.TrimSpace(body.CfHostname),
 	}
+	// Reject the partial-named-tunnel case server-side so a UI bypass
+	// can't silently fall through to a quick tunnel. cloudflared needs
+	// both the name (to look up credentials) and the hostname (to set
+	// the public URL); having one without the other yields the same
+	// random *.trycloudflare.com behaviour as no config at all, which
+	// is confusing if the user typed a real hostname expecting it.
+	if (cfg.CfTunnelName == "") != (cfg.CfHostname == "") {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error": "named tunnel needs both name and hostname (leave both empty for a quick tunnel)",
+		})
+		return
+	}
 
 	// 30s timeout: cloudflared cold-start can take ~5-15s for the
 	// public URL to propagate, plus a buffer for slow networks.
