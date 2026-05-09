@@ -80,3 +80,40 @@ export async function findPlanById(planId: string): Promise<PlanRecord | null> {
   }
   return null;
 }
+
+// listAllPlans returns every PlanRecord stored under
+// ~/.claude/projects/*/plans/*.json. Used at daemon startup to find
+// approved plans whose phase sessions need re-hydrating so phases keep
+// running unattended after a restart. Malformed files are skipped with
+// a warning rather than aborting the whole walk — one bad plan
+// shouldn't stop the rest from resuming.
+export async function listAllPlans(): Promise<PlanRecord[]> {
+  const projectsRoot = path.join(homedir(), ".claude", "projects");
+  let projects: string[];
+  try {
+    projects = await fs.readdir(projectsRoot);
+  } catch {
+    return [];
+  }
+  const out: PlanRecord[] = [];
+  for (const project of projects) {
+    const dir = path.join(projectsRoot, project, "plans");
+    let entries: string[];
+    try {
+      entries = await fs.readdir(dir);
+    } catch {
+      continue;
+    }
+    for (const name of entries) {
+      if (!name.endsWith(".json")) continue;
+      const file = path.join(dir, name);
+      try {
+        const buf = await fs.readFile(file, "utf8");
+        out.push(JSON.parse(buf) as PlanRecord);
+      } catch (err) {
+        console.warn(`[plans] failed to load ${file}:`, err);
+      }
+    }
+  }
+  return out;
+}

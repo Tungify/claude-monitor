@@ -33,6 +33,7 @@ import {
   persistStoredSession,
   type StoredSession,
 } from "./session-store";
+import { listAllPlans } from "./plans";
 import type {
   AskUserQuestionAnswers,
   AskUserQuestionEntry,
@@ -228,6 +229,52 @@ async function initFromDisk(): Promise<void> {
     }
   } catch (err) {
     console.warn("[sessions] disk hydrate failed:", err);
+  }
+
+  // Eagerly re-spawn phase sessions for every approved plan. Without
+  // this, a session that was rate-limited / mid-turn when the daemon
+  // went down stays as a shadow until the user navigates to its tab —
+  // which defeats the whole point of unattended phase scheduling.
+  // Promoting via getOrResume re-launches the SDK Query in `resume`
+  // mode so the claude binary picks the transcript back up; whether it
+  // re-emits a stalled turn is the binary's job.
+  //
+  // Skipped: phases that already committed (clean / committed). Those
+  // are done — re-hydrating wastes a Query. failed/unset stay eligible
+  // because the user may still want to retry.
+  await rehydratePhaseSessions();
+}
+
+async function rehydratePhaseSessions(): Promise<void> {
+  let revived = 0;
+  try {
+    const plans = await listAllPlans();
+    for (const plan of plans) {
+      if (plan.status !== "approved") continue;
+      for (const link of plan.phase_sessions ?? []) {
+        if (link.commit_status === "clean" || link.commit_status === "committed") {
+          continue;
+        }
+        // Already live? Nothing to do. Only the shadow path needs a kick.
+        if (sessions.has(link.session_id)) continue;
+        if (!interruptedSessions.has(link.session_id)) continue;
+        try {
+          getOrResume(link.session_id);
+          revived++;
+        } catch (err) {
+          console.warn(
+            `[sessions] re-hydrate ${link.session_id} (plan ${plan.id} / phase ${link.phase_slug}) failed:`,
+            err,
+          );
+        }
+      }
+    }
+  } catch (err) {
+    console.warn("[sessions] phase re-hydrate sweep failed:", err);
+    return;
+  }
+  if (revived > 0) {
+    console.log(`[sessions] re-hydrated ${revived} phase session(s) from approved plans`);
   }
 }
 
