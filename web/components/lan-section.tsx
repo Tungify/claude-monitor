@@ -410,16 +410,34 @@ function PublicRow({
             </p>
           </div>
         </div>
-        <Button
-          size="sm"
-          variant={status.enabled ? "outline" : "default"}
-          disabled={busy || (!status.enabled && partialNamed)}
-          onClick={status.enabled ? onDisable : onEnable}
-        >
-          {busy && <RefreshCw className="mr-1 size-3.5 animate-spin" />}
-          {!busy && <Globe className="mr-1 size-3.5" />}
-          {status.enabled ? "Disable" : "Enable public"}
-        </Button>
+        <div className="flex items-center gap-1.5">
+          {status.enabled && (
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={busy || partialNamed}
+              onClick={onEnable}
+              title="Restart tunnel with the current inputs"
+            >
+              {busy ? (
+                <RefreshCw className="mr-1 size-3.5 animate-spin" />
+              ) : (
+                <RefreshCw className="mr-1 size-3.5" />
+              )}
+              Reconfigure
+            </Button>
+          )}
+          <Button
+            size="sm"
+            variant={status.enabled ? "outline" : "default"}
+            disabled={busy || (!status.enabled && partialNamed)}
+            onClick={status.enabled ? onDisable : onEnable}
+          >
+            {busy && <RefreshCw className="mr-1 size-3.5 animate-spin" />}
+            {!busy && <Globe className="mr-1 size-3.5" />}
+            {status.enabled ? "Disable" : "Enable public"}
+          </Button>
+        </div>
       </header>
 
       {status.error && status.error.includes("cloudflared binary not found") && (
@@ -447,8 +465,11 @@ function PublicRow({
           </Alert>
         )}
 
-      {!status.enabled && (
-        <div className="space-y-3">
+      {/* Inputs visible regardless of enable state — when public is on
+          but the backend is tracking a quick tunnel (e.g. auto-start at
+          boot with empty config), the user can still type the named-
+          tunnel fields and click Reconfigure to switch over. */}
+      <div className="space-y-3">
           <div className="space-y-1.5">
             <label className="text-xs font-semibold tracking-wider text-muted-foreground uppercase">
               Named tunnel (recommended for SSE)
@@ -561,11 +582,16 @@ function PublicRow({
             )}
           </div>
         </div>
-      )}
 
       {status.enabled && !status.pending && status.url && (
         <PublicDetails
           url={status.url}
+          // configuredHost is what the user typed into the named-tunnel
+          // hostname field. When it differs from the active URL (e.g.
+          // backend is still on a stale quick tunnel while a named
+          // tunnel is also reachable), we render both so the user can
+          // pick whichever works. Empty when no named hostname is set.
+          configuredHost={hostTrim && !status.url.includes(hostTrim) ? hostTrim : undefined}
           token={lanStatus?.token}
           allowIPs={status.allow_ips}
         />
@@ -657,35 +683,74 @@ function LANDetails({
 
 function PublicDetails({
   url,
+  configuredHost,
   token,
   allowIPs,
 }: {
   url: string;
+  configuredHost?: string;
   token?: string;
   allowIPs?: string;
 }) {
+  // Both URLs may be reachable simultaneously when the backend is
+  // running a quick tunnel (whose URL it tracks via t.url) but the
+  // user has also configured a named tunnel pointing at a different
+  // hostname (cf_hostname). Surface both so they can pick.
+  const namedURL = configuredHost ? `https://${configuredHost}` : undefined;
+
+  return (
+    <div className="space-y-3">
+      <UrlRow
+        label={namedURL ? "Active tunnel URL" : "Public URL"}
+        url={url}
+        token={token}
+      />
+      {namedURL && (
+        <UrlRow
+          label="Named tunnel hostname"
+          url={namedURL}
+          token={token}
+          hint="Configured but not currently the active backend tunnel — switch via Reconfigure."
+        />
+      )}
+      {allowIPs && (
+        <p className="text-xs text-muted-foreground">
+          IP allowlist active:{" "}
+          <code className="font-mono text-xs">{allowIPs}</code>
+        </p>
+      )}
+    </div>
+  );
+}
+
+function UrlRow({
+  label,
+  url,
+  token,
+  hint,
+}: {
+  label: string;
+  url: string;
+  token?: string;
+  hint?: string;
+}) {
   const [copied, setCopied] = useState(false);
-
-  // Display the bare URL (clean, fits the box) but copy the
-  // tokenized form so the user can paste it into a new browser
-  // and have proxy.ts set the cookie on first touch. The hint
-  // text below promises this — keep them in sync.
+  // Copy the tokenized form so pasting into a new browser triggers
+  // proxy.ts's first-touch cookie set. Display the clean URL.
   const copyValue = token ? `${url}?token=${encodeURIComponent(token)}` : url;
-
   const onCopy = async () => {
     try {
       await navigator.clipboard.writeText(copyValue);
       setCopied(true);
       setTimeout(() => setCopied(false), 1500);
     } catch {
-      // see LANDetails
+      // clipboard denied; URL is still visible next to the button
     }
   };
-
   return (
-    <div className="space-y-2">
+    <div className="space-y-1">
       <div className="text-[10px] font-semibold tracking-wider text-muted-foreground uppercase">
-        Public URL
+        {label}
       </div>
       <div className="flex items-center gap-1.5">
         <code className="block min-w-0 flex-1 truncate rounded border bg-muted px-2 py-1 font-mono text-xs">
@@ -705,12 +770,7 @@ function PublicDetails({
           )}
         </Button>
       </div>
-      {allowIPs && (
-        <p className="text-xs text-muted-foreground">
-          IP allowlist active:{" "}
-          <code className="font-mono text-xs">{allowIPs}</code>
-        </p>
-      )}
+      {hint && <p className="text-[11px] text-muted-foreground">{hint}</p>}
     </div>
   );
 }
