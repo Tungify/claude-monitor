@@ -31,6 +31,7 @@ import type {
   Phase,
   PhaseMergeResult,
   PhaseNote,
+  PhasePending,
   PhaseSession,
   PlanIntegrationReviewStatus,
   PlanMergeStatus,
@@ -98,6 +99,16 @@ interface PhaseRow {
   phase: Phase;
   link?: PhaseSession;
   session?: SessionSummary;
+  // depends_on slugs that haven't reached commit_status ∈
+  // {clean, committed} yet. Empty = phase is unblocked. Populated for
+  // EVERY row (not just pending ones) so the depends_on chips can
+  // colour-code satisfied vs unsatisfied edges.
+  blockedDeps: string[];
+  // True if the phase is in plan.pending_phases — i.e. approved but
+  // not yet spawned because of unsatisfied deps. Mutually exclusive
+  // with `link` in well-formed plans (the scheduler moves a phase
+  // from pending → phase_sessions atomically).
+  isPending: boolean;
 }
 
 const COLUMNS: { id: Column; label: string; tint: string }[] = [
@@ -130,6 +141,12 @@ export function PhaseBoard({ plan: initialPlan }: { plan: PlanRecord }) {
   // can change.
   const [phaseSessions, setPhaseSessions] = useState<PhaseSession[]>(
     initialPlan.phase_sessions ?? [],
+  );
+  // Pending phases — approved but not yet spawned because their
+  // depends_on graph isn't settled. /complete returns an updated
+  // plan whose pending_phases shrink as dependents are released.
+  const [pendingPhases, setPendingPhases] = useState<PhasePending[]>(
+    initialPlan.pending_phases ?? [],
   );
   const [pendingCompleteSlug, setPendingCompleteSlug] = useState<string | null>(
     null,
@@ -244,6 +261,9 @@ export function PhaseBoard({ plan: initialPlan }: { plan: PlanRecord }) {
         // Notes also land async (any phase agent can append at any
         // time). Mirror them so the panel updates without a route nav.
         setPhaseNotes(next.notes ?? []);
+        // Pending phases shrink as dependents spawn — keep mirror
+        // current so blocked/cleared transitions surface promptly.
+        setPendingPhases(next.pending_phases ?? []);
       } catch {
         // ignore; tick again
       }
@@ -371,12 +391,37 @@ export function PhaseBoard({ plan: initialPlan }: { plan: PlanRecord }) {
     const linkByPhase = new Map<string, PhaseSession>(
       phaseSessions.map((p) => [p.phase_slug, p]),
     );
-    return initialPlan.phases.map((phase) => ({
-      phase,
-      link: linkByPhase.get(phase.slug),
-      session: sessionByPhaseSlug.get(phase.slug),
-    }));
-  }, [phaseSessions, initialPlan.phases, sessions, initialPlanId]);
+    const pendingSlugs = new Set(pendingPhases.map((p) => p.phase_slug));
+    // Map dep slug → its commit_status (or undefined). Used to
+    // partition each phase's depends_on into satisfied vs blocking.
+    // Mirrors plan-scheduler.depsBlocking but on the client.
+    const commitByDep = new Map<string, PhaseSession["commit_status"]>();
+    for (const s of phaseSessions) {
+      commitByDep.set(s.phase_slug, s.commit_status);
+    }
+    return initialPlan.phases.map((phase) => {
+      const blockedDeps: string[] = [];
+      for (const dep of phase.depends_on ?? []) {
+        const status = commitByDep.get(dep);
+        if (status !== "clean" && status !== "committed") {
+          blockedDeps.push(dep);
+        }
+      }
+      return {
+        phase,
+        link: linkByPhase.get(phase.slug),
+        session: sessionByPhaseSlug.get(phase.slug),
+        blockedDeps,
+        isPending: pendingSlugs.has(phase.slug),
+      };
+    });
+  }, [
+    phaseSessions,
+    pendingPhases,
+    initialPlan.phases,
+    sessions,
+    initialPlanId,
+  ]);
 
   // Fire the commit action and merge the server's updated PhaseSession
   // back into local state. We don't refetch the whole plan — the route
@@ -402,8 +447,14 @@ export function PhaseBoard({ plan: initialPlan }: { plan: PlanRecord }) {
         const data = (await res.json()) as {
           plan: PlanRecord;
           phase_session?: PhaseSession;
+          spawned_dependents?: string[];
         };
         setPhaseSessions(data.plan.phase_sessions ?? []);
+        // Cascade may have released dependents — mirror the new
+        // pending list so blocked phases that just spawned drop their
+        // "blocked by" badges and pick up real session state from the
+        // /api/chat poll on its next tick.
+        setPendingPhases(data.plan.pending_phases ?? []);
       } catch (err) {
         console.error(`[phase-board] complete ${slug} threw:`, err);
       } finally {
@@ -739,8 +790,9 @@ function PhaseRowCard({
   onReview: (slug: string) => void;
   reviewPending: boolean;
 }) {
-  const { phase, link, session } = row;
+  const { phase, link, session, blockedDeps, isPending } = row;
   const status = session?.status;
+  const blockedSet = useMemo(() => new Set(blockedDeps), [blockedDeps]);
   // Show the commit affordance only once the agent has actually been
   // spawned (link exists) AND it isn't actively working: idle/closed/
   // errored mean the user can reasonably decide "this phase is done,
@@ -788,11 +840,39 @@ function PhaseRowCard({
           </div>
           {phase.depends_on && phase.depends_on.length > 0 && (
             <div className="mt-1 flex flex-wrap gap-1">
-              {phase.depends_on.map((dep) => (
-                <Badge key={dep} variant="secondary" className="font-mono text-[10px]">
-                  ← {dep}
-                </Badge>
-              ))}
+              {phase.depends_on.map((dep) => {
+                const blocking = blockedSet.has(dep);
+                return (
+                  <Badge
+                    key={dep}
+                    variant="secondary"
+                    className={cn(
+                      "font-mono text-[10px]",
+                      blocking
+                        ? "border-amber-500/40 bg-amber-500/10 text-amber-700 dark:text-amber-300"
+                        : "border-emerald-500/40 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300",
+                    )}
+                    title={
+                      blocking
+                        ? `${dep} not yet committed — this phase is blocked on it`
+                        : `${dep} committed — dep satisfied`
+                    }
+                  >
+                    ← {dep}
+                  </Badge>
+                );
+              })}
+            </div>
+          )}
+          {isPending && (
+            <div className="mt-1.5 flex items-center gap-1.5 rounded-md border border-amber-500/40 bg-amber-500/10 px-2 py-1 text-[11px] text-amber-700 dark:text-amber-300">
+              <Clock className="size-3" aria-hidden />
+              <span className="font-mono">
+                blocked
+                {blockedDeps.length > 0
+                  ? ` on ${blockedDeps.join(", ")}`
+                  : " — waiting to spawn"}
+              </span>
             </div>
           )}
         </div>

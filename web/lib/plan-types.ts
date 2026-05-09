@@ -4,7 +4,7 @@
 // ~/.claude/projects/<encoded-cwd>/plans/<plan-id>.json mirroring Claude
 // CLI's session storage convention.
 
-import type { Effort } from "./chat-types";
+import type { Effort, PermissionMode } from "./chat-types";
 
 export interface Phase {
   slug: string;
@@ -163,6 +163,31 @@ export interface PhaseMergeResult {
 // phases, redundant implementations, integration-only test gaps, ...).
 export type PlanIntegrationReviewStatus = "running" | "complete" | "failed";
 
+// PhasePending is a phase that has been approved (worktree exists,
+// account is reserved) but not yet spawned because at least one of its
+// `depends_on` phases hasn't reached commit_status ∈ {clean, committed}
+// yet. The complete route releases pending phases as their deps clear:
+// each successful commit triggers a re-evaluation that promotes any
+// newly-eligible PhasePending into a real PhaseSession.
+//
+// Spawn defaults are SNAPSHOTTED at approve time so the cascade in the
+// complete route doesn't depend on the owner session still being
+// alive — by the time a deep-graph phase's deps clear, the user may
+// have closed and re-opened the orchestrator.
+export interface PhasePending {
+  phase_slug: string;
+  config_dir: string;
+  account_name?: string;
+  worktree_path: string;
+  worktree_branch: string;
+  // Owner-session fallbacks frozen at approve time. The actual spawn
+  // still merges in per-phase overrides from `plan.phases[i].model` /
+  // `.effort` first; these only fill gaps.
+  owner_permission_mode: PermissionMode;
+  owner_model?: string;
+  owner_effort?: Effort;
+}
+
 // PhaseNote is a broadcast a phase can post to siblings via the
 // submit_phase_note MCP tool. Use case: phase A renames a public API,
 // changes a schema, swaps a library — notify siblings who might rely
@@ -193,6 +218,11 @@ export interface PlanRecord {
   // server, registered on each phase session). Persisted on the plan
   // so the UI can show them and so notes survive a session restart.
   notes?: PhaseNote[];
+  // Phases approved-but-not-yet-spawned because their depends_on graph
+  // is still settling. Each successful /complete checks this list and
+  // promotes any phase whose deps are now in {clean, committed} into
+  // a real PhaseSession.
+  pending_phases?: PhasePending[];
   error?: string;
   merge_status?: PlanMergeStatus;
   merge_branch?: string;

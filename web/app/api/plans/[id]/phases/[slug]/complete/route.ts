@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { autoCommitWorktree, checkPhaseScope } from "@/lib/server/git";
 import { findPlanById, updatePlan } from "@/lib/server/plans";
+import { spawnReadyPending } from "@/lib/server/plan-scheduler";
 import type { PhaseSession, PlanRecord } from "@/lib/plan-types";
 
 export const runtime = "nodejs";
@@ -94,6 +95,10 @@ export async function POST(_req: Request, { params }: Ctx) {
   }
 
   const committedAt = new Date().toISOString();
+  // newlySpawned is set inside the mutator below so the response can
+  // include it. Declared outside because updatePlan's callback is
+  // synchronous and we want to surface this hint to the UI.
+  let newlySpawned: string[] = [];
   const updated = await updatePlan(plan.cwd, plan.id, (p: PlanRecord) => {
     if (!p.phase_sessions) return;
     const idx = p.phase_sessions.findIndex(
@@ -124,10 +129,19 @@ export async function POST(_req: Request, { params }: Ctx) {
       next.scope_check_base = scopeBase;
     }
     p.phase_sessions[idx] = next;
+    // Now that this phase has a terminal commit_status, dependents
+    // may be ready. spawnReadyPending mutates p in place: pending →
+    // phase_sessions for each newly-released slug. A failed commit
+    // does NOT release dependents (depsBlocking only counts
+    // clean/committed as satisfied).
+    if (result.status !== "failed") {
+      newlySpawned = spawnReadyPending(p);
+    }
   });
 
   return NextResponse.json({
     plan: updated,
     phase_session: updated.phase_sessions?.find((p) => p.phase_slug === slug),
+    spawned_dependents: newlySpawned,
   });
 }

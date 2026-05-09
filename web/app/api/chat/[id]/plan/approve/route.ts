@@ -7,19 +7,16 @@ import {
 } from "@/lib/daemon";
 import { readPlan, writePlan } from "@/lib/server/plans";
 import {
-  createSession,
   emitPlanEvent,
   getLatestPlan,
   getSession,
-  sendMessage,
   setLatestPlan,
 } from "@/lib/server/sessions";
+import { spawnReadyPending } from "@/lib/server/plan-scheduler";
 import type {
-  Phase,
   PhaseOverrides,
+  PhasePending,
   PhaseScope,
-  PhaseSession,
-  PlanRecord,
 } from "@/lib/plan-types";
 import type { Effort } from "@/lib/chat-types";
 
@@ -100,84 +97,6 @@ function sanitizeOverride(raw: unknown): {
 function branchFor(planId: string, slug: string): string {
   const short = planId.slice(0, 8);
   return `wo/${short}/${slug}`;
-}
-
-// Build the kickoff prompt the phase agent receives as its first user
-// turn. Conveys: which phase it owns, sibling phases (context-only,
-// must not touch), branch + worktree, and explicit instructions to
-// commit when done. Sibling list lets the agent reason about boundaries
-// without any inter-phase coordination — each phase relies on the plan
-// brief to stay in lane, not on reading siblings' WIP code.
-//
-// TDD addendum (`phase.tdd_mode === true`) appends a step-1/2/3
-// discipline to the working agreement: tests first, surface for review,
-// implement until green. Light-touch — no scheduler change, just a
-// stronger prompt the model commits to.
-function buildPhasePrompt(
-  plan: PlanRecord,
-  phase: Phase,
-  worktreePath: string,
-  branch: string,
-): string {
-  const siblings = plan.phases.filter((p) => p.slug !== phase.slug);
-  const siblingLines =
-    siblings.length === 0
-      ? "_(none — this is the only phase)_"
-      : siblings
-          .map((p) => `- \`${p.slug}\` — ${p.title}`)
-          .join("\n");
-
-  const tddSection = phase.tdd_mode
-    ? [
-        "",
-        "## TDD discipline (required for this phase)",
-        "1. Write failing tests for the behavior described in your brief. Cover happy path + the edge cases you would actually exercise.",
-        "2. Run the tests and confirm they fail for the right reason. Then **stop** — surface the test list and ask the user to confirm coverage before implementing.",
-        "3. Only after step 2 is acknowledged: implement until the tests pass. Don't refactor until they're green.",
-        "Skipping step 2 defeats the point — surface even if you think coverage is obvious.",
-      ].join("\n")
-    : "";
-
-  const scopeSection =
-    phase.scope?.files && phase.scope.files.length > 0
-      ? [
-          "",
-          "## File scope (stay within these globs)",
-          ...phase.scope.files.map((g) => `- \`${g}\``),
-          "If you genuinely need to touch a file outside this list, **stop** and use AskUserQuestion to surface why before editing it. The post-commit check flags out-of-scope files as a warning so the user notices either way.",
-        ].join("\n")
-      : "";
-
-  return [
-    `# Phase: ${phase.title}`,
-    "",
-    `You are the agent assigned to execute phase **${phase.slug}** of plan _"${plan.title}"_.`,
-    "",
-    "## Your brief",
-    phase.description,
-    "",
-    "## Working environment",
-    `- Worktree: \`${worktreePath}\``,
-    `- Branch: \`${branch}\``,
-    "- This worktree is your isolated copy of the repository. Other phases run in their own worktrees in parallel.",
-    "",
-    "## Sibling phases (context only — DO NOT modify their files)",
-    siblingLines,
-    "",
-    "## Working agreement",
-    "- Stay within the scope of your phase brief. If you hit work that belongs to a sibling, stop and surface it instead of silently expanding scope.",
-    "- Run the project's tests/typecheck before declaring done.",
-    "- When finished, `git add` your changes and create a commit on this branch with a clear message.",
-    "- If you get blocked or need a decision, use the AskUserQuestion tool — do not guess.",
-    "",
-    "## Coordinating with sibling phases",
-    "- Sibling phases run in parallel — they cannot read your worktree. Use the `mcp__phase_notes__list_phase_notes` tool to read what they have already broadcast, and `mcp__phase_notes__submit_phase_note` to broadcast back when YOU change something they may rely on (API rename, schema/contract change, library swap, gotcha you discovered). Keep notes terse — 1-3 sentences. Do not narrate progress; broadcast only when a sibling could break or duplicate work without the heads-up.",
-    "- Read notes once at the start, and again before you commit if your phase touched any shared interfaces.",
-    scopeSection,
-    tddSection,
-    "",
-    "Begin.",
-  ].join("\n");
 }
 
 export async function POST(req: Request, { params }: Ctx) {
@@ -278,51 +197,48 @@ export async function POST(req: Request, { params }: Ctx) {
     );
   }
 
-  const phaseSessions: PhaseSession[] = [];
-  const phaseBySlug = new Map(plan.phases.map((p) => [p.slug, p]));
-  for (let i = 0; i < worktreesCreated.length; i++) {
-    const wt = worktreesCreated[i];
-    const phase = phaseBySlug.get(wt.phase_slug);
-    if (!phase) continue; // shouldn't happen — daemon echoes back what we sent
+  // Build a PhasePending entry for every phase up-front, then let the
+  // scheduler decide which ones can spawn now (deps already satisfied,
+  // i.e. no deps) versus which stay pending. Owner session config is
+  // SNAPSHOTTED here so a later /complete cascade — possibly fired
+  // after the orchestrator was restarted — has everything it needs to
+  // spawn dependents without rehydrating the owner session.
+  const pending: PhasePending[] = [];
+  const worktreeBySlug = new Map(
+    worktreesCreated.map((w) => [w.phase_slug, w]),
+  );
+  for (let i = 0; i < plan.phases.length; i++) {
+    const phase = plan.phases[i];
+    const wt = worktreeBySlug.get(phase.slug);
+    if (!wt) continue; // shouldn't happen — daemon echoes back what we sent
     const assigned = assignments?.[i];
     const configDir = assigned?.config_dir ?? session.configDir;
     const accountName = assigned?.account_name ?? session.accountName;
-    try {
-      const summary = createSession({
-        cwd: wt.path,
-        configDir,
-        accountName,
-        // Per-phase override falls back to the owner session's model/
-        // effort. Owner session already has these set from the
-        // composer toolbar — defaulting there preserves prior behavior
-        // ("phases inherit from the user's current chat config").
-        model: phase.model ?? session.model,
-        effort: phase.effort ?? session.effort,
-        permissionMode: session.permissionMode,
-        planId: plan.id,
-        phaseSlug: phase.slug,
-      });
-      sendMessage(summary.id, buildPhasePrompt(plan, phase, wt.path, wt.branch));
-      phaseSessions.push({
-        phase_slug: phase.slug,
-        session_id: summary.id,
-        config_dir: configDir,
-        account_name: accountName,
-        spawned_at: new Date().toISOString(),
-      });
-    } catch (err) {
-      // One phase failing to spawn shouldn't void the whole approve —
-      // record the missing slot and let the user retry that phase
-      // manually. Worktree exists either way.
-      console.error(`failed to spawn phase session for ${phase.slug}:`, err);
-    }
+    pending.push({
+      phase_slug: phase.slug,
+      config_dir: configDir,
+      account_name: accountName,
+      worktree_path: wt.path,
+      worktree_branch: wt.branch,
+      owner_permission_mode: session.permissionMode,
+      owner_model: session.model,
+      owner_effort: session.effort,
+    });
   }
 
   plan.status = "approved";
   plan.approved_at = new Date().toISOString();
   plan.worktrees = worktreesCreated;
-  plan.phase_sessions = phaseSessions;
+  plan.phase_sessions = [];
+  plan.pending_phases = pending;
   delete plan.error;
+
+  // First-wave spawn: every phase with no depends_on (or only deps
+  // already in {clean,committed}, which can't happen at approve time
+  // since nothing has been committed yet) goes live immediately.
+  // Subsequent waves are released by /complete as parents commit.
+  spawnReadyPending(plan);
+
   await writePlan(plan);
   setLatestPlan(sessionId, plan);
   emitPlanEvent(sessionId, "plan_approved", plan);

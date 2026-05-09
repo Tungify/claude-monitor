@@ -12,12 +12,14 @@ import { computeDagLayout, type DagNode } from "./dag-layout";
 // PhaseRow mirrors the shape PhaseBoard already builds for its kanban
 // columns. Duplicated locally because the canonical type is internal
 // to phase-board.tsx and exporting it would re-trigger the file's
-// 1971-line monolith problem. The shape is small enough that drift
-// risk is tolerable.
+// monolith problem. The shape is small enough that drift risk is
+// tolerable.
 export interface DagPhaseRow {
   phase: Phase;
   link?: PhaseSession;
   session?: SessionSummary;
+  blockedDeps: string[];
+  isPending: boolean;
 }
 
 // DagView positions phases by dependency depth (left-to-right) and
@@ -104,14 +106,23 @@ export function DagView({ rows }: { rows: DagPhaseRow[] }) {
               // the target — visually clear directionality.
               const dx = Math.max(40, (toX - fromX) / 2);
               const path = `M ${fromX} ${fromY} C ${fromX + dx} ${fromY}, ${toX - dx} ${toY}, ${toX} ${toY}`;
-              const fromStatus = rowBySlug.get(e.from)?.session?.status;
+              const fromRow = rowBySlug.get(e.from);
+              const fromStatus = fromRow?.session?.status;
+              const fromCommit = fromRow?.link?.commit_status;
+              const satisfied =
+                fromCommit === "clean" || fromCommit === "committed";
               return (
                 <path
                   key={`${e.from}->${e.to}`}
                   d={path}
                   fill="none"
                   strokeWidth={1.5}
-                  className={edgeColor(fromStatus)}
+                  className={
+                    satisfied
+                      ? "stroke-emerald-500/60"
+                      : edgeColor(fromStatus)
+                  }
+                  strokeDasharray={satisfied ? undefined : "4 3"}
                   markerEnd="url(#dag-arrow)"
                 />
               );
@@ -157,7 +168,7 @@ function DagNodeCard({
   width: number;
   height: number;
 }) {
-  const { phase, link, session } = row;
+  const { phase, link, session, blockedDeps, isPending } = row;
   const status = session?.status;
   const className = cn(
     "absolute flex flex-col gap-1 rounded-md border bg-background p-2 shadow-sm transition-colors",
@@ -183,6 +194,20 @@ function DagNodeCard({
         {phase.title}
       </div>
       <div className="mt-auto flex flex-wrap items-center gap-1 text-[10px] font-mono text-muted-foreground">
+        {isPending && (
+          <span
+            className="rounded bg-amber-500/10 px-1 py-0.5 text-amber-700 dark:text-amber-300"
+            title={
+              blockedDeps.length > 0
+                ? `blocked on ${blockedDeps.join(", ")}`
+                : "waiting to spawn"
+            }
+          >
+            {blockedDeps.length > 0
+              ? `blocked: ${blockedDeps.join(",")}`
+              : "blocked"}
+          </span>
+        )}
         {link?.commit_status && (
           <span
             className={cn(
