@@ -212,6 +212,12 @@ export interface MergeBranchesResult {
   status: "ok" | "failed";
   integration_branch: string;
   results: MergePhaseResult[];
+  // base_sha = HEAD of integrationBranch *before* this run started any
+  // merges. Captured so callers (the integration-review agent) can
+  // diff the cumulative contribution `base_sha..head_sha` even when
+  // intermediate commits exist between phase merges (e.g. from a
+  // previous partial run + retry).
+  base_sha?: string;
   head_sha?: string;
   error?: string;
 }
@@ -315,6 +321,18 @@ export async function mergePhaseBranches(
     };
   }
 
+  // Snapshot HEAD of the integration branch *before* any merges run so
+  // an integration-review agent can diff `base_sha..head_sha` later.
+  // Best-effort: a missing base_sha just means review falls back to
+  // diffing against branch refs at run time.
+  let baseSha: string | undefined;
+  try {
+    const { stdout } = await git(repoPath, ["rev-parse", "HEAD"]);
+    baseSha = stdout.trim();
+  } catch {
+    // ignore — non-fatal
+  }
+
   const results: MergePhaseResult[] = [];
   let topLevelError: string | undefined;
   let stoppedEarly = false;
@@ -415,6 +433,7 @@ export async function mergePhaseBranches(
     status: anyFailure ? "failed" : "ok",
     integration_branch: integrationBranch,
     results,
+    base_sha: baseSha,
     head_sha: headSha,
     error: topLevelError,
   };

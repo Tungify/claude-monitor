@@ -155,6 +155,14 @@ export interface PhaseMergeResult {
   error?: string;
 }
 
+// PlanIntegrationReviewStatus parallels PhaseReviewStatus but applies
+// to the plan-level review run on the integration branch after every
+// phase has merged. The reviewer reads the cumulative diff
+// `<merge_base_sha>..<merge_head_sha>` so it can spot cross-phase
+// issues a per-phase reviewer can't see (mismatched APIs across
+// phases, redundant implementations, integration-only test gaps, ...).
+export type PlanIntegrationReviewStatus = "running" | "complete" | "failed";
+
 export interface PlanRecord {
   id: string;
   session_id: string;
@@ -170,7 +178,27 @@ export interface PlanRecord {
   merge_status?: PlanMergeStatus;
   merge_branch?: string;
   merge_results?: PhaseMergeResult[];
+  // HEAD of the integration branch BEFORE the merge run started —
+  // recorded by the /merge route so an integration review can diff
+  // `merge_base_sha..merge_head_sha` to see exactly what the merge
+  // contributed. Distinct from per-phase merge-base because phases
+  // can have diverged from integration via several intermediate
+  // commits and still be valid integration material.
+  merge_base_sha?: string;
   merge_head_sha?: string;
   merged_at?: string;
   merge_error?: string;
+  // Plan-level integration review (POST /api/plans/<id>/integration-review).
+  // Spawned after a successful merge; reads the cumulative diff and
+  // reports findings via submit_review. Soft signal — never blocks
+  // anything; user reads + decides whether to follow up.
+  integration_review_status?: PlanIntegrationReviewStatus;
+  integration_review_started_at?: string;
+  integration_review_completed_at?: string;
+  integration_review_summary?: string;
+  integration_review_findings?: ReviewFinding[];
+  integration_review_error?: string;
+  integration_review_base?: string;
+  integration_review_head?: string;
+  integration_review_branch?: string;
 }

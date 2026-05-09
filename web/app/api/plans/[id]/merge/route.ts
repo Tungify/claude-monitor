@@ -128,8 +128,21 @@ export async function POST(req: Request, { params }: Ctx) {
         error: r.error,
       }),
     );
+    p.merge_base_sha = result.base_sha;
     p.merge_head_sha = result.head_sha;
     p.merged_at = mergedAt;
+    // Re-running merge invalidates any prior integration review — the
+    // diff range is no longer the same. Clear stale fields so the UI
+    // doesn't claim "clean review" for a brand-new merge.
+    delete p.integration_review_status;
+    delete p.integration_review_started_at;
+    delete p.integration_review_completed_at;
+    delete p.integration_review_summary;
+    delete p.integration_review_findings;
+    delete p.integration_review_error;
+    delete p.integration_review_base;
+    delete p.integration_review_head;
+    delete p.integration_review_branch;
     if (result.error) {
       p.merge_error = result.error;
     } else {

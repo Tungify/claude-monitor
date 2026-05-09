@@ -22,6 +22,7 @@ import type {
   Phase,
   PhaseMergeResult,
   PhaseSession,
+  PlanIntegrationReviewStatus,
   PlanMergeStatus,
   PlanRecord,
   ReviewFinding,
@@ -100,6 +101,23 @@ export function PhaseBoard({ plan: initialPlan }: { plan: PlanRecord }) {
     initialPlan.merge_branch ?? "main",
   );
   const [merging, setMerging] = useState(false);
+  // Mirror plan.integration_review_* locally so the panel updates
+  // without a route nav after POST /integration-review returns. The
+  // poll below replaces phaseSessions AND splices these in too.
+  const [integrationReview, setIntegrationReview] = useState<
+    IntegrationReviewSnapshot
+  >(snapshotIntegrationReview(initialPlan));
+  const [integrationReviewPending, setIntegrationReviewPending] =
+    useState(false);
+  // Default-open the integration review panel when fresh findings or
+  // an error land. Otherwise collapsed so the user can scan the plan
+  // strip without a wall of text.
+  const [integrationReviewOpen, setIntegrationReviewOpen] = useState<boolean>(
+    () =>
+      initialPlan.integration_review_status === "complete" &&
+      ((initialPlan.integration_review_findings?.length ?? 0) > 0 ||
+        !!initialPlan.integration_review_summary),
+  );
   const initialPlanId = initialPlan.id;
 
   // Poll /api/chat for live status. 1500ms is fast enough that a
@@ -131,6 +149,10 @@ export function PhaseBoard({ plan: initialPlan }: { plan: PlanRecord }) {
         if (!res.ok) return;
         const next = (await res.json()) as PlanRecord;
         setPhaseSessions(next.phase_sessions ?? []);
+        // Splice integration review fields too — they share the
+        // poll's lifecycle (background agent writes to disk, UI reads
+        // back).
+        setIntegrationReview(snapshotIntegrationReview(next));
       } catch {
         // ignore; tick again
       }
@@ -185,8 +207,10 @@ export function PhaseBoard({ plan: initialPlan }: { plan: PlanRecord }) {
   // Stops as soon as no phase is running so an idle PhaseBoard doesn't
   // pay the cost.
   const anyReviewRunning = useMemo(
-    () => phaseSessions.some((p) => p.review_status === "running"),
-    [phaseSessions],
+    () =>
+      phaseSessions.some((p) => p.review_status === "running") ||
+      integrationReview.status === "running",
+    [phaseSessions, integrationReview.status],
   );
   useEffect(() => {
     if (!anyReviewRunning) return;
@@ -355,6 +379,11 @@ export function PhaseBoard({ plan: initialPlan }: { plan: PlanRecord }) {
       setMergedAt(data.plan.merged_at);
       setMergeError(data.plan.merge_error);
       if (data.plan.merge_branch) setMergeBranch(data.plan.merge_branch);
+      // Server clears integration review on re-merge — mirror that
+      // here so the panel doesn't keep showing stale findings against
+      // the old diff range.
+      setIntegrationReview(snapshotIntegrationReview(data.plan));
+      setIntegrationReviewOpen(false);
     } catch (err) {
       console.error(`[phase-board] merge threw:`, err);
       setMergeError(err instanceof Error ? err.message : String(err));
@@ -362,6 +391,39 @@ export function PhaseBoard({ plan: initialPlan }: { plan: PlanRecord }) {
       setMerging(false);
     }
   }, [initialPlanId, mergeBranch]);
+
+  // Plan-level integration review. Like /complete and /review, the
+  // server runs the agent in the background and persists findings to
+  // disk; the plan-record poll surfaces them as they land. POST
+  // returns 202 with the running record so the badge flips
+  // immediately. We open the findings panel by default for fresh
+  // results so the user doesn't miss them — they can collapse it
+  // again with the chevron.
+  const handleIntegrationReview = useCallback(async () => {
+    setIntegrationReviewPending(true);
+    try {
+      const res = await fetch(
+        `/api/plans/${encodeURIComponent(initialPlanId)}/integration-review`,
+        { method: "POST" },
+      );
+      if (!res.ok && res.status !== 202) {
+        const detail = await res.text();
+        console.error(
+          `[phase-board] integration-review failed:`,
+          res.status,
+          detail,
+        );
+        return;
+      }
+      const data = (await res.json()) as { plan: PlanRecord };
+      setIntegrationReview(snapshotIntegrationReview(data.plan));
+      setIntegrationReviewOpen(true);
+    } catch (err) {
+      console.error(`[phase-board] integration-review threw:`, err);
+    } finally {
+      setIntegrationReviewPending(false);
+    }
+  }, [initialPlanId]);
 
   const buckets = useMemo(() => {
     const map: Record<Column, PhaseRow[]> = {
@@ -462,6 +524,13 @@ export function PhaseBoard({ plan: initialPlan }: { plan: PlanRecord }) {
         onBranchChange={setMergeBranch}
         onMerge={handleMerge}
         merging={merging}
+        integrationReview={integrationReview}
+        integrationReviewOpen={integrationReviewOpen}
+        onToggleIntegrationReview={() =>
+          setIntegrationReviewOpen((v) => !v)
+        }
+        onIntegrationReview={handleIntegrationReview}
+        integrationReviewPending={integrationReviewPending}
       />
 
       <div className="grid min-h-0 flex-1 grid-cols-1 gap-3 overflow-x-auto p-4 md:grid-cols-2 xl:grid-cols-4">
@@ -1196,6 +1265,11 @@ function MergePanel({
   onBranchChange,
   onMerge,
   merging,
+  integrationReview,
+  integrationReviewOpen,
+  onToggleIntegrationReview,
+  onIntegrationReview,
+  integrationReviewPending,
 }: {
   gate: { ready: number; total: number; pending: string[]; eligible: boolean };
   status: PlanMergeStatus | undefined;
@@ -1207,6 +1281,11 @@ function MergePanel({
   onBranchChange: (b: string) => void;
   onMerge: () => void;
   merging: boolean;
+  integrationReview: IntegrationReviewSnapshot;
+  integrationReviewOpen: boolean;
+  onToggleIntegrationReview: () => void;
+  onIntegrationReview: () => void;
+  integrationReviewPending: boolean;
 }) {
   if (gate.total === 0) return null;
 
@@ -1328,8 +1407,325 @@ function MergePanel({
           )}
         </div>
       )}
+
+      {status === "merged" && (
+        <IntegrationReviewRow
+          snapshot={integrationReview}
+          open={integrationReviewOpen}
+          onToggle={onToggleIntegrationReview}
+          onRun={onIntegrationReview}
+          pending={integrationReviewPending}
+        />
+      )}
     </section>
   );
+}
+
+// IntegrationReviewSnapshot collapses the integration_review_* fields
+// from PlanRecord into a single object so prop-drilling stays tidy.
+// We mirror the wire shape one-for-one — no derived fields here, just
+// a structural slice so MergePanel can read it without depending on
+// the full PlanRecord shape.
+interface IntegrationReviewSnapshot {
+  status: PlanIntegrationReviewStatus | undefined;
+  startedAt?: string;
+  completedAt?: string;
+  summary?: string;
+  findings?: ReviewFinding[];
+  error?: string;
+  base?: string;
+  head?: string;
+  branch?: string;
+}
+
+function snapshotIntegrationReview(plan: PlanRecord): IntegrationReviewSnapshot {
+  return {
+    status: plan.integration_review_status,
+    startedAt: plan.integration_review_started_at,
+    completedAt: plan.integration_review_completed_at,
+    summary: plan.integration_review_summary,
+    findings: plan.integration_review_findings,
+    error: plan.integration_review_error,
+    base: plan.integration_review_base,
+    head: plan.integration_review_head,
+    branch: plan.integration_review_branch,
+  };
+}
+
+// IntegrationReviewRow is the second strip inside MergePanel — only
+// renders once the merge has fully landed (status === "merged"). It
+// mirrors the per-phase ReviewBadge + ReviewPanel pair: a button to
+// kick the agent, a badge that flips through running/clean/findings/
+// failed states, and an expandable panel below for the agent's
+// summary + findings list.
+function IntegrationReviewRow({
+  snapshot,
+  open,
+  onToggle,
+  onRun,
+  pending,
+}: {
+  snapshot: IntegrationReviewSnapshot;
+  open: boolean;
+  onToggle: () => void;
+  onRun: () => void;
+  pending: boolean;
+}) {
+  const status = snapshot.status;
+  const running = status === "running";
+  const buttonLabel =
+    status === "complete"
+      ? "Re-review"
+      : status === "failed"
+        ? "Retry review"
+        : "Run integration review";
+  const canRun = !running && !pending;
+  return (
+    <div className="flex flex-col gap-2 border-t pt-2">
+      <div className="flex flex-wrap items-center gap-2">
+        <MessageSquareText
+          className="size-4 shrink-0 text-violet-600 dark:text-violet-400"
+          aria-hidden
+        />
+        <div className="min-w-0 flex-1">
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="font-medium">Integration review</span>
+            <span className="text-[11px] text-muted-foreground">
+              cross-phase coherence on the merged branch
+            </span>
+            <IntegrationReviewBadge
+              snapshot={snapshot}
+              open={open}
+              onToggle={onToggle}
+            />
+          </div>
+        </div>
+        <div className="flex shrink-0 items-center gap-1.5">
+          <button
+            type="button"
+            onClick={onRun}
+            disabled={!canRun}
+            title={
+              status === "complete"
+                ? "Re-run the integration reviewer — useful after follow-up commits on the integration branch"
+                : status === "failed"
+                  ? "Retry — the previous run errored or didn't submit findings"
+                  : "Spawn a read-only agent that reviews the cumulative diff"
+            }
+            className={cn(
+              "inline-flex items-center gap-1 rounded-md border px-2 py-1 text-[11px]",
+              "border-violet-500/40 bg-violet-500/10 text-violet-700 hover:bg-violet-500/20",
+              "dark:text-violet-300",
+              "disabled:cursor-not-allowed disabled:opacity-60",
+            )}
+          >
+            {pending || running ? (
+              <Loader2 className="size-3 animate-spin" aria-hidden />
+            ) : (
+              <MessageSquareText className="size-3" aria-hidden />
+            )}
+            <span className="font-mono">{buttonLabel}</span>
+          </button>
+        </div>
+      </div>
+      {open &&
+        (status === "complete" || status === "failed") &&
+        (snapshot.summary || snapshot.error || (snapshot.findings?.length ?? 0) > 0) && (
+          <IntegrationReviewPanel snapshot={snapshot} />
+        )}
+    </div>
+  );
+}
+
+function IntegrationReviewBadge({
+  snapshot,
+  open,
+  onToggle,
+}: {
+  snapshot: IntegrationReviewSnapshot;
+  open: boolean;
+  onToggle: () => void;
+}) {
+  const status = snapshot.status;
+  if (!status) return null;
+  if (status === "running") {
+    return (
+      <span
+        className={cn(
+          "inline-flex items-center gap-1 rounded-md border px-2 py-0.5 font-mono text-[11px]",
+          "border-violet-500/40 bg-violet-500/10 text-violet-700 dark:text-violet-300",
+        )}
+        title={
+          snapshot.startedAt ? `started ${snapshot.startedAt}` : undefined
+        }
+      >
+        <Loader2 className="size-3 animate-spin" aria-hidden />
+        reviewing…
+      </span>
+    );
+  }
+  if (status === "failed") {
+    return (
+      <button
+        type="button"
+        onClick={onToggle}
+        title={snapshot.error}
+        className={cn(
+          "inline-flex items-center gap-1 rounded-md border px-2 py-0.5 font-mono text-[11px]",
+          "border-destructive/40 bg-destructive/10 text-destructive hover:bg-destructive/20",
+        )}
+      >
+        <AlertTriangle className="size-3" aria-hidden />
+        review failed
+        {open ? (
+          <ChevronDown className="size-3" aria-hidden />
+        ) : (
+          <ChevronRight className="size-3" aria-hidden />
+        )}
+      </button>
+    );
+  }
+  // complete
+  const findings = snapshot.findings ?? [];
+  const counts = countBySeverity(findings);
+  const totalIssues = counts.error + counts.warning + counts.info;
+  if (totalIssues === 0) {
+    return (
+      <button
+        type="button"
+        onClick={onToggle}
+        title={snapshot.summary}
+        className={cn(
+          "inline-flex items-center gap-1 rounded-md border px-2 py-0.5 font-mono text-[11px]",
+          "border-emerald-500/40 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300",
+        )}
+      >
+        <ShieldCheck className="size-3" aria-hidden />
+        clean integration
+        {open ? (
+          <ChevronDown className="size-3" aria-hidden />
+        ) : (
+          <ChevronRight className="size-3" aria-hidden />
+        )}
+      </button>
+    );
+  }
+  const tone =
+    counts.error > 0
+      ? "border-destructive/40 bg-destructive/10 text-destructive"
+      : counts.warning > 0
+        ? "border-amber-500/40 bg-amber-500/10 text-amber-700 dark:text-amber-300"
+        : "border-sky-500/40 bg-sky-500/10 text-sky-700 dark:text-sky-300";
+  return (
+    <button
+      type="button"
+      onClick={onToggle}
+      title={snapshot.summary}
+      className={cn(
+        "inline-flex items-center gap-1 rounded-md border px-2 py-0.5 font-mono text-[11px]",
+        tone,
+      )}
+    >
+      <MessageSquareText className="size-3" aria-hidden />
+      <span>
+        {counts.error > 0 && <span>{counts.error}e</span>}
+        {counts.warning > 0 && (
+          <span>
+            {counts.error > 0 ? " · " : ""}
+            {counts.warning}w
+          </span>
+        )}
+        {counts.info > 0 && (
+          <span>
+            {counts.error > 0 || counts.warning > 0 ? " · " : ""}
+            {counts.info}i
+          </span>
+        )}
+      </span>
+      {open ? (
+        <ChevronDown className="size-3" aria-hidden />
+      ) : (
+        <ChevronRight className="size-3" aria-hidden />
+      )}
+    </button>
+  );
+}
+
+// IntegrationReviewPanel renders summary + sorted findings, mirroring
+// ReviewPanel's layout. We also surface the diff range (base..head)
+// in the footer because, unlike per-phase reviews, the user can't
+// derive it from "the worktree this card refers to" — it's the
+// cumulative range across all phases.
+function IntegrationReviewPanel({
+  snapshot,
+}: {
+  snapshot: IntegrationReviewSnapshot;
+}) {
+  const findings = snapshot.findings ?? [];
+  const sorted = [...findings].sort((a, b) => severityRank(a.severity) - severityRank(b.severity));
+  return (
+    <div className="rounded-md border bg-muted/30 p-3 text-[11px]">
+      {snapshot.error ? (
+        <div className="flex items-start gap-2 text-destructive">
+          <AlertTriangle className="size-3 shrink-0" aria-hidden />
+          <span className="font-mono whitespace-pre-wrap">{snapshot.error}</span>
+        </div>
+      ) : null}
+      {snapshot.summary && (
+        <p className="whitespace-pre-wrap text-foreground/80">
+          {snapshot.summary}
+        </p>
+      )}
+      {sorted.length > 0 && (
+        <ul className="mt-2 flex flex-col gap-2">
+          {sorted.map((f, i) => (
+            <li
+              key={`${f.severity}-${i}-${f.title}`}
+              className="rounded-md border bg-background/60 p-2"
+            >
+              <div className="flex flex-wrap items-center gap-1.5">
+                <SeverityChip severity={f.severity} />
+                {f.category && (
+                  <Badge variant="outline" className="font-mono text-[10px]">
+                    {f.category}
+                  </Badge>
+                )}
+                <span className="font-medium">{f.title}</span>
+                {f.file && (
+                  <span className="font-mono text-[10px] text-muted-foreground">
+                    {f.file}
+                    {typeof f.line === "number" ? `:${f.line}` : ""}
+                  </span>
+                )}
+              </div>
+              <p className="mt-1 whitespace-pre-wrap text-foreground/80">
+                {f.description}
+              </p>
+            </li>
+          ))}
+        </ul>
+      )}
+      {(snapshot.completedAt || snapshot.base || snapshot.head) && (
+        <div className="mt-2 flex flex-wrap gap-x-2 gap-y-0.5 font-mono text-[10px] text-muted-foreground">
+          {snapshot.completedAt && (
+            <span>reviewed {snapshot.completedAt}</span>
+          )}
+          {snapshot.base && snapshot.head && (
+            <span>
+              · diff {snapshot.base.slice(0, 7)}..{snapshot.head.slice(0, 7)}
+            </span>
+          )}
+          {snapshot.branch && <span>· branch {snapshot.branch}</span>}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function severityRank(s: ReviewSeverity): number {
+  if (s === "error") return 0;
+  if (s === "warning") return 1;
+  return 2;
 }
 
 function MergeStatusBadge({ status }: { status: PlanMergeStatus }) {
