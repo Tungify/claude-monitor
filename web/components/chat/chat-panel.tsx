@@ -524,7 +524,11 @@ function ItemRow({
   cancelQuestion: (message?: string) => Promise<void>;
 }) {
   return (
-    <div className="px-4 py-1">
+    // Tool-call-heavy turns stream as one ItemRow per assistant message,
+    // so per-row vertical padding compounds fast — keep it at 2px so
+    // long Bash/Read sequences read as one tight block instead of a
+    // sparse ladder.
+    <div className="px-4 py-0.5">
       <div className="mx-auto max-w-3xl">
         {item.kind === "message" && <MessageBubble msg={item.msg} />}
         {item.kind === "streaming" && <StreamingTurn blocks={item.blocks} />}

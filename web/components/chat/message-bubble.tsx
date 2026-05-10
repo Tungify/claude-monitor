@@ -42,7 +42,7 @@ function AssistantBubble({
   const content = msg.message.content;
   const subagents = useSubagents();
   return (
-    <div className="space-y-2">
+    <div className="space-y-1">
       {content.map((block, i) => {
         if (block.type === "text") {
           return <TextBlock key={i} text={block.text} />;
@@ -231,6 +231,12 @@ export function TextBlock({ text }: { text: string }) {
 }
 
 export function ThinkingBlock({ thinking }: { thinking: string }) {
+  // The SDK occasionally emits a thinking block whose text never
+  // materialises (mid-stream artefact, or a content_block_start that
+  // lands without any thinking_delta children). Rendering an empty
+  // collapsible looks broken — the user clicks the chevron and
+  // nothing visually changes — so suppress entirely.
+  if (!thinking || thinking.trim().length === 0) return null;
   return (
     <details className="group rounded-md border-l-2 border-l-muted-foreground/30 bg-muted/20 px-3 py-1.5 text-xs italic text-muted-foreground">
       <summary className="cursor-pointer select-none not-italic font-mono text-[11px] text-muted-foreground/80">
@@ -512,7 +518,7 @@ export function StreamingTurn({ blocks }: { blocks: StreamingBlock[] }) {
     }
   }
   return (
-    <div className="space-y-2">
+    <div className="space-y-1">
       {blocks.map((block, i) => {
         if (!block) return null;
         if (block.type === "text") {
