@@ -78,18 +78,17 @@ function classifyForRun(
   if (msg.type === "assistant") {
     const content = msg.message.content;
     let hasToolUse = false;
-    let hasUserVisibleNonTool = false;
     for (const b of content) {
       if (b.type === "tool_use") hasToolUse = true;
-      else if (b.type === "text") {
-        // Only a text block really breaks a run — the assistant is
-        // now communicating with the user, not just operating.
-        // thinking / redacted_thinking / server_tool_use / *_tool_result
-        // / compaction / future SDK block types pass through silently.
-        hasUserVisibleNonTool = true;
-      }
     }
-    return hasToolUse && !hasUserVisibleNonTool ? "tool_asst" : "other";
+    // Any assistant turn that calls at least one tool counts as part
+    // of a tool run, even if it leads with a brief text intro like
+    // "Let me check…". The text gets folded into the collapsible
+    // alongside the tool_use, which is what the user wants — short
+    // operating commentary should NOT shatter a 10-call streak into
+    // five tiny groups. A turn with text and NO tool_use stays
+    // "other" so a real conversational reply still ends the run.
+    return hasToolUse ? "tool_asst" : "other";
   }
   if (msg.type === "user") {
     const content = msg.message.content;
