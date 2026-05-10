@@ -16,7 +16,6 @@ import {
 import type {
   Effort,
   PermissionMode,
-  SessionProvider,
   SessionSummary,
 } from "@/lib/chat-types";
 
@@ -33,19 +32,18 @@ export function HomeView() {
   const [model, setModel] = useState<string>(DEFAULT_MODEL_ID);
   const [effort, setEffort] = useState<Effort>(DEFAULT_EFFORT);
   const [mode, setMode] = useState<PermissionMode>("default");
-  const [provider, setProvider] = useState<SessionProvider>("anthropic");
   const [orModels, setOrModels] = useState<string[]>([]);
-  const [orDefaultModel, setOrDefaultModel] = useState<string | undefined>();
   const [recentCwds, setRecentCwds] = useState<string[]>([]);
   const [helpOpen, setHelpOpen] = useState(false);
   const [orDialogOpen, setOrDialogOpen] = useState(false);
 
-  // Refresh the OR favorites whenever the provider flips to openrouter
-  // or the settings dialog closes (it's the only writer). The picker
-  // shows these directly so the composer's model chip can render the
-  // user's saved OR list inline instead of an Anthropic tier label.
+  // Always fetch the OR favorites — the unified model picker shows
+  // them inline alongside native Anthropic models, so the list has
+  // to be present whether or not the user has decided to route
+  // through OR. Re-fetched whenever the OR settings dialog closes
+  // (it's the only writer) so a fresh "Add model" appears in the
+  // picker without a page reload.
   useEffect(() => {
-    if (provider !== "openrouter" && !orDialogOpen) return;
     let cancelled = false;
     void (async () => {
       try {
@@ -57,48 +55,15 @@ export function HomeView() {
           models: string[];
           default_model?: string;
         };
-        if (cancelled) return;
-        setOrModels(data.models);
-        setOrDefaultModel(data.default_model);
+        if (!cancelled) setOrModels(data.models);
       } catch {
-        // Silent — chip falls back to "(no models saved)" if we can't load.
+        // Silent — picker just shows native models if we can't load.
       }
     })();
     return () => {
       cancelled = true;
     };
-  }, [provider, orDialogOpen]);
-
-  // When the user flips to OR (or the favorites list lands), seed the
-  // composer's model field with the saved default. This is what the
-  // session will spawn against — the env block routes everything to
-  // this id, and the SDK's `model:` option carries it through. Flipping
-  // back to anthropic restores the native default.
-  //
-  // The seeding has to dodge React 19's set-state-in-effect lint rule:
-  // wrapping in queueMicrotask defers the setter until after the
-  // current render commits, which the rule accepts. Cancellation guard
-  // via the cleanup ref so a fast provider flip doesn't race two
-  // microtasks.
-  useEffect(() => {
-    let cancelled = false;
-    queueMicrotask(() => {
-      if (cancelled) return;
-      if (provider === "openrouter") {
-        const seed = orDefaultModel ?? orModels[0];
-        if (seed) setModel(seed);
-      } else {
-        setModel(DEFAULT_MODEL_ID);
-      }
-    });
-    return () => {
-      cancelled = true;
-    };
-    // We deliberately don't include `model` in deps — the user picking
-    // a different OR favorite from the composer is the same set of
-    // state, and re-running this effect would override that choice.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [provider, orDefaultModel, orModels.join("|")]);
+  }, [orDialogOpen]);
 
   // Hydrate the default cwd + recent list from existing sessions on mount.
   // Keeps the picker useful without forcing the user to type a path each
@@ -149,6 +114,15 @@ export function HomeView() {
 
     if (!active) throw new Error("no active account");
     setBusy(true);
+    // Provider is derived from the picked model id: any id in the OR
+    // favorites list (or anything with a vendor "/" prefix) routes
+    // through OpenRouter; everything else is native Anthropic. There's
+    // no separate provider toggle — the unified picker is the only
+    // affordance.
+    const provider =
+      orModels.includes(model) || model.includes("/")
+        ? "openrouter"
+        : "anthropic";
     try {
       const res = await fetch("/api/chat", {
         method: "POST",
@@ -237,10 +211,7 @@ export function HomeView() {
           onModelChange={setModel}
           effort={effort}
           onEffortChange={setEffort}
-          provider={provider}
-          onProviderChange={setProvider}
           onConfigureOpenRouter={() => setOrDialogOpen(true)}
-          activeProvider={provider}
           orModels={orModels}
           permMode={mode}
           onPermModeChange={setMode}

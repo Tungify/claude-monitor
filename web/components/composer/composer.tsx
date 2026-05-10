@@ -30,7 +30,6 @@ import { ContextMeter } from "./context-meter";
 import { FolderPicker } from "./folder-picker";
 import { ModelEffortPicker } from "./model-effort-picker";
 import { ModePicker, type PermissionMode } from "./mode-picker";
-import { ProviderPicker } from "./provider-picker";
 import { ModeBanner } from "./mode-banner";
 import { MultiPhaseToggle, hintForMultiPhase } from "./intent-picker";
 import { useGitBranch } from "@/hooks/use-git-branch";
@@ -94,11 +93,11 @@ interface HomeProps extends CommonProps {
   cwd: string;
   onCwdChange: (p: string) => void;
   recentCwds?: string[];
-  // Provider routing for the *new* session this composer will create.
-  // Only meaningful in mode="home" — once a chat exists, switching
-  // providers mid-stream isn't supported (would re-spawn the binary).
-  provider: SessionProvider;
-  onProviderChange: (p: SessionProvider) => void;
+  // Opens the global OR settings dialog. Wired through to the
+  // ModelEffortPicker's "Manage" link so the user can add/remove
+  // favorites without leaving the home view. Provider routing for the
+  // new session is derived from whichever model id the user picks —
+  // there's no separate provider toggle.
   onConfigureOpenRouter: () => void;
 }
 
@@ -501,19 +500,19 @@ export function Composer(props: Props) {
             />
           )}
           <MultiPhaseToggle active={multiPhase} onChange={setMultiPhase} />
-          {props.mode === "home" && (
-            <ProviderPicker
-              provider={props.provider}
-              onChange={props.onProviderChange}
-              onConfigureOpenRouter={props.onConfigureOpenRouter}
-            />
-          )}
           <ModelEffortPicker
             modelId={props.model}
             effort={props.effort}
             onModelChange={props.onModelChange}
             onEffortChange={props.onEffortChange}
-            provider={props.activeProvider}
+            // Home mode leaves provider undefined → picker shows both
+            // sections; the parent infers provider from the picked id
+            // when it spawns the session. Session mode locks to the
+            // session's provider so the user can't pick a model the
+            // already-spawned binary can't reach.
+            provider={
+              props.mode === "session" ? props.activeProvider : undefined
+            }
             orModels={props.orModels}
             onConfigureOpenRouter={
               props.mode === "home"

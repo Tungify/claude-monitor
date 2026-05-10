@@ -22,18 +22,25 @@ interface Props {
   effort: Effort;
   onModelChange: (id: string) => void;
   onEffortChange: (e: Effort) => void;
-  // When provider === "openrouter", the chip and the rows render the
-  // user's saved OR favorites (full ids like "openai/gpt-oss-120b")
-  // and selecting one passes that id straight back through
-  // onModelChange. Empty list means the user hasn't saved any
-  // favorites yet — we surface a one-click hint to open the OR
-  // settings dialog.
+  // Active provider for THIS picker mount.
+  //   - "anthropic"  → only show native models (chat sessions spawned
+  //                    against Anthropic; OR ids would error since
+  //                    BASE_URL is locked at spawn).
+  //   - "openrouter" → only show OR favorites for the same reason.
+  //   - undefined    → home mode: show BOTH lists in one popover so
+  //                    the user picks any model in one click; the
+  //                    parent derives provider from the chosen id at
+  //                    session-create time.
   provider?: SessionProvider;
+  // Saved OR favorites. Required for home mode (otherwise the OR
+  // section is empty), and consulted in session mode when the
+  // session is OR-routed. Empty list is fine — we surface a one-
+  // click hint to open the OR settings dialog.
   orModels?: string[];
   // Optional callback for the "open OR settings" link inside the
-  // popover. Wired by the home composer (which owns the dialog state)
-  // and skipped by the chat-panel — there the user can still open the
-  // dialog from the sidebar.
+  // popover. Wired by the home composer (which owns the dialog
+  // state). Skip in session-mode contexts where the user can edit
+  // OR settings via the sidebar instead.
   onConfigureOpenRouter?: () => void;
 }
 
@@ -46,12 +53,23 @@ function shortOrModel(id: string): string {
   return slash < 0 ? id : id.slice(slash + 1);
 }
 
+// providerForModel infers which provider an id targets so the chip
+// styling and effort filtering Just Work without a separate provider
+// state. OR ids are vendor-prefixed ("openai/gpt-oss-120b"); native
+// Anthropic ids are flat ("claude-opus-4-7").
+function providerForModel(
+  id: string,
+  orModels: string[],
+): SessionProvider {
+  if (orModels.includes(id)) return "openrouter";
+  if (id.includes("/")) return "openrouter";
+  return "anthropic";
+}
+
 // Effort levels supported when routing through OR. We don't know what
 // the third-party model can actually do, so we keep the lower three
 // universally enabled and gate xhigh/max behind ids that look like
-// Claude Opus (the only family confirmed to honor those levels). This
-// is just UX hinting — the model id is what the request actually
-// carries.
+// Claude Opus (the only family confirmed to honor those levels).
 const OR_BASE_EFFORTS: Effort[] = ["low", "medium", "high"];
 function effortsForOr(modelId?: string): Effort[] {
   if (!modelId) return OR_BASE_EFFORTS;
@@ -59,47 +77,61 @@ function effortsForOr(modelId?: string): Effort[] {
   return OR_BASE_EFFORTS;
 }
 
-// ModelEffortPicker mirrors Claude Code CLI's combined picker: one chip
-// summarizes "<model> · <effort>", and the popover lists both sections
-// stacked with a separator. For the native provider the model list is
-// the static MODELS lineup; for OpenRouter it's the user's saved
-// favorites — picking one calls onModelChange with the OR id directly,
-// which the SDK forwards as the request's `model` field.
+// ModelEffortPicker is the single chip the user clicks to switch
+// model + effort. The popover splits into sections by source:
+//   - Anthropic native (always available unless provider locks to OR)
+//   - OpenRouter favorites (when configured)
+//   - Effort levels (filtered by what the picked model supports)
+//
+// In session mode (provider supplied), only the matching section
+// renders — switching providers mid-chat would break since
+// BASE_URL/AUTH_TOKEN env vars are locked at spawn time. In home mode
+// (provider undefined), both sections render so the user picks any
+// model in one click; the home view infers provider from the picked
+// id when it spawns the session.
 export function ModelEffortPicker({
   modelId,
   effort,
   onModelChange,
   onEffortChange,
   provider,
-  orModels,
+  orModels = [],
   onConfigureOpenRouter,
 }: Props) {
   const [open, setOpen] = useState(false);
-  const isOR = provider === "openrouter";
   const current = modelById(modelId);
-  // Effort options change shape between providers. Native uses the
-  // model's declared list; OR uses our heuristic above so the popover
-  // doesn't dangle disabled rows the user can't possibly enable.
+  // Effective provider for the chip + effort filter. In session mode
+  // it's whatever the parent told us; in home mode we infer from the
+  // picked id so the chip recolors correctly when the user switches
+  // categories.
+  const effectiveProvider =
+    provider ?? providerForModel(modelId, orModels);
+  const isOR = effectiveProvider === "openrouter";
+
+  // Section visibility. Home mode (provider undefined) shows both;
+  // session mode shows only the locked side.
+  const showAnthropic = provider === undefined || provider === "anthropic";
+  const showOR = provider === undefined || provider === "openrouter";
+
+  // Effort filter follows the active model: native looks up
+  // ModelInfo.supportedEffortLevels; OR uses our heuristic. We don't
+  // intersect across both sections — the picker offers all of one
+  // set, since the user has already committed to the picked model.
   const supportedEfforts = isOR
     ? effortsForOr(modelId)
     : (current?.supportedEffortLevels ?? ["low", "medium", "high"]);
 
   const alternatives = MODELS.filter((m) => m.id !== modelId);
 
-  // For OR, `modelId` IS the OR id (we set it that way at session
-  // spawn). When it isn't yet — e.g. fresh home composer where the
-  // initial model is the default Anthropic id — fall back to the
-  // first favorite or "(unset)" so the chip never reads as a Claude
-  // tier label that wouldn't actually apply.
-  const orCurrent = isOR
-    ? (orModels?.includes(modelId) ? modelId : orModels?.[0])
-    : undefined;
+  // The displayed OR id in the chip — only meaningful when the picked
+  // model actually IS an OR id (or routes through OR). We never
+  // rewrite to a tier label.
+  const orChipLabel = isOR
+    ? (orModels.includes(modelId) ? modelId : modelId)
+    : "";
 
-  const pickModel = (id: string) => {
+  const pickNative = (id: string) => {
     onModelChange(id);
-    // Drop unsupported effort to a sensible fallback when the new
-    // model can't run the current effort (e.g. switching Opus → Haiku
-    // collapses xhigh/max).
     const next = modelById(id);
     if (next && !next.supportedEffortLevels.includes(effort)) {
       onEffortChange(next.supportedEffortLevels.at(-1) ?? "high");
@@ -107,9 +139,7 @@ export function ModelEffortPicker({
     setOpen(false);
   };
 
-  // For OR the supportedEfforts list is provider-derived (no
-  // ModelInfo lookup), so falling effort back uses that list directly.
-  const pickOrModel = (id: string) => {
+  const pickOr = (id: string) => {
     onModelChange(id);
     const efforts = effortsForOr(id);
     if (!efforts.includes(effort)) {
@@ -136,7 +166,7 @@ export function ModelEffortPicker({
         {isOR && <Router className="size-3 opacity-80" />}
         {isOR ? (
           <span className="font-mono text-[11px]">
-            {orCurrent ? shortOrModel(orCurrent) : "(no models saved)"}
+            {orChipLabel ? shortOrModel(orChipLabel) : "(no models saved)"}
           </span>
         ) : (
           <>
@@ -150,82 +180,90 @@ export function ModelEffortPicker({
         <span>{EFFORT_LABELS[effort]}</span>
         <ChevronDown className="size-3 opacity-60" />
       </PopoverTrigger>
-      <PopoverContent className="w-72 p-0" align="end" side="top">
-        <div className="flex items-baseline justify-between px-3 pt-3 pb-1.5">
-          <div className="text-xs text-muted-foreground">
-            {isOR ? "OpenRouter models" : "Models"}
-          </div>
-          {isOR && onConfigureOpenRouter && (
-            <button
-              type="button"
-              onClick={() => {
-                onConfigureOpenRouter();
-                setOpen(false);
-              }}
-              className="inline-flex items-center gap-1 text-[10px] text-violet-600 hover:underline dark:text-violet-400"
-            >
-              <Settings2 className="size-3" />
-              Manage
-            </button>
-          )}
-        </div>
-        {isOR ? (
-          orModels && orModels.length > 0 ? (
+      <PopoverContent className="w-80 p-0" align="end" side="top">
+        {showAnthropic && (
+          <>
+            <div className="px-3 pt-3 pb-1.5 text-xs text-muted-foreground">
+              Anthropic
+            </div>
             <ul className="px-1.5 pb-1.5">
-              {orModels.map((id) => (
-                <OrModelRow
-                  key={id}
-                  modelId={id}
-                  selected={id === orCurrent}
-                  onPick={() => pickOrModel(id)}
+              {current && current.id === modelId && !isOR && (
+                <ModelRow
+                  model={current}
+                  selected
+                  isDefault={current.id === DEFAULT_MODEL_ID}
+                  onPick={pickNative}
                 />
-              ))}
+              )}
+              {alternatives
+                .filter((m) => isOR || m.id !== modelId)
+                .map((m) => (
+                  <ModelRow
+                    key={m.id}
+                    model={m}
+                    selected={!isOR && m.id === modelId}
+                    isDefault={m.id === DEFAULT_MODEL_ID}
+                    onPick={pickNative}
+                  />
+                ))}
             </ul>
-          ) : (
-            <div className="px-3 pb-3 text-[11px] text-muted-foreground">
-              No saved models.{" "}
-              {onConfigureOpenRouter ? (
+          </>
+        )}
+
+        {showOR && (
+          <>
+            {showAnthropic && <div className="mx-3 border-t" />}
+            <div className="flex items-baseline justify-between px-3 pt-3 pb-1.5">
+              <div className="text-xs text-muted-foreground">
+                OpenRouter favorites
+              </div>
+              {onConfigureOpenRouter && (
                 <button
                   type="button"
                   onClick={() => {
                     onConfigureOpenRouter();
                     setOpen(false);
                   }}
-                  className="text-violet-600 underline-offset-2 hover:underline dark:text-violet-400"
+                  className="inline-flex items-center gap-1 text-[10px] text-violet-600 hover:underline dark:text-violet-400"
                 >
-                  Open OpenRouter settings
+                  <Settings2 className="size-3" />
+                  Manage
                 </button>
-              ) : (
-                "Open OpenRouter settings from the sidebar to add some."
               )}
             </div>
-          )
-        ) : (
-          <>
-            <ul className="px-1.5 pb-1.5">
-              {current && (
-                <ModelRow
-                  model={current}
-                  selected
-                  isDefault={current.id === DEFAULT_MODEL_ID}
-                  onPick={pickModel}
-                />
-              )}
-            </ul>
-            <div className="mx-3 border-t" />
-            <ul className="px-1.5 pt-1.5 pb-1.5">
-              {alternatives.map((m) => (
-                <ModelRow
-                  key={m.id}
-                  model={m}
-                  selected={false}
-                  isDefault={m.id === DEFAULT_MODEL_ID}
-                  onPick={pickModel}
-                />
-              ))}
-            </ul>
+            {orModels.length > 0 ? (
+              <ul className="px-1.5 pb-1.5">
+                {orModels.map((id) => (
+                  <OrModelRow
+                    key={id}
+                    modelId={id}
+                    selected={isOR && id === modelId}
+                    onPick={() => pickOr(id)}
+                  />
+                ))}
+              </ul>
+            ) : (
+              <div className="px-3 pb-3 text-[11px] text-muted-foreground">
+                No saved models.{" "}
+                {onConfigureOpenRouter ? (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      onConfigureOpenRouter();
+                      setOpen(false);
+                    }}
+                    className="text-violet-600 underline-offset-2 hover:underline dark:text-violet-400"
+                  >
+                    Add one
+                  </button>
+                ) : (
+                  "Open OpenRouter settings from the sidebar to add some."
+                )}
+              </div>
+            )}
           </>
         )}
+
         <div className="mx-3 border-t" />
         <div className="px-3 pt-3 pb-1.5">
           <div className="text-xs text-muted-foreground">Effort</div>
@@ -273,7 +311,10 @@ function ModelRow({
       <button
         type="button"
         onClick={() => onPick(model.id)}
-        className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left hover:bg-muted"
+        className={cn(
+          "flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left hover:bg-muted",
+          selected && "bg-muted",
+        )}
       >
         <span className="text-sm font-medium">{model.label}</span>
         {model.badge && (
@@ -293,10 +334,6 @@ function ModelRow({
   );
 }
 
-// OrModelRow renders one of the user's saved OR favorites. The OR id is
-// the headline (the user picked it directly from the catalog so they
-// recognize the full string); we split off the vendor prefix into
-// muted-foreground so a long id stays readable.
 function OrModelRow({
   modelId,
   selected,
