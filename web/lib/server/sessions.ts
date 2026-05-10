@@ -28,6 +28,13 @@ import {
   SUBMIT_NOTE_FQN,
 } from "./notes-mcp";
 import {
+  createLeaderMcpServer,
+  LEADER_LIST_NOTES_FQN,
+  LEADER_MCP_SERVER_NAME,
+  READ_PHASE_DIFF_FQN,
+  READ_PLAN_STATE_FQN,
+} from "./leader-mcp";
+import {
   deleteStoredSession,
   loadAllStoredSessions,
   persistStoredSession,
@@ -603,6 +610,16 @@ function makeCanUseTool(session: ChatSession): CanUseTool {
     if (toolName === SUBMIT_NOTE_FQN || toolName === LIST_NOTES_FQN) {
       return Promise.resolve({ behavior: "allow", updatedInput: input });
     }
+    // Leader tools are read-only snapshots over plan.json + git diffs
+    // in worktrees the owner already approved. No mutation surface, so
+    // auto-allow alongside the other plan-orchestration tools.
+    if (
+      toolName === READ_PLAN_STATE_FQN ||
+      toolName === LEADER_LIST_NOTES_FQN ||
+      toolName === READ_PHASE_DIFF_FQN
+    ) {
+      return Promise.resolve({ behavior: "allow", updatedInput: input });
+    }
     // AskUserQuestion is a conversational tool, not a privileged action.
     // Route it through its own form UI instead of the generic permission
     // gate — the user picks an option, and we ship the answers back to
@@ -762,6 +779,24 @@ function makeNotesMcp(session: ChatSession) {
   });
 }
 
+// makeLeaderMcp builds the cross-phase read-only toolkit for an owner
+// session — the chat that submitted the plan. Closures over the live
+// session so resolveCurrentPlanId tracks whatever submit_plan most
+// recently wrote without the leader having to thread plan_id through
+// every call. snapshotPhaseSession is wired through `summarize` so
+// read_plan_state surfaces live SDK status (thinking/idle/...) and
+// context_usage alongside the on-disk plan record.
+function makeLeaderMcp(session: ChatSession) {
+  return createLeaderMcpServer({
+    sessionId: session.id,
+    resolveCurrentPlanId: () => session.latestPlan?.id,
+    snapshotPhaseSession: (sid) => {
+      const s = sessions.get(sid);
+      return s ? summarize(s) : undefined;
+    },
+  });
+}
+
 interface BuildLiveInit {
   id: string;
   cwd: string;
@@ -855,6 +890,14 @@ function buildLiveSession(init: BuildLiveInit): ChatSession {
         ...(session.planId && session.phaseSlug
           ? { [NOTES_MCP_SERVER_NAME]: makeNotesMcp(session) }
           : {}),
+        // Leader toolkit is the inverse: registers ONLY for owner
+        // sessions (no phaseSlug). A phase agent doesn't need to query
+        // its siblings' state — that's the planner's job, and giving
+        // every phase the cross-phase read surface would dilute the
+        // sibling-isolation discipline the kickoff prompt sets up.
+        ...(session.phaseSlug
+          ? {}
+          : { [LEADER_MCP_SERVER_NAME]: makeLeaderMcp(session) }),
       },
       abortController,
       // Resume vs fresh: `resume` loads the session's transcript via
