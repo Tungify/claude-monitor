@@ -6,8 +6,15 @@ import type {
   PhasePending,
   PhaseSession,
   PlanRecord,
+  WorktreeInfo,
 } from "@/lib/plan-types";
-import { createSession, sendMessage } from "@/lib/server/sessions";
+import { updatePlan } from "@/lib/server/plans";
+import {
+  createSession,
+  sendMessage,
+  snapshotSession,
+  stopSession,
+} from "@/lib/server/sessions";
 
 // depsBlocking returns the slugs of dependencies that have NOT yet
 // reached commit_status ∈ {clean, committed}. Empty array means the
@@ -156,6 +163,79 @@ export function spawnPhaseSession(input: SpawnPhaseSessionInput): PhaseSession {
     account_name: input.accountName,
     spawned_at: new Date().toISOString(),
   };
+}
+
+// restartPhaseSession tears down a phase's current chat session and
+// spawns a fresh one in the same worktree, with the same configDir/
+// account, replaying the kickoff prompt. Shared by the manual restart
+// route and the rate-limit-reset watchdog so both paths follow the
+// same sequence: snapshot prev runtime config → stop old session →
+// spawn fresh → patch the on-disk plan in one atomic mutate.
+//
+// Caller is responsible for refusing to restart a phase whose
+// commit_status is already terminal (clean / committed) — the route
+// returns a 409 in that case; the watchdog filters such phases out
+// before invoking us.
+export async function restartPhaseSession(input: {
+  plan: PlanRecord;
+  phase: Phase;
+  link: PhaseSession;
+  worktree: WorktreeInfo;
+}): Promise<{ plan: PlanRecord; link: PhaseSession }> {
+  const { plan, phase, link, worktree } = input;
+
+  // Recover the previous run's runtime config so the restart matches
+  // what was running before. snapshotSession serves both live and
+  // interrupted-on-disk sessions, so this works after a daemon restart
+  // wiped the in-memory ChatSession too.
+  const snap = snapshotSession(link.session_id);
+  const prevModel = snap?.summary.model;
+  const prevEffort = snap?.summary.effort as Effort | undefined;
+  const prevPermissionMode =
+    (snap?.summary.permission_mode as PermissionMode | undefined) ?? "default";
+
+  // Stop FIRST so the new createSession can't collide with the old one
+  // on cwd-scoped resources (the SDK keys some control-channel state by
+  // cwd). Failures here aren't fatal — best-effort cleanup.
+  try {
+    await stopSession(link.session_id);
+  } catch (err) {
+    console.warn(
+      `[plan-scheduler] stopSession ${link.session_id} failed (continuing):`,
+      err,
+    );
+  }
+
+  const fresh = spawnPhaseSession({
+    plan,
+    phase,
+    worktreePath: worktree.path,
+    worktreeBranch: worktree.branch,
+    configDir: link.config_dir,
+    accountName: link.account_name,
+    permissionMode: prevPermissionMode,
+    model: prevModel,
+    effort: prevEffort,
+  });
+
+  const updated = await updatePlan(plan.cwd, plan.id, (p) => {
+    if (!p.phase_sessions) return;
+    const idx = p.phase_sessions.findIndex(
+      (entry) => entry.phase_slug === phase.slug,
+    );
+    if (idx < 0) {
+      // Concurrent /complete may have cleared the entry. Append rather
+      // than drop the new session on the floor.
+      p.phase_sessions.push(fresh);
+      return;
+    }
+    // Replace wholesale: a restart discards every per-attempt artifact
+    // (commit, scope check, review). spawned_at on `fresh` is the new
+    // session's birth time.
+    p.phase_sessions[idx] = fresh;
+  });
+
+  return { plan: updated, link: fresh };
 }
 
 // spawnPhaseFromPending is the first-wave / cascade entrypoint: takes a

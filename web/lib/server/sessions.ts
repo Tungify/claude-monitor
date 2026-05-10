@@ -34,6 +34,7 @@ import {
   type StoredSession,
 } from "./session-store";
 import { listAllPlans } from "./plans";
+import { startRlResetWatchdog } from "./rl-watchdog";
 import type {
   AskUserQuestionAnswers,
   AskUserQuestionEntry,
@@ -243,6 +244,12 @@ async function initFromDisk(): Promise<void> {
   // are done — re-hydrating wastes a Query. failed/unset stay eligible
   // because the user may still want to retry.
   await rehydratePhaseSessions();
+
+  // Background watchdog: phase sessions that hit a hard rate limit and
+  // exhausted the SDK's internal retries get auto-restarted once their
+  // resetsAt window opens. Idempotent — only arms the timer once per
+  // process, regardless of how often this module is re-evaluated.
+  startRlResetWatchdog();
 }
 
 async function rehydratePhaseSessions(): Promise<void> {
