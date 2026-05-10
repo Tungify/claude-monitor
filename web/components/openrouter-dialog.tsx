@@ -64,6 +64,13 @@ export function OpenRouterDialog({ open, onOpenChange }: Props) {
   const [pickerTier, setPickerTier] = useState<
     "opus" | "sonnet" | "haiku" | null
   >(null);
+  // When true, the API-key input renders even though one is on file.
+  // Saved-key state hides the input by default (just shows "Key on
+  // file · Replace") so the dialog reads "everything's set" without
+  // a stray password field cluttering the layout. Reset to false on
+  // every open inside the existing fetch effect (one less standalone
+  // useEffect).
+  const [editingKey, setEditingKey] = useState(false);
 
   // Auto-clear the "Saved" pulse 4s after a successful save. The
   // checkmark belongs to the action that just completed, not to a
@@ -82,12 +89,13 @@ export function OpenRouterDialog({ open, onOpenChange }: Props) {
     if (!open) return;
     let cancelled = false;
     void (async () => {
-      // setError inside the async body (post-await) avoids the
-      // set-state-in-effect lint rule that fires for sync effect-body
-      // setters; behaviorally identical because nothing else has had
-      // a chance to mutate state between the effect firing and this
-      // setter running.
+      // setError + setEditingKey inside the async body (post-await)
+      // avoids the set-state-in-effect lint rule that fires for sync
+      // effect-body setters; behaviorally identical because nothing
+      // else has had a chance to mutate state between the effect
+      // firing and these setters running.
       setError(null);
+      setEditingKey(false);
       try {
         const res = await fetch("/api/openrouter");
         if (!res.ok) throw new Error(`${res.status}: ${await res.text()}`);
@@ -131,6 +139,7 @@ export function OpenRouterDialog({ open, onOpenChange }: Props) {
       const data = (await res.json()) as OpenRouterStatus;
       setStatus(data);
       setApiKey("");
+      setEditingKey(false);
       setJustSaved(true);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -196,47 +205,78 @@ export function OpenRouterDialog({ open, onOpenChange }: Props) {
             <label className="text-xs font-semibold tracking-wider text-muted-foreground uppercase">
               API key
             </label>
-            <div className="relative">
-              <input
-                type={showKey ? "text" : "password"}
-                value={apiKey}
-                onChange={(e) => setApiKey(e.target.value)}
-                placeholder={
-                  status?.has_key
-                    ? "•••••••••• (leave blank to keep saved key)"
-                    : "sk-or-v1-..."
-                }
-                autoComplete="off"
-                spellCheck={false}
-                className="w-full rounded border bg-background px-2 py-1.5 pr-9 font-mono text-xs sm:py-1.5"
-              />
-              <button
-                type="button"
-                aria-label={showKey ? "Hide key" : "Show key"}
-                onClick={() => setShowKey((v) => !v)}
-                className="absolute top-1/2 right-1.5 -translate-y-1/2 rounded p-1 text-muted-foreground hover:bg-muted"
-              >
-                {showKey ? (
-                  <EyeOff className="size-3.5" />
-                ) : (
-                  <Eye className="size-3.5" />
-                )}
-              </button>
-            </div>
-            <p className="text-[11px] text-muted-foreground">
-              Stored locally at <code>~/.claude-monitor/config.json</code>. Get
-              one at{" "}
-              <a
-                href="https://openrouter.ai/keys"
-                target="_blank"
-                rel="noreferrer"
-                className="inline-flex items-center gap-0.5 text-foreground underline-offset-4 hover:underline"
-              >
-                openrouter.ai/keys
-                <ExternalLink className="size-3" />
-              </a>
-              .
-            </p>
+            {status?.has_key && !editingKey ? (
+              <div className="flex items-center gap-2 rounded-md border bg-background px-2 py-1.5 text-xs">
+                <span className="font-mono tracking-widest text-muted-foreground">
+                  ••••••••••••••••••
+                </span>
+                <span className="text-emerald-600 dark:text-emerald-400">
+                  on file
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setEditingKey(true)}
+                  className="ml-auto rounded-md border border-border px-2 py-0.5 text-[11px] font-medium hover:bg-muted"
+                >
+                  Replace
+                </button>
+              </div>
+            ) : (
+              <>
+                <div className="relative">
+                  <input
+                    type={showKey ? "text" : "password"}
+                    value={apiKey}
+                    onChange={(e) => setApiKey(e.target.value)}
+                    placeholder="sk-or-v1-..."
+                    autoComplete="off"
+                    spellCheck={false}
+                    className="w-full rounded border bg-background px-2 py-1.5 pr-16 font-mono text-xs sm:py-1.5"
+                  />
+                  <div className="absolute top-1/2 right-1 flex -translate-y-1/2 items-center gap-0.5">
+                    <button
+                      type="button"
+                      aria-label={showKey ? "Hide key" : "Show key"}
+                      onClick={() => setShowKey((v) => !v)}
+                      className="rounded p-1 text-muted-foreground hover:bg-muted"
+                    >
+                      {showKey ? (
+                        <EyeOff className="size-3.5" />
+                      ) : (
+                        <Eye className="size-3.5" />
+                      )}
+                    </button>
+                    {status?.has_key && (
+                      <button
+                        type="button"
+                        aria-label="Cancel replace"
+                        onClick={() => {
+                          setEditingKey(false);
+                          setApiKey("");
+                        }}
+                        className="rounded p-1 text-muted-foreground hover:bg-muted"
+                      >
+                        <X className="size-3.5" />
+                      </button>
+                    )}
+                  </div>
+                </div>
+                <p className="text-[11px] text-muted-foreground">
+                  Stored locally at{" "}
+                  <code>~/.claude-monitor/config.json</code>. Get one at{" "}
+                  <a
+                    href="https://openrouter.ai/keys"
+                    target="_blank"
+                    rel="noreferrer"
+                    className="inline-flex items-center gap-0.5 text-foreground underline-offset-4 hover:underline"
+                  >
+                    openrouter.ai/keys
+                    <ExternalLink className="size-3" />
+                  </a>
+                  .
+                </p>
+              </>
+            )}
           </section>
 
           <section className="space-y-1.5">

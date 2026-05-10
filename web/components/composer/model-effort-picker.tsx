@@ -41,6 +41,17 @@ function tierFor(modelId: string): "opus" | "sonnet" | "haiku" {
   return "opus";
 }
 
+// Canonical Claude id that the binary will actually request when the
+// user picks an OR model whose mapping lives at the given tier. The
+// SDK still needs a tier hint to know which env-var override to look
+// at — we always pass the latest 4.7/4.6/4.5 in that family so effort
+// levels resolve sensibly (Opus tier → xhigh / max available).
+const TIER_ANCHOR: Record<"opus" | "sonnet" | "haiku", string> = {
+  opus: "claude-opus-4-7",
+  sonnet: "claude-sonnet-4-6",
+  haiku: "claude-haiku-4-5-20251001",
+};
+
 // Trims `provider/model-name` → `model-name` for compact display in
 // the chip. Long ids would otherwise blow out the toolbar layout,
 // especially on phones where the chip lives in a wrap-row with the
@@ -72,12 +83,27 @@ export function ModelEffortPicker({
 
   const alternatives = MODELS.filter((m) => m.id !== modelId);
 
-  // Active OR model id for the currently-picked tier. Empty string =
-  // user picked OR but didn't map this tier — chip falls back to the
-  // Claude label so the user sees they're flying without a route map.
   const isOR = provider === "openrouter";
-  const orForCurrent =
-    isOR && current ? (orModels?.[tierFor(current.id)] ?? "") : "";
+  // OR mode treats "the picked model" as whichever tier mapping the
+  // current modelId routes through. The chip and popover render OR
+  // ids directly — the user picked openai/gpt-oss-120b, that's what
+  // they should see, not the Anthropic label that happens to share a
+  // tier with it.
+  const currentTier = current ? tierFor(current.id) : "opus";
+  const orForCurrent = isOR ? (orModels?.[currentTier] ?? "") : "";
+  // Build the list of OR rows from the user's saved mapping. Tiers
+  // with no mapping still render so the user knows the slot exists
+  // (clicking offers to open the OR settings dialog instead, but
+  // that's a future polish — for now the chip shows "(unmapped)").
+  const orRows: Array<{
+    tier: "opus" | "sonnet" | "haiku";
+    label: string;
+    modelId?: string;
+  }> = [
+    { tier: "opus", label: "Opus", modelId: orModels?.opus },
+    { tier: "sonnet", label: "Sonnet", modelId: orModels?.sonnet },
+    { tier: "haiku", label: "Haiku", modelId: orModels?.haiku },
+  ];
 
   const pickModel = (id: string) => {
     onModelChange(id);
@@ -89,6 +115,10 @@ export function ModelEffortPicker({
       onEffortChange(next.supportedEffortLevels.at(-1) ?? "high");
     }
     setOpen(false);
+  };
+
+  const pickOrTier = (tier: "opus" | "sonnet" | "haiku") => {
+    pickModel(TIER_ANCHOR[tier]);
   };
 
   return (
@@ -107,16 +137,16 @@ export function ModelEffortPicker({
         }
       >
         {isOR && <Router className="size-3 opacity-80" />}
-        <span className="font-medium">{current?.label ?? modelId}</span>
-        {!isOR && current?.badge && (
-          <span className="text-muted-foreground">{current.badge}</span>
-        )}
-        {isOR && (
+        {isOR ? (
+          <span className="font-mono text-[11px]">
+            {orForCurrent ? shortOrModel(orForCurrent) : "(unmapped)"}
+          </span>
+        ) : (
           <>
-            <span className="opacity-50">→</span>
-            <span className="font-mono text-[11px] opacity-90">
-              {orForCurrent ? shortOrModel(orForCurrent) : "(unmapped)"}
-            </span>
+            <span className="font-medium">{current?.label ?? modelId}</span>
+            {current?.badge && (
+              <span className="text-muted-foreground">{current.badge}</span>
+            )}
           </>
         )}
         <span className="text-muted-foreground">·</span>
@@ -125,37 +155,54 @@ export function ModelEffortPicker({
       </PopoverTrigger>
       <PopoverContent className="w-72 p-0" align="end" side="top">
         <div className="flex items-baseline justify-between px-3 pt-3 pb-1.5">
-          <div className="text-xs text-muted-foreground">Models</div>
+          <div className="text-xs text-muted-foreground">
+            {isOR ? "OpenRouter models" : "Models"}
+          </div>
           {isOR && (
             <div className="text-[10px] text-violet-600 dark:text-violet-400">
-              OpenRouter
+              via tier
             </div>
           )}
         </div>
-        <ul className="px-1.5 pb-1.5">
-          {current && (
-            <ModelRow
-              model={current}
-              selected
-              isDefault={current.id === DEFAULT_MODEL_ID}
-              orMapping={isOR ? orModels?.[tierFor(current.id)] : undefined}
-              onPick={pickModel}
-            />
-          )}
-        </ul>
-        <div className="mx-3 border-t" />
-        <ul className="px-1.5 pt-1.5 pb-1.5">
-          {alternatives.map((m) => (
-            <ModelRow
-              key={m.id}
-              model={m}
-              selected={false}
-              isDefault={m.id === DEFAULT_MODEL_ID}
-              orMapping={isOR ? orModels?.[tierFor(m.id)] : undefined}
-              onPick={pickModel}
-            />
-          ))}
-        </ul>
+        {isOR ? (
+          <ul className="px-1.5 pb-1.5">
+            {orRows.map((row) => (
+              <OrModelRow
+                key={row.tier}
+                tier={row.tier}
+                tierLabel={row.label}
+                modelId={row.modelId}
+                selected={row.tier === currentTier}
+                onPick={() => pickOrTier(row.tier)}
+              />
+            ))}
+          </ul>
+        ) : (
+          <>
+            <ul className="px-1.5 pb-1.5">
+              {current && (
+                <ModelRow
+                  model={current}
+                  selected
+                  isDefault={current.id === DEFAULT_MODEL_ID}
+                  onPick={pickModel}
+                />
+              )}
+            </ul>
+            <div className="mx-3 border-t" />
+            <ul className="px-1.5 pt-1.5 pb-1.5">
+              {alternatives.map((m) => (
+                <ModelRow
+                  key={m.id}
+                  model={m}
+                  selected={false}
+                  isDefault={m.id === DEFAULT_MODEL_ID}
+                  onPick={pickModel}
+                />
+              ))}
+            </ul>
+          </>
+        )}
         <div className="mx-3 border-t" />
         <div className="px-3 pt-3 pb-1.5">
           <div className="text-xs text-muted-foreground">Effort</div>
@@ -191,16 +238,11 @@ function ModelRow({
   model,
   selected,
   isDefault,
-  orMapping,
   onPick,
 }: {
   model: ModelInfo;
   selected: boolean;
   isDefault: boolean;
-  // Set when this row is rendered while provider=openrouter — drives
-  // the second-line preview "→ openai/gpt-oss-120b". Undefined for
-  // native Anthropic mode (no preview row).
-  orMapping?: string;
   onPick: (id: string) => void;
 }) {
   return (
@@ -208,32 +250,75 @@ function ModelRow({
       <button
         type="button"
         onClick={() => onPick(model.id)}
-        className="flex w-full items-start gap-2 rounded-md px-2 py-1.5 text-left hover:bg-muted"
+        className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left hover:bg-muted"
       >
-        <span className="min-w-0 flex-1">
-          <span className="flex items-center gap-2">
-            <span className="text-sm font-medium">{model.label}</span>
-            {model.badge && (
-              <span className="text-xs text-muted-foreground">
-                {model.badge}
-              </span>
-            )}
-            {isDefault && (
-              <span className="text-xs text-muted-foreground">Default</span>
-            )}
-          </span>
-          {orMapping !== undefined && (
-            <span className="mt-0.5 block truncate font-mono text-[10px] text-violet-600 dark:text-violet-400">
-              → {orMapping || "(unmapped — OR will reject)"}
-            </span>
-          )}
-        </span>
-        <span className="mt-0.5 text-[10px] tabular-nums text-muted-foreground">
+        <span className="text-sm font-medium">{model.label}</span>
+        {model.badge && (
+          <span className="text-xs text-muted-foreground">{model.badge}</span>
+        )}
+        {isDefault && (
+          <span className="text-xs text-muted-foreground">Default</span>
+        )}
+        <span className="ml-auto text-[10px] tabular-nums text-muted-foreground">
           {model.contextWindow >= 1_000_000
             ? "1M"
             : `${Math.round(model.contextWindow / 1000)}K`}
         </span>
-        {selected && <Check className="mt-0.5 size-3.5 shrink-0" />}
+        {selected && <Check className="size-3.5 shrink-0" />}
+      </button>
+    </li>
+  );
+}
+
+// OrModelRow renders a saved OR mapping. The OR id is the headline —
+// users care about which model is actually answering, not the
+// Anthropic tier name underneath. The tier still shows in muted text
+// because it's load-bearing for effort levels (Opus tier is the only
+// one that supports xhigh / max).
+function OrModelRow({
+  tier,
+  tierLabel,
+  modelId,
+  selected,
+  onPick,
+}: {
+  tier: "opus" | "sonnet" | "haiku";
+  tierLabel: string;
+  modelId?: string;
+  selected: boolean;
+  onPick: () => void;
+}) {
+  const unmapped = !modelId;
+  return (
+    <li>
+      <button
+        type="button"
+        onClick={onPick}
+        disabled={unmapped}
+        className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-transparent"
+      >
+        <span className="min-w-0 flex-1">
+          <span className="block truncate text-sm font-medium">
+            {unmapped ? (
+              <span className="text-muted-foreground italic">
+                {tierLabel} tier · unmapped
+              </span>
+            ) : (
+              shortOrModel(modelId)
+            )}
+          </span>
+          {!unmapped && (
+            <span className="block truncate font-mono text-[10px] text-muted-foreground">
+              {modelId}
+            </span>
+          )}
+        </span>
+        <span className="text-[10px] tabular-nums text-muted-foreground uppercase">
+          {tier}
+        </span>
+        {selected && !unmapped && (
+          <Check className="size-3.5 shrink-0" />
+        )}
       </button>
     </li>
   );
