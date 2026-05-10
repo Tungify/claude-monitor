@@ -208,6 +208,40 @@ export function ChatPanel({ session }: Props) {
       cancelled = true;
     };
   }, [session.provider]);
+
+  // Legacy OR sessions stored `session.model` as a Claude tier anchor
+  // (e.g. "claude-opus-4-7") rather than the actual OR id, because the
+  // earlier tier-mapping flow used those anchors to pick the right
+  // ANTHROPIC_DEFAULT_*_MODEL env var. The composer chip then has
+  // nothing to match against the favorites list and reads as "(no
+  // models saved)".
+  //
+  // Recover the real id from the SDK's reported `assistant.message.model`
+  // — that's whatever OR resolved the request to and matches the
+  // favorites list. Sync once when the model first arrives in history;
+  // after that the user's setModel calls take over.
+  useEffect(() => {
+    if (session.provider !== "openrouter") return;
+    if (model.includes("/")) return; // already an OR id
+    const reported = latestAssistantModel(chat.history);
+    if (!reported || reported === model) return;
+    // queueMicrotask defers the setter past the current render so
+    // React 19's set-state-in-effect lint stays quiet — the setter
+    // running one microtask later is imperceptible on screen.
+    let cancelled = false;
+    queueMicrotask(() => {
+      if (cancelled) return;
+      setModel(reported);
+    });
+    return () => {
+      cancelled = true;
+    };
+    // Don't depend on `model` so the sync only fires until the
+    // displayed value catches up; a user-initiated patchOptions
+    // afterwards will set model to a new OR id with "/", which
+    // satisfies the early return above.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [session.provider, chat.history]);
   const virtuosoRef = useRef<VirtuosoHandle>(null);
   // Track viewport position so we can show a "scroll to latest" button
   // when the user has read-up. Virtuoso fires atBottomStateChange when
@@ -887,6 +921,27 @@ function shortenCwd(cwd: string): string {
   const head = segments[0] === "~" ? "~" : segments[0] || "/";
   const tail = segments.slice(-2).join("/");
   return `${head}/…/${tail}`;
+}
+
+// latestAssistantModel returns the model id reported by the SDK on the
+// most recent top-level assistant message. Used to recover the real
+// served model on legacy OR sessions whose stored `session.model` is
+// a Claude tier anchor rather than an OR id. Subagent assistants
+// (parent_tool_use_id set) run on their own model and don't override
+// the main session's display.
+function latestAssistantModel(
+  history: ReturnType<typeof useChatSession>["history"],
+): string | undefined {
+  for (let i = history.length - 1; i >= 0; i--) {
+    const m = history[i];
+    if (m.type !== "assistant") continue;
+    const parent = (m as { parent_tool_use_id?: string | null })
+      .parent_tool_use_id;
+    if (parent) continue;
+    const reported = (m as { message?: { model?: string } }).message?.model;
+    if (typeof reported === "string" && reported.length > 0) return reported;
+  }
+  return undefined;
 }
 
 function latestUsage(
