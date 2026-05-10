@@ -34,9 +34,40 @@ export function HomeView() {
   const [effort, setEffort] = useState<Effort>(DEFAULT_EFFORT);
   const [mode, setMode] = useState<PermissionMode>("default");
   const [provider, setProvider] = useState<SessionProvider>("anthropic");
+  const [orModels, setOrModels] = useState<{
+    opus?: string;
+    sonnet?: string;
+    haiku?: string;
+  }>({});
   const [recentCwds, setRecentCwds] = useState<string[]>([]);
   const [helpOpen, setHelpOpen] = useState(false);
   const [orDialogOpen, setOrDialogOpen] = useState(false);
+
+  // Refresh the OR mapping whenever the provider flips to openrouter
+  // or the settings dialog closes (it's the only writer). The chip
+  // needs the mapping so it can render "Opus → openai/gpt-oss-120b"
+  // instead of just "Opus 4.7" when OR is active.
+  useEffect(() => {
+    if (provider !== "openrouter" && !orDialogOpen) return;
+    let cancelled = false;
+    void (async () => {
+      try {
+        const res = await fetch("/api/openrouter");
+        if (!res.ok || cancelled) return;
+        const data = (await res.json()) as {
+          configured: boolean;
+          has_key: boolean;
+          models: { opus?: string; sonnet?: string; haiku?: string };
+        };
+        if (!cancelled) setOrModels(data.models);
+      } catch {
+        // Silent — chip falls back to "(unmapped)" if we can't load.
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [provider, orDialogOpen]);
 
   // Hydrate the default cwd + recent list from existing sessions on mount.
   // Keeps the picker useful without forcing the user to type a path each
@@ -178,6 +209,8 @@ export function HomeView() {
           provider={provider}
           onProviderChange={setProvider}
           onConfigureOpenRouter={() => setOrDialogOpen(true)}
+          activeProvider={provider}
+          orModels={orModels}
           permMode={mode}
           onPermModeChange={setMode}
           onSubmit={onSubmit}

@@ -177,6 +177,35 @@ export function ChatPanel({ session }: Props) {
     (session.permission_mode as PermissionMode | undefined) ?? "default",
   );
   const [commandLog, setCommandLog] = useState<CommandLog[]>([]);
+  // OR model mapping for the chip's "→ model-id" preview. Only fetched
+  // when this session is OR-routed; native sessions never need it and
+  // skip the request. Refreshed once on mount — the user can't edit
+  // OR settings while inside a chat (the dialog is sidebar-scoped),
+  // so a single fetch is enough.
+  const [orModels, setOrModels] = useState<{
+    opus?: string;
+    sonnet?: string;
+    haiku?: string;
+  }>({});
+  useEffect(() => {
+    if (session.provider !== "openrouter") return;
+    let cancelled = false;
+    void (async () => {
+      try {
+        const res = await fetch("/api/openrouter");
+        if (!res.ok || cancelled) return;
+        const data = (await res.json()) as {
+          models: { opus?: string; sonnet?: string; haiku?: string };
+        };
+        if (!cancelled) setOrModels(data.models);
+      } catch {
+        // chip falls back to "(unmapped)" silently
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [session.provider]);
   const virtuosoRef = useRef<VirtuosoHandle>(null);
   // Track viewport position so we can show a "scroll to latest" button
   // when the user has read-up. Virtuoso fires atBottomStateChange when
@@ -677,6 +706,8 @@ export function ChatPanel({ session }: Props) {
               onModelChange={(id) => void patchOptions({ model: id })}
               effort={effort}
               onEffortChange={(e) => void patchOptions({ effort: e })}
+              activeProvider={session.provider}
+              orModels={orModels}
               permMode={permissionMode}
               onPermModeChange={(m) => patchOptions({ permission_mode: m })}
               onSubmit={onSubmit}

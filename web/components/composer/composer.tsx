@@ -46,6 +46,14 @@ interface CommonProps {
   onEffortChange: (e: Effort) => void;
   model: string;
   onModelChange: (id: string) => void;
+  // Optional metadata for the OR-aware model chip. Both must be
+  // provided together: activeProvider tells the picker which routing
+  // is in effect (so the chip recolors and shows the OR mapping
+  // instead of the Claude badge), and orModels supplies the
+  // tier→OR-id map. Home view fetches both; the chat session reads
+  // them off the session summary + same /api/openrouter GET.
+  activeProvider?: SessionProvider;
+  orModels?: { opus?: string; sonnet?: string; haiku?: string };
   onSubmit: (payload: ComposerSubmit) => Promise<void> | void;
   busy?: boolean;
   disabled?: boolean;
@@ -504,6 +512,8 @@ export function Composer(props: Props) {
             effort={props.effort}
             onModelChange={props.onModelChange}
             onEffortChange={props.onEffortChange}
+            provider={props.activeProvider}
+            orModels={props.orModels}
           />
 
           <Button
