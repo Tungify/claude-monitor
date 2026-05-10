@@ -1,7 +1,7 @@
 "use client";
 
 import { useState } from "react";
-import { Check, ChevronDown, Router } from "lucide-react";
+import { Check, ChevronDown, Router, Settings2 } from "lucide-react";
 import {
   Popover,
   PopoverContent,
@@ -22,35 +22,20 @@ interface Props {
   effort: Effort;
   onModelChange: (id: string) => void;
   onEffortChange: (e: Effort) => void;
-  // When provider === "openrouter", the chip and the model rows show
-  // the OR model id mapped to each Anthropic tier. Without a mapping,
-  // the row just shows the Claude tier name (which is what the binary
-  // requests) — that's still legal, OR will pick a default.
+  // When provider === "openrouter", the chip and the rows render the
+  // user's saved OR favorites (full ids like "openai/gpt-oss-120b")
+  // and selecting one passes that id straight back through
+  // onModelChange. Empty list means the user hasn't saved any
+  // favorites yet — we surface a one-click hint to open the OR
+  // settings dialog.
   provider?: SessionProvider;
-  orModels?: { opus?: string; sonnet?: string; haiku?: string };
+  orModels?: string[];
+  // Optional callback for the "open OR settings" link inside the
+  // popover. Wired by the home composer (which owns the dialog state)
+  // and skipped by the chat-panel — there the user can still open the
+  // dialog from the sidebar.
+  onConfigureOpenRouter?: () => void;
 }
-
-// Maps a Claude model id to the binary's internal tier so we can look
-// up the user's OR mapping. Defaults to opus on unknown ids — the
-// orchestrator's MODELS list only carries Anthropic ids today, but if
-// someone wires a tier-less custom id we'd rather show "opus" than
-// throw.
-function tierFor(modelId: string): "opus" | "sonnet" | "haiku" {
-  if (modelId.includes("haiku")) return "haiku";
-  if (modelId.includes("sonnet")) return "sonnet";
-  return "opus";
-}
-
-// Canonical Claude id that the binary will actually request when the
-// user picks an OR model whose mapping lives at the given tier. The
-// SDK still needs a tier hint to know which env-var override to look
-// at — we always pass the latest 4.7/4.6/4.5 in that family so effort
-// levels resolve sensibly (Opus tier → xhigh / max available).
-const TIER_ANCHOR: Record<"opus" | "sonnet" | "haiku", string> = {
-  opus: "claude-opus-4-7",
-  sonnet: "claude-sonnet-4-6",
-  haiku: "claude-haiku-4-5-20251001",
-};
 
 // Trims `provider/model-name` → `model-name` for compact display in
 // the chip. Long ids would otherwise blow out the toolbar layout,
@@ -61,10 +46,25 @@ function shortOrModel(id: string): string {
   return slash < 0 ? id : id.slice(slash + 1);
 }
 
+// Effort levels supported when routing through OR. We don't know what
+// the third-party model can actually do, so we keep the lower three
+// universally enabled and gate xhigh/max behind ids that look like
+// Claude Opus (the only family confirmed to honor those levels). This
+// is just UX hinting — the model id is what the request actually
+// carries.
+const OR_BASE_EFFORTS: Effort[] = ["low", "medium", "high"];
+function effortsForOr(modelId?: string): Effort[] {
+  if (!modelId) return OR_BASE_EFFORTS;
+  if (/opus/i.test(modelId)) return ["low", "medium", "high", "xhigh", "max"];
+  return OR_BASE_EFFORTS;
+}
+
 // ModelEffortPicker mirrors Claude Code CLI's combined picker: one chip
 // summarizes "<model> · <effort>", and the popover lists both sections
-// stacked with a separator. Effort options are filtered by the selected
-// model's `supportedEffortLevels` (xhigh = Opus only, max = Opus only).
+// stacked with a separator. For the native provider the model list is
+// the static MODELS lineup; for OpenRouter it's the user's saved
+// favorites — picking one calls onModelChange with the OR id directly,
+// which the SDK forwards as the request's `model` field.
 export function ModelEffortPicker({
   modelId,
   effort,
@@ -72,38 +72,28 @@ export function ModelEffortPicker({
   onEffortChange,
   provider,
   orModels,
+  onConfigureOpenRouter,
 }: Props) {
   const [open, setOpen] = useState(false);
+  const isOR = provider === "openrouter";
   const current = modelById(modelId);
-  const supportedEfforts = current?.supportedEffortLevels ?? [
-    "low",
-    "medium",
-    "high",
-  ];
+  // Effort options change shape between providers. Native uses the
+  // model's declared list; OR uses our heuristic above so the popover
+  // doesn't dangle disabled rows the user can't possibly enable.
+  const supportedEfforts = isOR
+    ? effortsForOr(modelId)
+    : (current?.supportedEffortLevels ?? ["low", "medium", "high"]);
 
   const alternatives = MODELS.filter((m) => m.id !== modelId);
 
-  const isOR = provider === "openrouter";
-  // OR mode treats "the picked model" as whichever tier mapping the
-  // current modelId routes through. The chip and popover render OR
-  // ids directly — the user picked openai/gpt-oss-120b, that's what
-  // they should see, not the Anthropic label that happens to share a
-  // tier with it.
-  const currentTier = current ? tierFor(current.id) : "opus";
-  const orForCurrent = isOR ? (orModels?.[currentTier] ?? "") : "";
-  // Build the list of OR rows from the user's saved mapping. Tiers
-  // with no mapping still render so the user knows the slot exists
-  // (clicking offers to open the OR settings dialog instead, but
-  // that's a future polish — for now the chip shows "(unmapped)").
-  const orRows: Array<{
-    tier: "opus" | "sonnet" | "haiku";
-    label: string;
-    modelId?: string;
-  }> = [
-    { tier: "opus", label: "Opus", modelId: orModels?.opus },
-    { tier: "sonnet", label: "Sonnet", modelId: orModels?.sonnet },
-    { tier: "haiku", label: "Haiku", modelId: orModels?.haiku },
-  ];
+  // For OR, `modelId` IS the OR id (we set it that way at session
+  // spawn). When it isn't yet — e.g. fresh home composer where the
+  // initial model is the default Anthropic id — fall back to the
+  // first favorite or "(unset)" so the chip never reads as a Claude
+  // tier label that wouldn't actually apply.
+  const orCurrent = isOR
+    ? (orModels?.includes(modelId) ? modelId : orModels?.[0])
+    : undefined;
 
   const pickModel = (id: string) => {
     onModelChange(id);
@@ -117,8 +107,15 @@ export function ModelEffortPicker({
     setOpen(false);
   };
 
-  const pickOrTier = (tier: "opus" | "sonnet" | "haiku") => {
-    pickModel(TIER_ANCHOR[tier]);
+  // For OR the supportedEfforts list is provider-derived (no
+  // ModelInfo lookup), so falling effort back uses that list directly.
+  const pickOrModel = (id: string) => {
+    onModelChange(id);
+    const efforts = effortsForOr(id);
+    if (!efforts.includes(effort)) {
+      onEffortChange(efforts.at(-1) ?? "high");
+    }
+    setOpen(false);
   };
 
   return (
@@ -139,7 +136,7 @@ export function ModelEffortPicker({
         {isOR && <Router className="size-3 opacity-80" />}
         {isOR ? (
           <span className="font-mono text-[11px]">
-            {orForCurrent ? shortOrModel(orForCurrent) : "(unmapped)"}
+            {orCurrent ? shortOrModel(orCurrent) : "(no models saved)"}
           </span>
         ) : (
           <>
@@ -158,25 +155,51 @@ export function ModelEffortPicker({
           <div className="text-xs text-muted-foreground">
             {isOR ? "OpenRouter models" : "Models"}
           </div>
-          {isOR && (
-            <div className="text-[10px] text-violet-600 dark:text-violet-400">
-              via tier
-            </div>
+          {isOR && onConfigureOpenRouter && (
+            <button
+              type="button"
+              onClick={() => {
+                onConfigureOpenRouter();
+                setOpen(false);
+              }}
+              className="inline-flex items-center gap-1 text-[10px] text-violet-600 hover:underline dark:text-violet-400"
+            >
+              <Settings2 className="size-3" />
+              Manage
+            </button>
           )}
         </div>
         {isOR ? (
-          <ul className="px-1.5 pb-1.5">
-            {orRows.map((row) => (
-              <OrModelRow
-                key={row.tier}
-                tier={row.tier}
-                tierLabel={row.label}
-                modelId={row.modelId}
-                selected={row.tier === currentTier}
-                onPick={() => pickOrTier(row.tier)}
-              />
-            ))}
-          </ul>
+          orModels && orModels.length > 0 ? (
+            <ul className="px-1.5 pb-1.5">
+              {orModels.map((id) => (
+                <OrModelRow
+                  key={id}
+                  modelId={id}
+                  selected={id === orCurrent}
+                  onPick={() => pickOrModel(id)}
+                />
+              ))}
+            </ul>
+          ) : (
+            <div className="px-3 pb-3 text-[11px] text-muted-foreground">
+              No saved models.{" "}
+              {onConfigureOpenRouter ? (
+                <button
+                  type="button"
+                  onClick={() => {
+                    onConfigureOpenRouter();
+                    setOpen(false);
+                  }}
+                  className="text-violet-600 underline-offset-2 hover:underline dark:text-violet-400"
+                >
+                  Open OpenRouter settings
+                </button>
+              ) : (
+                "Open OpenRouter settings from the sidebar to add some."
+              )}
+            </div>
+          )
         ) : (
           <>
             <ul className="px-1.5 pb-1.5">
@@ -270,55 +293,39 @@ function ModelRow({
   );
 }
 
-// OrModelRow renders a saved OR mapping. The OR id is the headline —
-// users care about which model is actually answering, not the
-// Anthropic tier name underneath. The tier still shows in muted text
-// because it's load-bearing for effort levels (Opus tier is the only
-// one that supports xhigh / max).
+// OrModelRow renders one of the user's saved OR favorites. The OR id is
+// the headline (the user picked it directly from the catalog so they
+// recognize the full string); we split off the vendor prefix into
+// muted-foreground so a long id stays readable.
 function OrModelRow({
-  tier,
-  tierLabel,
   modelId,
   selected,
   onPick,
 }: {
-  tier: "opus" | "sonnet" | "haiku";
-  tierLabel: string;
-  modelId?: string;
+  modelId: string;
   selected: boolean;
   onPick: () => void;
 }) {
-  const unmapped = !modelId;
+  const slash = modelId.indexOf("/");
+  const vendor = slash >= 0 ? modelId.slice(0, slash) : "";
+  const name = slash >= 0 ? modelId.slice(slash + 1) : modelId;
   return (
     <li>
       <button
         type="button"
         onClick={onPick}
-        disabled={unmapped}
-        className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-transparent"
-      >
-        <span className="min-w-0 flex-1">
-          <span className="block truncate text-sm font-medium">
-            {unmapped ? (
-              <span className="text-muted-foreground italic">
-                {tierLabel} tier · unmapped
-              </span>
-            ) : (
-              shortOrModel(modelId)
-            )}
-          </span>
-          {!unmapped && (
-            <span className="block truncate font-mono text-[10px] text-muted-foreground">
-              {modelId}
-            </span>
-          )}
-        </span>
-        <span className="text-[10px] tabular-nums text-muted-foreground uppercase">
-          {tier}
-        </span>
-        {selected && !unmapped && (
-          <Check className="size-3.5 shrink-0" />
+        className={cn(
+          "flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left hover:bg-muted",
+          selected && "bg-violet-500/5",
         )}
+      >
+        <span className="min-w-0 flex-1 truncate font-mono text-xs">
+          {vendor && (
+            <span className="text-muted-foreground">{vendor}/</span>
+          )}
+          <span className="font-medium">{name}</span>
+        </span>
+        {selected && <Check className="size-3.5 shrink-0" />}
       </button>
     </li>
   );

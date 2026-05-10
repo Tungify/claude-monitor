@@ -177,16 +177,14 @@ export function ChatPanel({ session }: Props) {
     (session.permission_mode as PermissionMode | undefined) ?? "default",
   );
   const [commandLog, setCommandLog] = useState<CommandLog[]>([]);
-  // OR model mapping for the chip's "→ model-id" preview. Only fetched
-  // when this session is OR-routed; native sessions never need it and
-  // skip the request. Refreshed once on mount — the user can't edit
-  // OR settings while inside a chat (the dialog is sidebar-scoped),
-  // so a single fetch is enough.
-  const [orModels, setOrModels] = useState<{
-    opus?: string;
-    sonnet?: string;
-    haiku?: string;
-  }>({});
+  // OR favorites list for the composer's model chip. Only fetched when
+  // this session is OR-routed; native sessions skip the request. Picker
+  // selections call patchOptions({model}) which goes through the SDK's
+  // setModel — the binary then carries that id verbatim to OR on the
+  // next request. Refreshed once on mount; opening the OR settings
+  // dialog from the sidebar would write but this component re-mounts
+  // when the user re-enters the chat, so a single fetch is enough.
+  const [orModels, setOrModels] = useState<string[]>([]);
   useEffect(() => {
     if (session.provider !== "openrouter") return;
     let cancelled = false;
@@ -194,12 +192,10 @@ export function ChatPanel({ session }: Props) {
       try {
         const res = await fetch("/api/openrouter");
         if (!res.ok || cancelled) return;
-        const data = (await res.json()) as {
-          models: { opus?: string; sonnet?: string; haiku?: string };
-        };
+        const data = (await res.json()) as { models: string[] };
         if (!cancelled) setOrModels(data.models);
       } catch {
-        // chip falls back to "(unmapped)" silently
+        // chip falls back to "(no models saved)" silently
       }
     })();
     return () => {

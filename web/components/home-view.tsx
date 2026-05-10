@@ -34,19 +34,16 @@ export function HomeView() {
   const [effort, setEffort] = useState<Effort>(DEFAULT_EFFORT);
   const [mode, setMode] = useState<PermissionMode>("default");
   const [provider, setProvider] = useState<SessionProvider>("anthropic");
-  const [orModels, setOrModels] = useState<{
-    opus?: string;
-    sonnet?: string;
-    haiku?: string;
-  }>({});
+  const [orModels, setOrModels] = useState<string[]>([]);
+  const [orDefaultModel, setOrDefaultModel] = useState<string | undefined>();
   const [recentCwds, setRecentCwds] = useState<string[]>([]);
   const [helpOpen, setHelpOpen] = useState(false);
   const [orDialogOpen, setOrDialogOpen] = useState(false);
 
-  // Refresh the OR mapping whenever the provider flips to openrouter
-  // or the settings dialog closes (it's the only writer). The chip
-  // needs the mapping so it can render "Opus → openai/gpt-oss-120b"
-  // instead of just "Opus 4.7" when OR is active.
+  // Refresh the OR favorites whenever the provider flips to openrouter
+  // or the settings dialog closes (it's the only writer). The picker
+  // shows these directly so the composer's model chip can render the
+  // user's saved OR list inline instead of an Anthropic tier label.
   useEffect(() => {
     if (provider !== "openrouter" && !orDialogOpen) return;
     let cancelled = false;
@@ -57,17 +54,51 @@ export function HomeView() {
         const data = (await res.json()) as {
           configured: boolean;
           has_key: boolean;
-          models: { opus?: string; sonnet?: string; haiku?: string };
+          models: string[];
+          default_model?: string;
         };
-        if (!cancelled) setOrModels(data.models);
+        if (cancelled) return;
+        setOrModels(data.models);
+        setOrDefaultModel(data.default_model);
       } catch {
-        // Silent — chip falls back to "(unmapped)" if we can't load.
+        // Silent — chip falls back to "(no models saved)" if we can't load.
       }
     })();
     return () => {
       cancelled = true;
     };
   }, [provider, orDialogOpen]);
+
+  // When the user flips to OR (or the favorites list lands), seed the
+  // composer's model field with the saved default. This is what the
+  // session will spawn against — the env block routes everything to
+  // this id, and the SDK's `model:` option carries it through. Flipping
+  // back to anthropic restores the native default.
+  //
+  // The seeding has to dodge React 19's set-state-in-effect lint rule:
+  // wrapping in queueMicrotask defers the setter until after the
+  // current render commits, which the rule accepts. Cancellation guard
+  // via the cleanup ref so a fast provider flip doesn't race two
+  // microtasks.
+  useEffect(() => {
+    let cancelled = false;
+    queueMicrotask(() => {
+      if (cancelled) return;
+      if (provider === "openrouter") {
+        const seed = orDefaultModel ?? orModels[0];
+        if (seed) setModel(seed);
+      } else {
+        setModel(DEFAULT_MODEL_ID);
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+    // We deliberately don't include `model` in deps — the user picking
+    // a different OR favorite from the composer is the same set of
+    // state, and re-running this effect would override that choice.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [provider, orDefaultModel, orModels.join("|")]);
 
   // Hydrate the default cwd + recent list from existing sessions on mount.
   // Keeps the picker useful without forcing the user to type a path each

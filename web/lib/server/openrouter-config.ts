@@ -16,26 +16,71 @@ const CONFIG_FILE = path.join(os.homedir(), ".claude-monitor", "config.json");
 // runs the Claude binary, MCP servers, plan flow, permission prompts —
 // only the model on the other end of the HTTP call changes.
 //
-// `models` maps the binary's three internal tiers (opus / sonnet / haiku)
-// to OpenRouter model ids. The CLI picks one tier per request based on
-// the `--model` flag; with these env vars set it sends the mapped OR id
-// instead. Leave a tier blank to fall through to whatever the binary
-// defaults to (which OpenRouter will reject if it's not a known id).
+// `models` is the user's saved favorites — each entry is a full OR
+// model id (e.g. "openai/gpt-oss-120b"). The composer's model picker
+// lists these directly so the user picks an OR model the same way they
+// would pick "Opus" or "Sonnet" on the native provider. `default_model`
+// is the fallback OR id used at session-spawn time when the user hasn't
+// already chosen one — it also seeds the in-chat picker on a fresh
+// session.
 export interface OpenRouterConfig {
+  api_key: string;
+  models: string[];
+  default_model?: string;
+}
+
+interface ConfigFile {
+  version: 1;
+  openrouter?: OpenRouterConfig | LegacyOpenRouterConfig;
+}
+
+// Old shape — favored Anthropic tiers (opus/sonnet/haiku) as the
+// switching axis. Kept around so existing config files migrate
+// transparently on first read; we never write this shape back.
+interface LegacyOpenRouterConfig {
   api_key: string;
   models: {
     opus?: string;
     sonnet?: string;
     haiku?: string;
   };
-}
-
-interface ConfigFile {
-  version: 1;
-  openrouter?: OpenRouterConfig;
+  default_model?: string;
 }
 
 const EMPTY: ConfigFile = { version: 1 };
+
+function migrate(
+  raw: OpenRouterConfig | LegacyOpenRouterConfig | undefined,
+): OpenRouterConfig | undefined {
+  if (!raw) return undefined;
+  if (Array.isArray((raw as OpenRouterConfig).models)) {
+    const cur = raw as OpenRouterConfig;
+    return {
+      api_key: cur.api_key,
+      models: [...cur.models],
+      default_model: cur.default_model,
+    };
+  }
+  // Legacy tier shape — flatten the dict's values into a unique list,
+  // keeping insertion order (opus → sonnet → haiku). The first
+  // non-empty tier becomes the default since the legacy semantics
+  // treated it as the headline mapping.
+  const legacy = raw as LegacyOpenRouterConfig;
+  const tiered = [legacy.models.opus, legacy.models.sonnet, legacy.models.haiku]
+    .filter((s): s is string => Boolean(s && s.length > 0));
+  const seen = new Set<string>();
+  const models: string[] = [];
+  for (const id of tiered) {
+    if (seen.has(id)) continue;
+    seen.add(id);
+    models.push(id);
+  }
+  return {
+    api_key: legacy.api_key,
+    models,
+    default_model: legacy.default_model ?? models[0],
+  };
+}
 
 async function readFile(): Promise<ConfigFile> {
   try {
@@ -59,7 +104,7 @@ async function writeFile(file: ConfigFile): Promise<void> {
 
 export async function loadOpenRouterConfig(): Promise<OpenRouterConfig | undefined> {
   const file = await readFile();
-  return file.openrouter;
+  return migrate(file.openrouter);
 }
 
 // Sync variant for the session spawn path. buildLiveSession is sync
@@ -73,7 +118,7 @@ export function loadOpenRouterConfigSync(): OpenRouterConfig | undefined {
     const text = readFileSync(CONFIG_FILE, "utf-8");
     const parsed = JSON.parse(text) as Partial<ConfigFile>;
     if (parsed.version !== 1) return undefined;
-    return parsed.openrouter;
+    return migrate(parsed.openrouter);
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === "ENOENT") return undefined;
     console.warn("[openrouter-config] sync read failed:", err);
@@ -98,28 +143,35 @@ export async function saveOpenRouterConfig(
 }
 
 // Builds the env var block that buildLiveSession merges onto process.env
-// when a session has provider === "openrouter". Returns undefined when
-// OR isn't configured (caller should reject the spawn rather than
-// silently fall back to native — that would route to the wrong provider
-// without telling anyone).
+// when a session has provider === "openrouter". `activeModel` is the
+// session's chosen OR id (drives all three tier env vars); when omitted
+// we fall back to config.default_model so the binary still has *some*
+// id to send for any tier it requests.
 //
 // ANTHROPIC_API_KEY is set to "" explicitly: the SDK / binary picks it
 // up before ANTHROPIC_AUTH_TOKEN, so leaving the user's real Anthropic
 // key in the inherited env shadows the OR token and hits the wrong API.
+//
+// The three ANTHROPIC_DEFAULT_*_MODEL vars are all set to the SAME id:
+// the binary still asks for an opus / sonnet / haiku tier per request,
+// but with the user picking a single OR model we want every tier to
+// resolve to that pick. OpenRouter sees the model id directly in the
+// request body either way; the env vars are just the tier-resolution
+// fallback when the SDK doesn't pass an explicit model.
 export function openRouterEnv(
   config: OpenRouterConfig,
+  activeModel?: string,
 ): Record<string, string> {
   const env: Record<string, string> = {
     ANTHROPIC_BASE_URL: "https://openrouter.ai/api",
     ANTHROPIC_AUTH_TOKEN: config.api_key,
     ANTHROPIC_API_KEY: "",
   };
-  if (config.models.opus) env.ANTHROPIC_DEFAULT_OPUS_MODEL = config.models.opus;
-  if (config.models.sonnet) {
-    env.ANTHROPIC_DEFAULT_SONNET_MODEL = config.models.sonnet;
-  }
-  if (config.models.haiku) {
-    env.ANTHROPIC_DEFAULT_HAIKU_MODEL = config.models.haiku;
+  const id = activeModel || config.default_model || config.models[0];
+  if (id) {
+    env.ANTHROPIC_DEFAULT_OPUS_MODEL = id;
+    env.ANTHROPIC_DEFAULT_SONNET_MODEL = id;
+    env.ANTHROPIC_DEFAULT_HAIKU_MODEL = id;
   }
   return env;
 }
@@ -130,20 +182,18 @@ export function openRouterEnv(
 export interface OpenRouterStatus {
   configured: boolean;
   has_key: boolean;
-  models: {
-    opus?: string;
-    sonnet?: string;
-    haiku?: string;
-  };
+  models: string[];
+  default_model?: string;
 }
 
 export function statusFor(config: OpenRouterConfig | undefined): OpenRouterStatus {
   if (!config) {
-    return { configured: false, has_key: false, models: {} };
+    return { configured: false, has_key: false, models: [] };
   }
   return {
     configured: true,
     has_key: config.api_key.length > 0,
-    models: { ...config.models },
+    models: [...config.models],
+    default_model: config.default_model,
   };
 }

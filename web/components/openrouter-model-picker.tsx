@@ -24,11 +24,15 @@ interface CatalogModel {
 interface Props {
   open: boolean;
   onOpenChange: (open: boolean) => void;
-  // Currently-mapped id for highlight / "selected" dot.
+  // Currently-selected id for highlight / "selected" dot. Optional —
+  // the picker is also used for "add a new favorite" where there's no
+  // current selection to compare against.
   currentId?: string;
-  // Tier label shown in the dialog header so the user knows which
-  // slot they're filling ("Pick a model for the Opus tier").
-  tierLabel: string;
+  // Header title + description. Defaults handle the standalone "browse
+  // and add a favorite" flow; callers that mount this for a different
+  // purpose (e.g. "switch active model") can override both.
+  title?: string;
+  description?: string;
   onPick: (id: string) => void;
 }
 
@@ -55,7 +59,8 @@ export function OpenRouterModelPicker({
   open,
   onOpenChange,
   currentId,
-  tierLabel,
+  title = "Pick an OpenRouter model",
+  description = "Anything you pick will be sent to OpenRouter for this session.",
   onPick,
 }: Props) {
   const [models, setModels] = useState<CatalogModel[] | null>(null);
@@ -113,13 +118,8 @@ export function OpenRouterModelPicker({
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="flex max-h-[calc(100dvh-1rem)] max-w-2xl flex-col gap-3 overflow-hidden p-3 shadow-2xl sm:max-h-[calc(100dvh-2rem)] sm:p-4">
         <DialogHeader>
-          <DialogTitle className="pr-8">
-            Pick a model for the {tierLabel} tier
-          </DialogTitle>
-          <DialogDescription className="pr-8">
-            Anything you pick will be sent to OpenRouter whenever the binary
-            asks for the {tierLabel.toLowerCase()} tier in this session.
-          </DialogDescription>
+          <DialogTitle className="pr-8">{title}</DialogTitle>
+          <DialogDescription className="pr-8">{description}</DialogDescription>
         </DialogHeader>
 
         <div className="space-y-2">

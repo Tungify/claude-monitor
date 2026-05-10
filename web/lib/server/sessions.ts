@@ -932,7 +932,13 @@ function buildLiveSession(init: BuildLiveInit): ChatSession {
   // a normal Anthropic auth response the user can read.
   const orConfig =
     init.provider === "openrouter" ? loadOpenRouterConfigSync() : undefined;
-  const providerEnv = orConfig ? openRouterEnv(orConfig) : {};
+  // Pass the session's chosen model so OR's tier env vars resolve to
+  // the user's pick. Without this the env block falls back to
+  // config.default_model — fine for the binary's tier requests, but
+  // the SDK's `model:` option overrides anyway, so the env vars matter
+  // only for whichever request goes through the binary's tier-naming
+  // path (rare but real).
+  const providerEnv = orConfig ? openRouterEnv(orConfig, init.model) : {};
 
   session.query = query({
     prompt: inputQueue,
