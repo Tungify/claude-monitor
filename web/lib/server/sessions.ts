@@ -59,11 +59,13 @@ import type {
   PermissionMode,
   PermissionRequest,
   RateLimitInfo,
+  SessionProvider,
   SessionSnapshot,
   SessionStatus,
   SessionSummary,
   SessionUsage,
 } from "@/lib/chat-types";
+import { loadOpenRouterConfigSync, openRouterEnv } from "./openrouter-config";
 import type { PlanRecord } from "@/lib/plan-types";
 import { deriveSubagents } from "@/lib/subagents";
 
@@ -95,6 +97,7 @@ interface ChatSession {
   createdAt: Date;
   model?: string;
   effort?: EffortLevel;
+  provider?: SessionProvider;
   permissionMode: PermissionMode;
   // Set when this session is a phase executor (spawned from plan approve).
   // Sidebar uses these to group phase sessions under their owning plan;
@@ -162,6 +165,7 @@ interface InterruptedSession {
   createdAt: Date;
   model?: string;
   effort?: EffortLevel;
+  provider?: SessionProvider;
   permissionMode: PermissionMode;
   history: SDKMessage[];
   latestUsage?: SessionUsage;
@@ -227,6 +231,7 @@ async function initFromDisk(): Promise<void> {
         createdAt: new Date(s.created_at),
         model: s.model,
         effort: s.effort,
+        provider: s.provider,
         permissionMode: s.permission_mode,
         history: s.history,
         latestUsage: s.latest_usage,
@@ -357,6 +362,7 @@ async function persistNow(id: string): Promise<void> {
       created_at: s.createdAt.toISOString(),
       model: s.model,
       effort: s.effort,
+      provider: s.provider,
       permission_mode: s.permissionMode,
       history: s.history,
       latest_usage: s.latestUsage,
@@ -409,6 +415,7 @@ function summarize(session: ChatSession): SessionSummary {
     title: firstUserText(session.history),
     model: session.model,
     effort: session.effort,
+    provider: session.provider,
     permission_mode: session.permissionMode,
     usage: session.latestUsage,
     context_usage: session.latestContextUsage,
@@ -852,6 +859,7 @@ interface BuildLiveInit {
   createdAt: Date;
   model?: string;
   effort?: EffortLevel;
+  provider?: SessionProvider;
   permissionMode: PermissionMode;
   history: SDKMessage[];
   latestUsage?: SessionUsage;
@@ -889,6 +897,7 @@ function buildLiveSession(init: BuildLiveInit): ChatSession {
     createdAt: init.createdAt,
     model: init.model,
     effort: init.effort,
+    provider: init.provider,
     permissionMode: init.permissionMode,
     planId: init.planId,
     phaseSlug: init.phaseSlug,
@@ -914,11 +923,26 @@ function buildLiveSession(init: BuildLiveInit): ChatSession {
   // there really is none, in which case the SDK's own error wins).
   const claudeBin = findClaudeBinary();
 
+  // Provider routing. For OpenRouter, layer ANTHROPIC_BASE_URL +
+  // ANTHROPIC_AUTH_TOKEN onto the env so the SDK's HTTP traffic goes
+  // to OR instead of Anthropic. Falls back to native if the user
+  // selected OR but the global config was wiped — better to spawn
+  // against the active Anthropic account than to refuse outright,
+  // and the missing env block surfaces in the very next API call as
+  // a normal Anthropic auth response the user can read.
+  const orConfig =
+    init.provider === "openrouter" ? loadOpenRouterConfigSync() : undefined;
+  const providerEnv = orConfig ? openRouterEnv(orConfig) : {};
+
   session.query = query({
     prompt: inputQueue,
     options: {
       cwd: init.cwd,
-      env: { ...process.env, CLAUDE_CONFIG_DIR: init.configDir },
+      env: {
+        ...process.env,
+        CLAUDE_CONFIG_DIR: init.configDir,
+        ...providerEnv,
+      },
       ...(claudeBin ? { pathToClaudeCodeExecutable: claudeBin } : {}),
       // Without this, the Agent SDK uses an empty/agent-flavored system
       // prompt and the session loses Claude Code's tone guidelines,
@@ -988,6 +1012,7 @@ export function createSession(opts: {
   accountName?: string;
   model?: string;
   effort?: EffortLevel;
+  provider?: SessionProvider;
   permissionMode?: PermissionMode;
   planId?: string;
   phaseSlug?: string;
@@ -1001,6 +1026,7 @@ export function createSession(opts: {
     createdAt: new Date(),
     model: opts.model,
     effort: opts.effort,
+    provider: opts.provider,
     permissionMode: opts.permissionMode ?? "default",
     planId: opts.planId,
     phaseSlug: opts.phaseSlug,
@@ -1064,6 +1090,7 @@ function resumeSession(stored: InterruptedSession): ChatSession {
     createdAt: stored.createdAt,
     model: stored.model,
     effort: stored.effort,
+    provider: stored.provider,
     permissionMode: stored.permissionMode,
     planId: stored.planId,
     phaseSlug: stored.phaseSlug,
@@ -1205,6 +1232,7 @@ function summarizeInterrupted(s: InterruptedSession): SessionSummary {
     title: firstUserText(s.history),
     model: s.model,
     effort: s.effort,
+    provider: s.provider,
     permission_mode: s.permissionMode,
     usage: s.latestUsage,
     context_usage: s.latestContextUsage,

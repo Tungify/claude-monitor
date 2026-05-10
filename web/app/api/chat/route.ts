@@ -38,6 +38,7 @@ export async function POST(req: Request) {
       accountName: body.account_name,
       model: body.model,
       effort: body.effort,
+      provider: body.provider,
       permissionMode: body.permission_mode,
       planId: body.plan_id,
       phaseSlug: body.phase_slug,

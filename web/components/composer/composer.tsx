@@ -16,6 +16,7 @@ import type {
   Attachment,
   ContextUsageBreakdown,
   Effort,
+  SessionProvider,
   SessionUsage,
 } from "@/lib/chat-types";
 import { modelById } from "@/lib/models";
@@ -29,6 +30,7 @@ import { ContextMeter } from "./context-meter";
 import { FolderPicker } from "./folder-picker";
 import { ModelEffortPicker } from "./model-effort-picker";
 import { ModePicker, type PermissionMode } from "./mode-picker";
+import { ProviderPicker } from "./provider-picker";
 import { ModeBanner } from "./mode-banner";
 import { MultiPhaseToggle, hintForMultiPhase } from "./intent-picker";
 import { useGitBranch } from "@/hooks/use-git-branch";
@@ -83,6 +85,12 @@ interface HomeProps extends CommonProps {
   cwd: string;
   onCwdChange: (p: string) => void;
   recentCwds?: string[];
+  // Provider routing for the *new* session this composer will create.
+  // Only meaningful in mode="home" — once a chat exists, switching
+  // providers mid-stream isn't supported (would re-spawn the binary).
+  provider: SessionProvider;
+  onProviderChange: (p: SessionProvider) => void;
+  onConfigureOpenRouter: () => void;
 }
 
 interface SessionProps extends CommonProps {
@@ -484,6 +492,13 @@ export function Composer(props: Props) {
             />
           )}
           <MultiPhaseToggle active={multiPhase} onChange={setMultiPhase} />
+          {props.mode === "home" && (
+            <ProviderPicker
+              provider={props.provider}
+              onChange={props.onProviderChange}
+              onConfigureOpenRouter={props.onConfigureOpenRouter}
+            />
+          )}
           <ModelEffortPicker
             modelId={props.model}
             effort={props.effort}

@@ -5,6 +5,7 @@ import { useRouter } from "next/navigation";
 import { X } from "lucide-react";
 import { useDaemonContext } from "@/lib/daemon-context";
 import { Composer, type ComposerSubmit } from "@/components/composer/composer";
+import { OpenRouterDialog } from "@/components/openrouter-dialog";
 import { SidebarTrigger } from "@/components/sidebar/sidebar-trigger";
 import { DEFAULT_EFFORT, DEFAULT_MODEL_ID } from "@/lib/models";
 import {
@@ -12,7 +13,12 @@ import {
   HOME_COMMANDS,
   parseSlashCommand,
 } from "@/lib/slash-commands";
-import type { Effort, PermissionMode, SessionSummary } from "@/lib/chat-types";
+import type {
+  Effort,
+  PermissionMode,
+  SessionProvider,
+  SessionSummary,
+} from "@/lib/chat-types";
 
 // HomeView is the empty-state landing of the workspace: a serif hero +
 // the composer. Submitting creates a session against the active account
@@ -27,8 +33,10 @@ export function HomeView() {
   const [model, setModel] = useState<string>(DEFAULT_MODEL_ID);
   const [effort, setEffort] = useState<Effort>(DEFAULT_EFFORT);
   const [mode, setMode] = useState<PermissionMode>("default");
+  const [provider, setProvider] = useState<SessionProvider>("anthropic");
   const [recentCwds, setRecentCwds] = useState<string[]>([]);
   const [helpOpen, setHelpOpen] = useState(false);
+  const [orDialogOpen, setOrDialogOpen] = useState(false);
 
   // Hydrate the default cwd + recent list from existing sessions on mount.
   // Keeps the picker useful without forcing the user to type a path each
@@ -89,6 +97,7 @@ export function HomeView() {
           cwd: cwd || undefined,
           model,
           effort,
+          provider,
           permission_mode: mode,
         }),
       });
@@ -166,6 +175,9 @@ export function HomeView() {
           onModelChange={setModel}
           effort={effort}
           onEffortChange={setEffort}
+          provider={provider}
+          onProviderChange={setProvider}
+          onConfigureOpenRouter={() => setOrDialogOpen(true)}
           permMode={mode}
           onPermModeChange={setMode}
           onSubmit={onSubmit}
@@ -182,6 +194,11 @@ export function HomeView() {
               : "Waiting for an active account…"
           }
           helper={helper}
+        />
+
+        <OpenRouterDialog
+          open={orDialogOpen}
+          onOpenChange={setOrDialogOpen}
         />
 
         {helpOpen && (
