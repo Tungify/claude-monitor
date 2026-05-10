@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { ExternalLink, Eye, EyeOff } from "lucide-react";
+import { ExternalLink, Eye, EyeOff, Search, X } from "lucide-react";
 import {
   Dialog,
   DialogContent,
@@ -10,6 +10,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
+import { OpenRouterModelPicker } from "@/components/openrouter-model-picker";
 
 // Mirror of OpenRouterStatus from the server module — duplicated here
 // because client code can't import "server-only" modules. Keep in sync.
@@ -57,6 +58,12 @@ export function OpenRouterDialog({ open, onOpenChange }: Props) {
   // during render, and a simple flag + a clear-after-timeout effect
   // gets us the "Saved" pulse without comparing wall-clock in JSX.
   const [justSaved, setJustSaved] = useState(false);
+  // Picker dialog state. `pickerTier` doubles as the "open" flag —
+  // null means the picker is closed; setting to a tier key opens it
+  // and seeds which tier slot the click will assign to.
+  const [pickerTier, setPickerTier] = useState<
+    "opus" | "sonnet" | "haiku" | null
+  >(null);
 
   // Auto-clear the "Saved" pulse 4s after a successful save. The
   // checkmark belongs to the action that just completed, not to a
@@ -238,23 +245,31 @@ export function OpenRouterDialog({ open, onOpenChange }: Props) {
             </label>
             <p className="text-[11px] text-muted-foreground">
               Claude Code asks the API for an &quot;opus&quot;,
-              &quot;sonnet&quot;, or &quot;haiku&quot; tier per request. Map
-              each tier to whatever OpenRouter model id you want — try{" "}
-              <code>openai/gpt-4o</code>, <code>google/gemini-2.5-pro</code>,
-              <code> qwen/qwen3-coder</code>, <code>deepseek/deepseek-chat</code>,
-              etc.
+              &quot;sonnet&quot;, or &quot;haiku&quot; tier per request. Click
+              Browse to pick from OpenRouter&apos;s catalog (gpt-oss, gemini,
+              qwen, deepseek, …).
             </p>
-            <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
-              <TierField label="Opus tier" value={opus} onChange={setOpus} />
-              <TierField
+            <div className="space-y-2">
+              <TierSlot
+                tier="opus"
+                label="Opus tier"
+                value={opus}
+                onClear={() => setOpus("")}
+                onBrowse={() => setPickerTier("opus")}
+              />
+              <TierSlot
+                tier="sonnet"
                 label="Sonnet tier"
                 value={sonnet}
-                onChange={setSonnet}
+                onClear={() => setSonnet("")}
+                onBrowse={() => setPickerTier("sonnet")}
               />
-              <TierField
+              <TierSlot
+                tier="haiku"
                 label="Haiku tier"
                 value={haiku}
-                onChange={setHaiku}
+                onClear={() => setHaiku("")}
+                onBrowse={() => setPickerTier("haiku")}
               />
             </div>
           </section>
@@ -292,31 +307,88 @@ export function OpenRouterDialog({ open, onOpenChange }: Props) {
           </div>
         </div>
       </DialogContent>
+
+      {/* Catalog picker. Mounted alongside the main dialog so picking
+          a model can replace the tier value while the parent stays
+          open underneath. setPickerTier(null) to dismiss. */}
+      <OpenRouterModelPicker
+        open={pickerTier !== null}
+        onOpenChange={(o) => {
+          if (!o) setPickerTier(null);
+        }}
+        currentId={
+          pickerTier === "opus"
+            ? opus
+            : pickerTier === "sonnet"
+              ? sonnet
+              : pickerTier === "haiku"
+                ? haiku
+                : undefined
+        }
+        tierLabel={
+          pickerTier === "opus"
+            ? "Opus"
+            : pickerTier === "sonnet"
+              ? "Sonnet"
+              : "Haiku"
+        }
+        onPick={(id) => {
+          if (pickerTier === "opus") setOpus(id);
+          else if (pickerTier === "sonnet") setSonnet(id);
+          else if (pickerTier === "haiku") setHaiku(id);
+        }}
+      />
     </Dialog>
   );
 }
 
-function TierField({
+// TierSlot renders one row of the model mapping section: tier name,
+// the assigned id (or an empty hint), Browse + Clear actions. Clicking
+// Browse lifts pickerTier in the parent so the catalog picker mounts
+// pointed at the right slot.
+function TierSlot({
+  tier,
   label,
   value,
-  onChange,
+  onClear,
+  onBrowse,
 }: {
+  tier: "opus" | "sonnet" | "haiku";
   label: string;
   value: string;
-  onChange: (v: string) => void;
+  onClear: () => void;
+  onBrowse: () => void;
 }) {
   return (
-    <label className="block space-y-1">
-      <span className="block text-[11px] text-muted-foreground">{label}</span>
-      <input
-        type="text"
-        value={value}
-        onChange={(e) => onChange(e.target.value)}
-        spellCheck={false}
-        autoCapitalize="off"
-        autoComplete="off"
-        className="w-full rounded border bg-background px-2 py-1.5 font-mono text-xs sm:py-1"
-      />
-    </label>
+    <div className="flex items-center gap-2 rounded-md border bg-background px-2 py-1.5">
+      <span className="w-20 shrink-0 text-[11px] font-semibold tracking-wider text-muted-foreground uppercase">
+        {label.replace(" tier", "")}
+      </span>
+      <span className="min-w-0 flex-1 truncate font-mono text-xs">
+        {value || (
+          <span className="text-muted-foreground italic">
+            (not set — OR will default)
+          </span>
+        )}
+      </span>
+      {value && (
+        <button
+          type="button"
+          aria-label={`Clear ${tier} mapping`}
+          onClick={onClear}
+          className="rounded p-1 text-muted-foreground hover:bg-muted"
+        >
+          <X className="size-3.5" />
+        </button>
+      )}
+      <button
+        type="button"
+        onClick={onBrowse}
+        className="inline-flex items-center gap-1 rounded-md border border-violet-500/40 bg-violet-500/10 px-2 py-1 text-xs font-medium text-violet-700 hover:bg-violet-500/15 dark:text-violet-300"
+      >
+        <Search className="size-3" />
+        Browse
+      </button>
+    </div>
   );
 }

@@ -1,6 +1,7 @@
 import "server-only";
 
 import { promises as fs } from "node:fs";
+import os from "node:os";
 import path from "node:path";
 
 // Reads stuff out of the user's Claude config directory + project
@@ -110,26 +111,93 @@ export interface McpServerInfo {
   raw: McpServerEntry;
 }
 
-// Lists MCP servers visible to the session. User-scope entries come
-// from <configDir>/settings.{,local.}json; project-scope from
-// <cwd>/.claude/settings.{,local.}json. We label each with its scope so
-// the user sees whether a server is "always on" vs "only here".
+// Lists MCP servers visible to the session. The Claude binary itself
+// resolves MCP config from a fan of files; we walk all of them so the
+// /mcp output matches what the CLI would show:
+//
+//   1. <configDir>/settings.json + settings.local.json    (claude-monitor scope)
+//   2. <configDir>/.claude.json                            (per-account binary state)
+//   3. ~/.claude.json                                       (global binary state — *the* default location)
+//   4. ~/.claude.json projects[<cwd>].mcpServers            (project-scoped, written by `claude mcp add --scope project`)
+//   5. <cwd>/.mcp.json                                      (committed-to-repo project servers)
+//   6. <cwd>/.claude/settings.{,local.}json mcpServers
+//
+// Duplicates by name resolve to the latest occurrence (later sources
+// win) — same precedence the binary uses.
 export async function listMcpServers(
   configDir: string,
   cwd: string,
 ): Promise<McpServerInfo[]> {
-  const out: McpServerInfo[] = [];
+  // Use a Map<name, info> to dedupe; insertion order tracks first sight,
+  // and we overwrite entries as we walk later sources.
+  const byName = new Map<string, McpServerInfo>();
+
   const userSettings = await loadSettings(configDir);
   for (const [name, raw] of Object.entries(userSettings.merged.mcpServers ?? {})) {
-    out.push(infoFor(name, "user", raw));
+    byName.set(name, infoFor(name, "user", raw));
   }
+
+  // <configDir>/.claude.json — present when the binary was invoked
+  // with CLAUDE_CONFIG_DIR=<configDir>; this is where `claude mcp add`
+  // writes user-scope servers when running under our per-account dirs.
+  const accountClaudeJson = await readJson<ClaudeJsonShape>(
+    path.join(configDir, ".claude.json"),
+  );
+  for (const [name, raw] of Object.entries(
+    accountClaudeJson?.mcpServers ?? {},
+  )) {
+    byName.set(name, infoFor(name, "user", raw));
+  }
+
+  // ~/.claude.json — the binary's global config file. Even when
+  // CLAUDE_CONFIG_DIR points elsewhere, the binary still falls back
+  // to this for session memory + project records, so MCPs configured
+  // there will be visible to the session unless explicitly shadowed.
+  const homeClaudeJson = await readJson<ClaudeJsonShape>(
+    path.join(os.homedir(), ".claude.json"),
+  );
+  for (const [name, raw] of Object.entries(homeClaudeJson?.mcpServers ?? {})) {
+    if (!byName.has(name)) byName.set(name, infoFor(name, "user", raw));
+  }
+  // Project-scoped MCPs recorded in the global config under projects[<cwd>].
+  const projectFromHome = homeClaudeJson?.projects?.[cwd]?.mcpServers ?? {};
+  for (const [name, raw] of Object.entries(projectFromHome)) {
+    byName.set(name, infoFor(name, "project", raw));
+  }
+  const projectFromAccount =
+    accountClaudeJson?.projects?.[cwd]?.mcpServers ?? {};
+  for (const [name, raw] of Object.entries(projectFromAccount)) {
+    byName.set(name, infoFor(name, "project", raw));
+  }
+
+  // <cwd>/.mcp.json — dedicated file the user commits to a repo so
+  // collaborators get the same MCP servers. Shape matches the
+  // mcpServers object directly (no settings wrapper).
+  const dotMcp = await readJson<{ mcpServers?: Record<string, McpServerEntry> }>(
+    path.join(cwd, ".mcp.json"),
+  );
+  for (const [name, raw] of Object.entries(dotMcp?.mcpServers ?? {})) {
+    byName.set(name, infoFor(name, "project", raw));
+  }
+
   const projectSettings = await loadSettings(path.join(cwd, ".claude"));
   for (const [name, raw] of Object.entries(
     projectSettings.merged.mcpServers ?? {},
   )) {
-    out.push(infoFor(name, "project", raw));
+    byName.set(name, infoFor(name, "project", raw));
   }
-  return out;
+
+  return Array.from(byName.values());
+}
+
+interface ClaudeJsonShape {
+  mcpServers?: Record<string, McpServerEntry>;
+  projects?: Record<
+    string,
+    {
+      mcpServers?: Record<string, McpServerEntry>;
+    }
+  >;
 }
 
 function infoFor(
@@ -153,9 +221,10 @@ export interface AgentEntry {
 }
 
 // Walks <configDir>/agents and <cwd>/.claude/agents for *.md agent
-// definitions. Each file's leading frontmatter description (if any) is
-// surfaced; we don't parse the YAML rigorously, just the first
-// `description:` line.
+// definitions, plus every installed plugin's agents/ folder
+// (~/.claude/plugins/marketplaces/<repo>/<plugin>/agents/*.md). Each
+// file's leading frontmatter `description` (if any) is surfaced; we
+// don't parse the YAML rigorously, just the first `description:` line.
 export async function listAgents(
   configDir: string,
   cwd: string,
@@ -174,6 +243,14 @@ export async function listAgents(
       });
     }
   }
+  for (const e of await listPluginMarkdown("agents")) {
+    entries.push({
+      name: e.name,
+      scope: "user",
+      description: e.description,
+      path: e.path,
+    });
+  }
   return entries.sort((a, b) => a.name.localeCompare(b.name));
 }
 
@@ -186,7 +263,9 @@ export interface SkillEntry {
 
 // Skills live as directories with a SKILL.md inside. We list any
 // subdirectory of <configDir>/skills and <cwd>/.claude/skills that
-// holds a SKILL.md, picking up the description from its frontmatter.
+// holds a SKILL.md, plus every plugin's skills/ folder. Description
+// comes from each SKILL.md's frontmatter — same shape Claude Code
+// surfaces when it triggers a skill.
 export async function listSkills(
   configDir: string,
   cwd: string,
@@ -196,25 +275,84 @@ export async function listSkills(
     [path.join(configDir, "skills"), "user"],
     [path.join(cwd, ".claude", "skills"), "project"],
   ] as const) {
-    let children: string[];
-    try {
-      children = await fs.readdir(dir);
-    } catch {
-      continue;
+    for (const s of await listSkillsDir(dir)) {
+      out.push({ ...s, scope, path: path.join(dir, s.name, "SKILL.md") });
     }
-    for (const child of children) {
-      const skillFile = path.join(dir, child, "SKILL.md");
-      const meta = await readMarkdownFrontmatter(skillFile);
-      if (!meta) continue;
+  }
+  // Plugin-supplied skills. Plugins live under
+  // ~/.claude/plugins/marketplaces/<repo>/<plugin>/skills/<name>/SKILL.md.
+  for (const root of await pluginRoots()) {
+    const skillsDir = path.join(root, "skills");
+    for (const s of await listSkillsDir(skillsDir)) {
       out.push({
-        name: child,
-        scope,
-        description: meta.description,
-        path: skillFile,
+        name: s.name,
+        scope: "user",
+        description: s.description,
+        path: path.join(skillsDir, s.name, "SKILL.md"),
       });
     }
   }
   return out.sort((a, b) => a.name.localeCompare(b.name));
+}
+
+async function listSkillsDir(
+  dir: string,
+): Promise<Array<{ name: string; description?: string }>> {
+  let children: string[];
+  try {
+    children = await fs.readdir(dir);
+  } catch {
+    return [];
+  }
+  const out: Array<{ name: string; description?: string }> = [];
+  for (const child of children) {
+    const meta = await readMarkdownFrontmatter(
+      path.join(dir, child, "SKILL.md"),
+    );
+    if (!meta) continue;
+    out.push({ name: child, description: meta.description });
+  }
+  return out;
+}
+
+// pluginRoots walks ~/.claude/plugins/marketplaces/<repo>/<plugin>
+// directories. Each plugin can ship agents/ + skills/ subdirs that
+// the binary surfaces alongside user/project ones; we mirror that
+// behavior so /agents and /skills don't underreport against the CLI.
+async function pluginRoots(): Promise<string[]> {
+  const base = path.join(os.homedir(), ".claude", "plugins", "marketplaces");
+  let repos: string[];
+  try {
+    repos = await fs.readdir(base);
+  } catch {
+    return [];
+  }
+  const out: string[] = [];
+  for (const repo of repos) {
+    const repoDir = path.join(base, repo);
+    let plugins: string[];
+    try {
+      plugins = await fs.readdir(repoDir);
+    } catch {
+      continue;
+    }
+    for (const plugin of plugins) {
+      out.push(path.join(repoDir, plugin));
+    }
+  }
+  return out;
+}
+
+async function listPluginMarkdown(
+  subdir: "agents",
+): Promise<Array<{ name: string; description?: string; path: string }>> {
+  const out: Array<{ name: string; description?: string; path: string }> = [];
+  for (const root of await pluginRoots()) {
+    for (const m of await listMarkdown(path.join(root, subdir))) {
+      out.push(m);
+    }
+  }
+  return out;
 }
 
 interface MarkdownFile {
