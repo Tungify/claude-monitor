@@ -9,6 +9,14 @@ import type { PlanRecord } from "./plan-types";
 // SDK runtime) can use the same union.
 export type Effort = EffortLevel;
 
+// Provider chosen per session. "anthropic" hits the first-party API
+// using whatever account is active in claude-monitor. "openrouter"
+// reroutes the SDK's HTTP traffic through OpenRouter using the global
+// OR config (~/.claude-monitor/config.json) — same SDK, same MCPs,
+// just a different model on the other end. Defaults to "anthropic"
+// when omitted.
+export type SessionProvider = "anthropic" | "openrouter";
+
 // PermissionMode mirrors the SDK PermissionMode union but is duplicated
 // here so client modules (which can only import types from the SDK)
 // have a runtime-safe value. Keep in sync with the SDK upstream.
@@ -78,6 +86,8 @@ export interface SessionSummary {
   // Selected at session creation; UI surfaces them in the composer.
   model?: string;
   effort?: Effort;
+  // Routing target for SDK HTTP traffic. Omitted → "anthropic".
+  provider?: SessionProvider;
   // Active permission mode. Drives auto-allow behavior server-side
   // and the mode chip in the composer toolbar client-side.
   permission_mode?: PermissionMode;
@@ -298,6 +308,11 @@ export interface CreateSessionRequest {
   account_name?: string;
   model?: string;
   effort?: Effort;
+  // When set to "openrouter" the spawn injects ANTHROPIC_BASE_URL +
+  // ANTHROPIC_AUTH_TOKEN from the saved OR config so all SDK traffic
+  // routes through OpenRouter. account_name is then effectively
+  // ignored — OR auth replaces the account's Anthropic credentials.
+  provider?: SessionProvider;
   // Active permission mode. Drives auto-allow behavior server-side
   // and the mode chip in the composer toolbar client-side.
   permission_mode?: PermissionMode;

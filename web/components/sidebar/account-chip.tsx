@@ -1,11 +1,12 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { ChevronUp, Globe2, Users } from "lucide-react";
+import { ChevronUp, Globe2, Router, Users } from "lucide-react";
 import { useDaemonContext } from "@/lib/daemon-context";
 import { Progress } from "@/components/ui/progress";
 import { AccountsDialog } from "@/components/accounts-dialog";
 import { NetworkDialog } from "@/components/network-dialog";
+import { OpenRouterDialog } from "@/components/openrouter-dialog";
 import { useSidebar } from "@/lib/sidebar-context";
 
 // AccountChip lives at the sidebar bottom. Tapping pops a small menu
@@ -24,6 +25,7 @@ export function AccountChip() {
   const [menuOpen, setMenuOpen] = useState(false);
   const [accountsOpen, setAccountsOpen] = useState(false);
   const [networkOpen, setNetworkOpen] = useState(false);
+  const [openRouterOpen, setOpenRouterOpen] = useState(false);
   const wrapperRef = useRef<HTMLDivElement>(null);
   const { setOpen: setSidebarOpen, isMobile } = useSidebar();
 
@@ -52,10 +54,11 @@ export function AccountChip() {
     };
   }, [menuOpen]);
 
-  const openDialog = (which: "accounts" | "network") => {
+  const openDialog = (which: "accounts" | "network" | "openrouter") => {
     setMenuOpen(false);
     if (which === "accounts") setAccountsOpen(true);
-    else setNetworkOpen(true);
+    else if (which === "network") setNetworkOpen(true);
+    else setOpenRouterOpen(true);
     // Mobile: dismiss the drawer when the user picks a setting so the
     // dialog isn't fighting the sidebar for screen space.
     if (isMobile) setSidebarOpen(false);
@@ -136,6 +139,12 @@ export function AccountChip() {
               onClick={() => openDialog("accounts")}
             />
             <MenuItem
+              icon={<Router className="size-4" aria-hidden />}
+              label="OpenRouter"
+              description="Route sessions through OpenRouter to swap models"
+              onClick={() => openDialog("openrouter")}
+            />
+            <MenuItem
               icon={<Globe2 className="size-4" aria-hidden />}
               label="Network access"
               description="Expose to LAN or via Cloudflare tunnel"
@@ -146,6 +155,10 @@ export function AccountChip() {
       </div>
       <AccountsDialog open={accountsOpen} onOpenChange={setAccountsOpen} />
       <NetworkDialog open={networkOpen} onOpenChange={setNetworkOpen} />
+      <OpenRouterDialog
+        open={openRouterOpen}
+        onOpenChange={setOpenRouterOpen}
+      />
     </>
   );
 }

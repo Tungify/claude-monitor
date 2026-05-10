@@ -2,6 +2,8 @@ import "server-only";
 
 import { EventEmitter } from "node:events";
 import { randomUUID } from "node:crypto";
+import { promises as fs } from "node:fs";
+import path from "node:path";
 import {
   query,
   type CanUseTool,
@@ -59,11 +61,21 @@ import type {
   PermissionMode,
   PermissionRequest,
   RateLimitInfo,
+  SessionProvider,
   SessionSnapshot,
   SessionStatus,
   SessionSummary,
   SessionUsage,
 } from "@/lib/chat-types";
+import { loadOpenRouterConfigSync, openRouterEnv } from "./openrouter-config";
+import {
+  listSnapshots as fhListSnapshots,
+  pathsForTool as fhPathsForTool,
+  restoreCode as fhRestoreCode,
+  trackEdit as fhTrackEdit,
+  type FileSnapshot,
+  type RestoreFileAction,
+} from "./file-history";
 import type { PlanRecord } from "@/lib/plan-types";
 import { deriveSubagents } from "@/lib/subagents";
 
@@ -95,6 +107,7 @@ interface ChatSession {
   createdAt: Date;
   model?: string;
   effort?: EffortLevel;
+  provider?: SessionProvider;
   permissionMode: PermissionMode;
   // Set when this session is a phase executor (spawned from plan approve).
   // Sidebar uses these to group phase sessions under their owning plan;
@@ -162,6 +175,7 @@ interface InterruptedSession {
   createdAt: Date;
   model?: string;
   effort?: EffortLevel;
+  provider?: SessionProvider;
   permissionMode: PermissionMode;
   history: SDKMessage[];
   latestUsage?: SessionUsage;
@@ -227,6 +241,7 @@ async function initFromDisk(): Promise<void> {
         createdAt: new Date(s.created_at),
         model: s.model,
         effort: s.effort,
+        provider: s.provider,
         permissionMode: s.permission_mode,
         history: s.history,
         latestUsage: s.latest_usage,
@@ -357,6 +372,7 @@ async function persistNow(id: string): Promise<void> {
       created_at: s.createdAt.toISOString(),
       model: s.model,
       effort: s.effort,
+      provider: s.provider,
       permission_mode: s.permissionMode,
       history: s.history,
       latest_usage: s.latestUsage,
@@ -409,6 +425,7 @@ function summarize(session: ChatSession): SessionSummary {
     title: firstUserText(session.history),
     model: session.model,
     effort: session.effort,
+    provider: session.provider,
     permission_mode: session.permissionMode,
     usage: session.latestUsage,
     context_usage: session.latestContextUsage,
@@ -622,6 +639,21 @@ function firstUserText(history: SDKMessage[]): string | undefined {
   return undefined;
 }
 
+// latestUserMessageId scans history for the most recent user message
+// uuid. Used by the file-history hook in canUseTool so each snapshot
+// is tagged with its parent user turn — the /rewind picker groups
+// snapshots by parent so a single user message that drove ten Edits
+// shows up as one restore point.
+function latestUserMessageId(s: ChatSession): string | undefined {
+  for (let i = s.history.length - 1; i >= 0; i--) {
+    const m = s.history[i];
+    if (m.type === "user") {
+      return (m as { uuid?: string }).uuid;
+    }
+  }
+  return undefined;
+}
+
 // makeCanUseTool returns a CanUseTool callback bound to the given
 // session. Factored out so createSession (fresh) and resumeSession
 // (reanimated from disk) share one implementation — both need the
@@ -707,6 +739,21 @@ function makeCanUseTool(session: ChatSession): CanUseTool {
           },
           { once: true },
         );
+      });
+    }
+    // Snapshot file-mutating tool inputs BEFORE the permission gate so
+    // /rewind has something to restore from even when the user
+    // approves on auto. We fire-and-forget the trackEdit call so the
+    // permission flow isn't blocked on disk I/O — a failed snapshot
+    // surfaces in the server log but doesn't deny the tool.
+    const fhPaths = fhPathsForTool(toolName, input, session.cwd);
+    if (fhPaths.length > 0) {
+      void fhTrackEdit({
+        sessionId: session.id,
+        parentMessageId: latestUserMessageId(session),
+        toolName,
+        toolUseId: ctx.toolUseID,
+        paths: fhPaths,
       });
     }
     // Short-circuit if a previous "Always allow" already covered this
@@ -852,6 +899,7 @@ interface BuildLiveInit {
   createdAt: Date;
   model?: string;
   effort?: EffortLevel;
+  provider?: SessionProvider;
   permissionMode: PermissionMode;
   history: SDKMessage[];
   latestUsage?: SessionUsage;
@@ -889,6 +937,7 @@ function buildLiveSession(init: BuildLiveInit): ChatSession {
     createdAt: init.createdAt,
     model: init.model,
     effort: init.effort,
+    provider: init.provider,
     permissionMode: init.permissionMode,
     planId: init.planId,
     phaseSlug: init.phaseSlug,
@@ -907,6 +956,21 @@ function buildLiveSession(init: BuildLiveInit): ChatSession {
     query: undefined as unknown as Query, // assigned below
   };
 
+  attachSDKQuery(session, init.isResume);
+
+  sessions.set(init.id, session);
+  void driveSession(session);
+  return session;
+}
+
+// attachSDKQuery wires a fresh SDK Query onto an existing ChatSession.
+// Reads provider/model/effort/cwd/configDir straight off the session
+// so it can be reused for both initial spawn (buildLiveSession) and
+// in-place respawn (provider switch via updateSessionOptions). The
+// caller is responsible for ensuring session.inputQueue and
+// session.abortController are fresh — leftover references from a
+// previous spawn would have already been aborted/closed.
+function attachSDKQuery(session: ChatSession, isResume: boolean): void {
   // SDK locates a native binary via optional deps; if those got
   // skipped during install we end up throwing "Native CLI binary
   // for darwin-arm64 not found" at first iteration. findClaudeBinary
@@ -914,11 +978,32 @@ function buildLiveSession(init: BuildLiveInit): ChatSession {
   // there really is none, in which case the SDK's own error wins).
   const claudeBin = findClaudeBinary();
 
+  // Provider routing. For OpenRouter, layer ANTHROPIC_BASE_URL +
+  // ANTHROPIC_AUTH_TOKEN onto the env so the SDK's HTTP traffic goes
+  // to OR instead of Anthropic. Falls back to native if the user
+  // selected OR but the global config was wiped — better to spawn
+  // against the active Anthropic account than to refuse outright,
+  // and the missing env block surfaces in the very next API call as
+  // a normal Anthropic auth response the user can read.
+  const orConfig =
+    session.provider === "openrouter" ? loadOpenRouterConfigSync() : undefined;
+  // Pass the session's chosen model so OR's tier env vars resolve to
+  // the user's pick. Without this the env block falls back to
+  // config.default_model — fine for the binary's tier requests, but
+  // the SDK's `model:` option overrides anyway, so the env vars matter
+  // only for whichever request goes through the binary's tier-naming
+  // path (rare but real).
+  const providerEnv = orConfig ? openRouterEnv(orConfig, session.model) : {};
+
   session.query = query({
-    prompt: inputQueue,
+    prompt: session.inputQueue,
     options: {
-      cwd: init.cwd,
-      env: { ...process.env, CLAUDE_CONFIG_DIR: init.configDir },
+      cwd: session.cwd,
+      env: {
+        ...process.env,
+        CLAUDE_CONFIG_DIR: session.configDir,
+        ...providerEnv,
+      },
       ...(claudeBin ? { pathToClaudeCodeExecutable: claudeBin } : {}),
       // Without this, the Agent SDK uses an empty/agent-flavored system
       // prompt and the session loses Claude Code's tone guidelines,
@@ -934,9 +1019,9 @@ function buildLiveSession(init: BuildLiveInit): ChatSession {
       systemPrompt: {
         type: "preset",
         preset: "claude_code",
-        ...(init.phaseSlug ? {} : { append: OWNER_TRIAGE_APPEND }),
+        ...(session.phaseSlug ? {} : { append: OWNER_TRIAGE_APPEND }),
       },
-      permissionMode: init.permissionMode,
+      permissionMode: session.permissionMode,
       // bypassPermissions ("Auto / Yolo" in the UI) requires the
       // session to be launched with this opt-in. Without it the SDK
       // refuses both the initial config and any later
@@ -962,24 +1047,58 @@ function buildLiveSession(init: BuildLiveInit): ChatSession {
           ? {}
           : { [LEADER_MCP_SERVER_NAME]: makeLeaderMcp(session) }),
       },
-      abortController,
+      abortController: session.abortController,
       // Resume vs fresh: `resume` loads the session's transcript via
       // claude's own jsonl on disk; `sessionId` opens a fresh session
       // file with that id. The two are mutually exclusive in the SDK.
-      ...(init.isResume ? { resume: init.id } : { sessionId: init.id }),
+      ...(isResume ? { resume: session.id } : { sessionId: session.id }),
       // Stream Anthropic content_block_delta events through as
       // SDKPartialAssistantMessage (type: "stream_event"). Note: when
       // extended thinking is on (effort high/xhigh/max), the SDK
       // suppresses these and only ships the final assistant message.
       includePartialMessages: true,
-      ...(init.model ? { model: init.model } : {}),
-      ...(init.effort ? { effort: init.effort } : {}),
+      ...(session.model ? { model: session.model } : {}),
+      ...(session.effort ? { effort: session.effort } : {}),
     },
   });
+}
 
-  sessions.set(init.id, session);
+// respawnQuery tears down the running SDK Query for a live session and
+// stands up a fresh one against the session's CURRENT provider/model
+// fields. Used by updateSessionOptions when the provider switches —
+// the env vars that route traffic to OR vs Anthropic are baked into
+// the spawned binary's process env, so a flip needs a full respawn.
+//
+// Preserves the ChatSession identity (and its emitter, recentRequestIds,
+// alwaysAllowRules, history). SSE subscribers stay attached. The OLD
+// driveSession loop's terminal branches compare session.query to the
+// instance they were started with; mismatch (which we cause here by
+// reassigning) makes them swallow the closed/errored flips instead of
+// killing the session.
+function respawnQuery(session: ChatSession): void {
+  try {
+    session.abortController.abort();
+  } catch {
+    // already-aborted controllers throw — swallow.
+  }
+  try {
+    session.inputQueue.end();
+  } catch {
+    // already-ended queue — swallow.
+  }
+  try {
+    session.query.close();
+  } catch {
+    // close() can throw on an already-closed query — ignore.
+  }
+  session.inputQueue = new AsyncQueue<SDKUserMessage>();
+  session.abortController = new AbortController();
+  // Resume from the on-disk jsonl so the new binary picks up the
+  // conversation where the previous one left off — the user
+  // shouldn't lose context just because they swapped providers.
+  attachSDKQuery(session, true);
+  setStatus(session, "starting");
   void driveSession(session);
-  return session;
 }
 
 export function createSession(opts: {
@@ -988,6 +1107,7 @@ export function createSession(opts: {
   accountName?: string;
   model?: string;
   effort?: EffortLevel;
+  provider?: SessionProvider;
   permissionMode?: PermissionMode;
   planId?: string;
   phaseSlug?: string;
@@ -1001,6 +1121,7 @@ export function createSession(opts: {
     createdAt: new Date(),
     model: opts.model,
     effort: opts.effort,
+    provider: opts.provider,
     permissionMode: opts.permissionMode ?? "default",
     planId: opts.planId,
     phaseSlug: opts.phaseSlug,
@@ -1064,6 +1185,7 @@ function resumeSession(stored: InterruptedSession): ChatSession {
     createdAt: stored.createdAt,
     model: stored.model,
     effort: stored.effort,
+    provider: stored.provider,
     permissionMode: stored.permissionMode,
     planId: stored.planId,
     phaseSlug: stored.phaseSlug,
@@ -1093,6 +1215,14 @@ function getOrResume(id: string): ChatSession | undefined {
 }
 
 async function driveSession(session: ChatSession): Promise<void> {
+  // Capture the SDK Query we were started against. respawnQuery
+  // (provider switch) tears this query down and assigns a new one to
+  // session.query, then kicks off a fresh driveSession for it. When
+  // the abort propagates through the OLD iterator and lands us in the
+  // terminal branches below, we compare against this captured ref to
+  // tell "real shutdown" from "stale instance after respawn" — the
+  // latter must not flip status to closed/errored.
+  const ownQuery = session.query;
   try {
     // The SDK Query iterator is constructed synchronously in
     // buildLiveSession but only starts producing messages once a user
@@ -1105,7 +1235,7 @@ async function driveSession(session: ChatSession): Promise<void> {
     if (session.status === "starting") {
       setStatus(session, "idle");
     }
-    for await (const msg of session.query) {
+    for await (const msg of ownQuery) {
       // stream_event messages are token deltas — we push them through
       // SSE so live clients can render incremental text, but we do NOT
       // persist them in `history`. Replay on reconnect would bloat the
@@ -1173,9 +1303,19 @@ async function driveSession(session: ChatSession): Promise<void> {
         setStatus(session, "thinking");
       }
     }
+    if (session.query !== ownQuery) {
+      // Provider switch tore down our query and started a fresh
+      // driveSession on a new one — leave the session alive.
+      return;
+    }
     setStatus(session, "closed");
     emit(session, { type: "closed", data: {} });
   } catch (err) {
+    if (session.query !== ownQuery) {
+      // Same logic as the natural-end branch: an abort during a
+      // provider switch must not surface as a session error.
+      return;
+    }
     setStatus(session, "errored");
     emit(session, {
       type: "error",
@@ -1205,6 +1345,7 @@ function summarizeInterrupted(s: InterruptedSession): SessionSummary {
     title: firstUserText(s.history),
     model: s.model,
     effort: s.effort,
+    provider: s.provider,
     permission_mode: s.permissionMode,
     usage: s.latestUsage,
     context_usage: s.latestContextUsage,
@@ -1533,14 +1674,42 @@ export function cancelAskUserQuestion(
 // Auto-resumes an interrupted session: the user changing model on a
 // chat they reopened after a restart should "just work" rather than
 // throw "session not found".
+//
+// Provider switch (anthropic ↔ openrouter) needs a respawn — the SDK
+// reads ANTHROPIC_BASE_URL/AUTH_TOKEN from the spawned binary's env,
+// which is baked in at query() construction. We tear down the running
+// query, rebuild on the same ChatSession object, and resume the
+// transcript from disk — emitter / history / SSE subscribers stay
+// pointed at the same session so the user doesn't notice the
+// reconnect except for a brief "starting" flicker.
 export async function updateSessionOptions(
   sessionId: string,
-  opts: { model?: string; effort?: EffortLevel; permissionMode?: PermissionMode },
+  opts: {
+    model?: string;
+    effort?: EffortLevel;
+    permissionMode?: PermissionMode;
+    provider?: SessionProvider;
+  },
 ): Promise<SessionSummary> {
   const s = getOrResume(sessionId);
   if (!s) throw new Error("session not found");
   if (s.status === "closed" || s.status === "errored") {
     throw new Error(`session is ${s.status}`);
+  }
+  // Provider change first — it respawns the SDK Query, after which the
+  // new query takes the rest of the patch (model/effort/permissionMode)
+  // straight via attachSDKQuery's options. Subsequent setModel /
+  // applyFlagSettings calls would race the still-spawning binary; we
+  // skip them when we already respawned with the right settings.
+  const providerChanged = opts.provider && opts.provider !== s.provider;
+  if (providerChanged) {
+    if (opts.model) s.model = opts.model;
+    if (opts.effort) s.effort = opts.effort;
+    if (opts.permissionMode) s.permissionMode = opts.permissionMode;
+    s.provider = opts.provider;
+    respawnQuery(s);
+    schedulePersist(s.id);
+    return summarize(s);
   }
   if (opts.model && opts.model !== s.model) {
     await s.query.setModel(opts.model);
@@ -1570,6 +1739,122 @@ export async function updateSessionOptions(
     s.permissionMode = opts.permissionMode;
   }
   return summarize(s);
+}
+
+// listFileSnapshots is the public read API for /rewind. Returns the
+// raw FileSnapshot list — the route handler shapes it into a UI
+// payload (groups by parentMessageId, joins with history excerpts).
+export async function listFileSnapshots(
+  sessionId: string,
+): Promise<FileSnapshot[]> {
+  return fhListSnapshots(sessionId);
+}
+
+// rewindSession performs the actual restore. Takes a snapshot id and a
+// mode that selects which surfaces get rolled back:
+//   - "code"        — only files; conversation untouched
+//   - "conversation"— only history + transcript jsonl; on-disk files
+//                     untouched
+//   - "both"        — code + conversation
+// Returns the actions taken on each surface so the route can shape a
+// response the user can scan ("restored 3 files, truncated 8 messages").
+export interface RewindResult {
+  files?: RestoreFileAction[];
+  // For conversation rewinds: the index in the new (truncated)
+  // history that was kept as the last entry. Lets the UI hint the
+  // user "you're now at message #N".
+  truncatedFromIndex?: number;
+}
+
+export async function rewindSession(
+  sessionId: string,
+  opts: { snapshotId: string; mode: "code" | "conversation" | "both" },
+): Promise<RewindResult> {
+  const s = getOrResume(sessionId);
+  if (!s) throw new Error("session not found");
+  const snapshots = await fhListSnapshots(sessionId);
+  const target = snapshots.find((sn) => sn.id === opts.snapshotId);
+  if (!target) throw new Error("snapshot not found");
+
+  const result: RewindResult = {};
+  if (opts.mode === "code" || opts.mode === "both") {
+    result.files = await fhRestoreCode(sessionId, opts.snapshotId);
+  }
+  if (opts.mode === "conversation" || opts.mode === "both") {
+    // Conversation rewind: stop the live query, slice the in-memory
+    // history at the parent user message, persist the trimmed view,
+    // and re-resume so the SDK reads the truncated transcript on next
+    // turn. Without the abort the running query would keep streaming
+    // into stale history slots.
+    const cutId = target.parentMessageId;
+    if (!cutId) {
+      throw new Error(
+        "snapshot has no parentMessageId — conversation rewind unavailable",
+      );
+    }
+    const cutIdx = s.history.findIndex(
+      (m) => m.type === "user" && (m as { uuid?: string }).uuid === cutId,
+    );
+    if (cutIdx < 0) {
+      throw new Error("parent user message no longer in history");
+    }
+    // Drop everything strictly AFTER the parent user message —
+    // including the parent itself's tool_use/result chain — so the
+    // session reads as "user turn submitted, no response yet".
+    s.history = s.history.slice(0, cutIdx + 1);
+    result.truncatedFromIndex = cutIdx;
+
+    try {
+      s.abortController.abort();
+      s.inputQueue.end();
+      try {
+        s.query.close();
+      } catch {
+        // close() can throw on an already-closed query — ignore.
+      }
+    } catch (err) {
+      console.warn("[rewind] abort failed:", err);
+    }
+    sessions.delete(sessionId);
+
+    // Rewrite the on-disk transcript to match the trimmed history.
+    // The SDK's `resume` reads this file on the next spawn, and any
+    // entries past the cut would re-introduce the very state we
+    // just rewound away from.
+    await rewriteTranscript(s);
+    schedulePersist(sessionId);
+  }
+  return result;
+}
+
+// rewriteTranscript flushes the session's current in-memory history to
+// the SDK transcript jsonl so a subsequent `resume` reads the same
+// view. Touches Claude's project storage at
+// ~/.claude/projects/<projectDir>/<sessionId>.jsonl — the same file
+// the binary itself appends to during a live session.
+async function rewriteTranscript(s: ChatSession): Promise<void> {
+  // The CLI hashes cwd to derive projectDir. We mirror that with the
+  // same convention the binary uses: replace `/` with `-` and prefix
+  // with `-` (matches `~/.claude/projects/<-Users-tungngo-...>/<id>.jsonl`).
+  const projectDir = s.cwd.replace(/\//g, "-");
+  const file = path.join(
+    s.configDir,
+    "projects",
+    projectDir,
+    `${s.id}.jsonl`,
+  );
+  try {
+    await fs.mkdir(path.dirname(file), { recursive: true });
+    const lines = s.history.map((m) => JSON.stringify(m));
+    const tmp = `${file}.tmp`;
+    await fs.writeFile(tmp, lines.join("\n") + (lines.length > 0 ? "\n" : ""));
+    await fs.rename(tmp, file);
+  } catch (err) {
+    console.warn("[rewind] transcript rewrite failed:", err);
+    // The user still gets the in-memory rewind; the next resume may
+    // re-introduce trimmed messages. Visible enough to surface in the
+    // server log without crashing the operation.
+  }
 }
 
 export async function stopSession(sessionId: string): Promise<void> {

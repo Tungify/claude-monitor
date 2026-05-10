@@ -4,7 +4,7 @@ import {
   stopSession,
   updateSessionOptions,
 } from "@/lib/server/sessions";
-import type { Effort, PermissionMode } from "@/lib/chat-types";
+import type { Effort, PermissionMode, SessionProvider } from "@/lib/chat-types";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -26,14 +26,20 @@ interface PatchBody {
   model?: string;
   effort?: Effort;
   permission_mode?: PermissionMode;
+  // Provider switch (anthropic ↔ openrouter). Triggers a full SDK
+  // Query respawn server-side because the env vars that route traffic
+  // are baked into the spawned binary's process env. Passed alongside
+  // a model id when the user picks an OR favorite from a session that
+  // was started against Anthropic (or vice versa).
+  provider?: SessionProvider;
 }
 
 export async function PATCH(req: Request, { params }: Ctx) {
   const { id } = await params;
   const body = (await req.json().catch(() => ({}))) as PatchBody;
-  if (!body.model && !body.effort && !body.permission_mode) {
+  if (!body.model && !body.effort && !body.permission_mode && !body.provider) {
     return NextResponse.json(
-      { error: "model, effort, or permission_mode required" },
+      { error: "model, effort, permission_mode, or provider required" },
       { status: 400 },
     );
   }
@@ -42,6 +48,7 @@ export async function PATCH(req: Request, { params }: Ctx) {
       model: body.model,
       effort: body.effort,
       permissionMode: body.permission_mode,
+      provider: body.provider,
     });
     return NextResponse.json(summary);
   } catch (err) {

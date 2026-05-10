@@ -10,6 +10,7 @@ import type {
   ContextUsageBreakdown,
   PermissionMode,
   RateLimitInfo,
+  SessionProvider,
   SessionUsage,
 } from "@/lib/chat-types";
 import type { PlanRecord } from "@/lib/plan-types";
@@ -30,6 +31,9 @@ export interface StoredSession {
   created_at: string;
   model?: string;
   effort?: EffortLevel;
+  // Persisted so a daemon restart resumes the session against the
+  // same provider. Omitted entries default to "anthropic" on load.
+  provider?: SessionProvider;
   permission_mode: PermissionMode;
   // Capped per HISTORY_CAP in sessions.ts; safe to dump verbatim.
   history: SDKMessage[];

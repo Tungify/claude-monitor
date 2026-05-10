@@ -21,6 +21,7 @@ import type {
   AskUserQuestionRequest,
   Effort,
   PermissionMode,
+  SessionProvider,
   SessionSummary,
   SessionUsage,
   StreamingBlock,
@@ -39,6 +40,7 @@ import { ThinkingIndicator } from "./thinking-indicator";
 import { QueueIndicator, computeQueuedMessages } from "./queue-indicator";
 import { PermissionDialog } from "./permission-dialog";
 import { PlanCard } from "./plan-card";
+import { RewindPicker } from "./rewind-picker";
 import { AskQuestionCard } from "./ask-question-card";
 import { ToolRunCard } from "./tool-run-card";
 import { SubagentProvider } from "./subagent-context";
@@ -170,6 +172,11 @@ export function ChatPanel({ session }: Props) {
   const router = useRouter();
   const [effort, setEffort] = useState<Effort>(session.effort ?? DEFAULT_EFFORT);
   const [model, setModel] = useState<string>(session.model ?? "");
+  // Tracks the running session's active provider so the picker chip
+  // recolors when the user swaps providers mid-chat. Initialised from
+  // the session summary; updated optimistically inside patchOptions
+  // when a provider switch is in flight.
+  const [activeProvider, setActiveProvider] = useState(session.provider);
   // permission_mode is one of the only session knobs whose default
   // hasn't always existed on disk — coerce to "default" when the
   // server returned a session without it.
@@ -177,6 +184,70 @@ export function ChatPanel({ session }: Props) {
     (session.permission_mode as PermissionMode | undefined) ?? "default",
   );
   const [commandLog, setCommandLog] = useState<CommandLog[]>([]);
+  // /rewind opens the file-history picker. Boolean rather than
+  // payload because the picker fetches snapshots itself — keeping the
+  // open state minimal here lets the picker re-fetch each time the
+  // user re-opens it (history grows mid-session).
+  const [rewindOpen, setRewindOpen] = useState(false);
+  // OR favorites list for the composer's model chip. Only fetched when
+  // this session is OR-routed; native sessions skip the request. Picker
+  // selections call patchOptions({model}) which goes through the SDK's
+  // setModel — the binary then carries that id verbatim to OR on the
+  // next request. Refreshed once on mount; opening the OR settings
+  // dialog from the sidebar would write but this component re-mounts
+  // when the user re-enters the chat, so a single fetch is enough.
+  const [orModels, setOrModels] = useState<string[]>([]);
+  useEffect(() => {
+    if (session.provider !== "openrouter") return;
+    let cancelled = false;
+    void (async () => {
+      try {
+        const res = await fetch("/api/openrouter");
+        if (!res.ok || cancelled) return;
+        const data = (await res.json()) as { models: string[] };
+        if (!cancelled) setOrModels(data.models);
+      } catch {
+        // chip falls back to "(no models saved)" silently
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [session.provider]);
+
+  // Legacy OR sessions stored `session.model` as a Claude tier anchor
+  // (e.g. "claude-opus-4-7") rather than the actual OR id, because the
+  // earlier tier-mapping flow used those anchors to pick the right
+  // ANTHROPIC_DEFAULT_*_MODEL env var. The composer chip then has
+  // nothing to match against the favorites list and reads as "(no
+  // models saved)".
+  //
+  // Recover the real id from the SDK's reported `assistant.message.model`
+  // — that's whatever OR resolved the request to and matches the
+  // favorites list. Sync once when the model first arrives in history;
+  // after that the user's setModel calls take over.
+  useEffect(() => {
+    if (session.provider !== "openrouter") return;
+    if (model.includes("/")) return; // already an OR id
+    const reported = latestAssistantModel(chat.history);
+    if (!reported || reported === model) return;
+    // queueMicrotask defers the setter past the current render so
+    // React 19's set-state-in-effect lint stays quiet — the setter
+    // running one microtask later is imperceptible on screen.
+    let cancelled = false;
+    queueMicrotask(() => {
+      if (cancelled) return;
+      setModel(reported);
+    });
+    return () => {
+      cancelled = true;
+    };
+    // Don't depend on `model` so the sync only fires until the
+    // displayed value catches up; a user-initiated patchOptions
+    // afterwards will set model to a new OR id with "/", which
+    // satisfies the early return above.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [session.provider, chat.history]);
   const virtuosoRef = useRef<VirtuosoHandle>(null);
   // Track viewport position so we can show a "scroll to latest" button
   // when the user has read-up. Virtuoso fires atBottomStateChange when
@@ -214,19 +285,21 @@ export function ChatPanel({ session }: Props) {
     ]);
   };
 
-  // PATCH the running session with new model/effort. Optimistic update
-  // first so the picker chip reflects the choice immediately; if the
-  // server rejects (e.g. session already closed), we revert and surface
-  // the error in the chat panel's error list.
+  // PATCH the running session with new model/effort/provider. Optimistic
+  // update first so the picker chip reflects the choice immediately; if
+  // the server rejects (e.g. session already closed), we revert and
+  // surface the error in the chat panel's error list.
   const patchOptions = async (patch: {
     model?: string;
     effort?: Effort;
     permission_mode?: PermissionMode;
+    provider?: SessionProvider;
   }) => {
-    const prev = { model, effort, permissionMode };
+    const prev = { model, effort, permissionMode, provider: activeProvider };
     if (patch.model) setModel(patch.model);
     if (patch.effort) setEffort(patch.effort);
     if (patch.permission_mode) setPermissionMode(patch.permission_mode);
+    if (patch.provider) setActiveProvider(patch.provider);
     try {
       const res = await fetch(`/api/chat/${session.id}`, {
         method: "PATCH",
@@ -238,6 +311,7 @@ export function ChatPanel({ session }: Props) {
       setModel(prev.model);
       setEffort(prev.effort);
       setPermissionMode(prev.permissionMode);
+      setActiveProvider(prev.provider);
     }
   };
 
@@ -507,6 +581,7 @@ export function ChatPanel({ session }: Props) {
         appendOutput,
         patchOptions,
         router,
+        openRewind: () => setRewindOpen(true),
       });
       return;
     }
@@ -674,9 +749,34 @@ export function ChatPanel({ session }: Props) {
               mode="session"
               cwd={session.cwd}
               model={model}
-              onModelChange={(id) => void patchOptions({ model: id })}
+              onModelChange={(id) => {
+                // Picking a model from the OTHER provider triggers a
+                // session respawn server-side (env vars route Anthropic
+                // ↔ OpenRouter and are baked in at SDK spawn time). We
+                // infer the target provider from the id shape here so
+                // the user doesn't need a separate toggle: vendor-
+                // prefixed ids (or anything saved as an OR favorite)
+                // route through OR, anything else stays native.
+                const nextProvider: SessionProvider =
+                  orModels.includes(id) || id.includes("/")
+                    ? "openrouter"
+                    : "anthropic";
+                // Treat an unset activeProvider as "anthropic" — older
+                // sessions persisted before this field existed don't
+                // need a respawn just because we're now naming the
+                // implicit default.
+                const currentProvider: SessionProvider =
+                  activeProvider ?? "anthropic";
+                const patch: Parameters<typeof patchOptions>[0] = { model: id };
+                if (nextProvider !== currentProvider) {
+                  patch.provider = nextProvider;
+                }
+                void patchOptions(patch);
+              }}
               effort={effort}
               onEffortChange={(e) => void patchOptions({ effort: e })}
+              activeProvider={activeProvider}
+              orModels={orModels}
               permMode={permissionMode}
               onPermModeChange={(m) => patchOptions({ permission_mode: m })}
               onSubmit={onSubmit}
@@ -698,6 +798,35 @@ export function ChatPanel({ session }: Props) {
         </footer>
 
         <PermissionDialog request={chat.pendingPermission} onDecide={chat.decide} />
+        <RewindPicker
+          open={rewindOpen}
+          onOpenChange={setRewindOpen}
+          sessionId={session.id}
+          history={chat.history}
+          onRewound={({ mode }) => {
+            // Conversation rewinds abort the live query; the next user
+            // turn will re-resume against the truncated transcript.
+            // SSE re-subscribes on the next render anyway, so we don't
+            // need to do anything imperative here besides letting the
+            // user know what happened.
+            appendOutput({
+              echo: "/rewind",
+              tone: "success",
+              subtitle:
+                mode === "conversation"
+                  ? "Conversation restored"
+                  : mode === "code"
+                    ? "Code restored"
+                    : "Conversation + code restored",
+              body:
+                mode === "conversation"
+                  ? "Chat history truncated to the chosen point. Send a new message to continue."
+                  : mode === "code"
+                    ? "Working tree rolled back to the pre-edit state for the chosen restore point."
+                    : "Both surfaces restored. Send a new message to continue.",
+            });
+          }}
+        />
       </div>
     </SubagentProvider>
   );
@@ -826,6 +955,27 @@ function shortenCwd(cwd: string): string {
   return `${head}/…/${tail}`;
 }
 
+// latestAssistantModel returns the model id reported by the SDK on the
+// most recent top-level assistant message. Used to recover the real
+// served model on legacy OR sessions whose stored `session.model` is
+// a Claude tier anchor rather than an OR id. Subagent assistants
+// (parent_tool_use_id set) run on their own model and don't override
+// the main session's display.
+function latestAssistantModel(
+  history: ReturnType<typeof useChatSession>["history"],
+): string | undefined {
+  for (let i = history.length - 1; i >= 0; i--) {
+    const m = history[i];
+    if (m.type !== "assistant") continue;
+    const parent = (m as { parent_tool_use_id?: string | null })
+      .parent_tool_use_id;
+    if (parent) continue;
+    const reported = (m as { message?: { model?: string } }).message?.model;
+    if (typeof reported === "string" && reported.length > 0) return reported;
+  }
+  return undefined;
+}
+
 function latestUsage(
   history: ReturnType<typeof useChatSession>["history"],
 ): SessionUsage | undefined {
@@ -888,6 +1038,9 @@ interface ChatCommandContext {
   appendOutput: (output: CommandOutput) => void;
   patchOptions: (patch: { model?: string; effort?: Effort }) => Promise<void>;
   router: ReturnType<typeof useRouter>;
+  // Opens the file-history picker overlay. Wired by the /rewind
+  // handler; the picker manages its own loading + restore POST.
+  openRewind: () => void;
 }
 
 const ALL_EFFORTS: Effort[] = ["low", "medium", "high", "xhigh", "max"];
@@ -1453,25 +1606,12 @@ async function runChatCommand(
     }
 
     case "agents": {
-      ctx.appendOutput({
-        echo: parsed.raw,
-        subtitle: "Agents",
-        body:
-          "Subagents are loaded from `~/.claude/agents/` and per-project `.claude/agents/`. " +
-          "The web orchestrator doesn't yet enumerate them — ask the agent (e.g. " +
-          "_'list available agents'_) and it will report what it can dispatch via the Skill/Task tools.",
-      });
+      await renderCliInfo(ctx, parsed, "agents");
       return;
     }
 
     case "skills": {
-      ctx.appendOutput({
-        echo: parsed.raw,
-        subtitle: "Skills",
-        body:
-          "Skills live in `~/.claude/skills/` and plugin marketplaces. " +
-          "The agent surfaces them when relevant — ask Claude to _'list skills'_ to see what's loaded for this session.",
-      });
+      await renderCliInfo(ctx, parsed, "skills");
       return;
     }
 
@@ -1494,50 +1634,22 @@ async function runChatCommand(
     }
 
     case "hooks": {
-      ctx.appendOutput({
-        echo: parsed.raw,
-        subtitle: "Hooks",
-        body:
-          "Hooks are configured in `~/.claude/settings.json` (or per-project " +
-          "`.claude/settings.json`). The web orchestrator doesn't manage hooks " +
-          "in-app — edit the settings file or use the CLI's `/hooks`.",
-      });
+      await renderCliInfo(ctx, parsed, "hooks");
       return;
     }
 
     case "mcp": {
-      ctx.appendOutput({
-        echo: parsed.raw,
-        subtitle: "MCP servers",
-        body:
-          "MCP servers are configured in `~/.claude/settings.json` and per-project. " +
-          "The submit_plan MCP is wired into every web session for plan approval. " +
-          "Ask Claude to list active MCP tools if you need a session-scoped view.",
-      });
+      await renderCliInfo(ctx, parsed, "mcp");
       return;
     }
 
     case "config": {
-      ctx.appendOutput({
-        echo: parsed.raw,
-        subtitle: "Configuration",
-        body:
-          "Config is stored in `~/.claude/settings.json` and the per-project " +
-          "`.claude/settings.json`. Account swap and limits are managed in the " +
-          "Accounts dialog (sidebar → Accounts).",
-      });
+      await renderCliInfo(ctx, parsed, "config");
       return;
     }
 
     case "permissions": {
-      ctx.appendOutput({
-        echo: parsed.raw,
-        subtitle: "Permissions",
-        body:
-          "Tool permissions are gated through the in-chat dialog (deny/allow once " +
-          "or always). Persistent rules live in `~/.claude/settings.json` under " +
-          "`permissions`. The web orchestrator doesn't expose a settings editor yet.",
-      });
+      await renderCliInfo(ctx, parsed, "permissions");
       return;
     }
 
@@ -1553,14 +1665,7 @@ async function runChatCommand(
     }
 
     case "rewind": {
-      ctx.appendOutput({
-        echo: parsed.raw,
-        tone: "warning",
-        body:
-          "`/rewind` restores file snapshots taken by the CLI before edits. The " +
-          "web orchestrator doesn't snapshot files yet, so there's nothing to " +
-          "restore. Use `git restore` or your editor's undo for now.",
-      });
+      ctx.openRewind();
       return;
     }
 
@@ -1610,6 +1715,242 @@ async function runChatCommand(
         tone: "warning",
         body: `Command \`/${parsed.command.name}\` isn't wired up yet.`,
       });
+    }
+  }
+}
+
+// renderCliInfo fetches the session's view of a CLI introspection topic
+// (mcp / agents / skills / hooks / config / permissions) and renders it
+// as a CommandOutput. Server-side does the filesystem reads against
+// the session's configDir + cwd; here we just shape the JSON into
+// markdown the chat bubble can render. Errors degrade to a tone:warning
+// notice — better than a blank bubble that looks like nothing happened.
+async function renderCliInfo(
+  ctx: ChatCommandContext,
+  parsed: ParsedCommand,
+  topic: "mcp" | "agents" | "skills" | "hooks" | "config" | "permissions",
+): Promise<void> {
+  let data: unknown;
+  try {
+    const res = await fetch(
+      `/api/chat/${ctx.session.id}/cli-info?topic=${topic}`,
+    );
+    if (!res.ok) throw new Error(`${res.status}: ${await res.text()}`);
+    data = await res.json();
+  } catch (err) {
+    ctx.appendOutput({
+      echo: parsed.raw,
+      tone: "error",
+      body: `Failed to load \`/${topic}\`: ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    });
+    return;
+  }
+
+  const echo = parsed.raw;
+  switch (topic) {
+    case "mcp": {
+      const { servers } = data as {
+        servers: Array<{
+          name: string;
+          scope: string;
+          type?: string;
+          target?: string;
+        }>;
+      };
+      // Group by scope so the output reads like the CLI's MCPListPanel:
+      // "Project · 2 servers", "User · 4 servers". We don't probe live
+      // connection status — the CLI panel does, but that needs the SDK
+      // to round-trip per server and would block the chat thread —
+      // so we surface the configuration scope as the actionable hint
+      // instead. Listed in the same scope order the CLI uses.
+      const order = ["project", "user", "enterprise", "dynamic", "claudeai"];
+      const scopes = new Map<string, typeof servers>();
+      for (const s of servers) {
+        const key = scopes.get(s.scope) ?? [];
+        key.push(s);
+        scopes.set(s.scope, key);
+      }
+      const sections: string[] = [];
+      for (const scope of order) {
+        const list = scopes.get(scope);
+        if (!list || list.length === 0) continue;
+        sections.push(`**${scope.toUpperCase()}** _(${list.length})_`);
+        for (const s of list) {
+          const type = s.type ?? "stdio";
+          const target = s.target ? ` · \`${s.target}\`` : "";
+          sections.push(`• **${s.name}** _${type}_${target}`);
+        }
+      }
+      // Anything in an unrecognised scope still surfaces below — better
+      // to show "scope=foo" than silently drop the server.
+      for (const [scope, list] of scopes) {
+        if (order.includes(scope)) continue;
+        sections.push(`**${scope.toUpperCase()}** _(${list.length})_`);
+        for (const s of list) {
+          sections.push(
+            `• **${s.name}** _${s.type ?? "stdio"}_${s.target ? ` · \`${s.target}\`` : ""}`,
+          );
+        }
+      }
+      ctx.appendOutput({
+        echo,
+        subtitle: `${servers.length} MCP server${servers.length === 1 ? "" : "s"} · ${scopes.size} scope${scopes.size === 1 ? "" : "s"}`,
+        body:
+          servers.length === 0
+            ? "_No MCP servers configured for this session._\n\n" +
+              "Configure servers in `settings.json` under `mcpServers`, in `<cwd>/.mcp.json` for a project-scoped server, or via `claude mcp add` from a terminal. " +
+              "The orchestrator's built-in plan/notes/leader tools are wired in automatically and don't show up here."
+            : sections.join("\n\n"),
+      });
+      return;
+    }
+    case "agents": {
+      const { agents } = data as {
+        agents: Array<{
+          name: string;
+          scope: string;
+          description?: string;
+        }>;
+      };
+      ctx.appendOutput({
+        echo,
+        subtitle: `${agents.length} agent${agents.length === 1 ? "" : "s"}`,
+        body:
+          agents.length === 0
+            ? "_No subagents found in `~/.claude/agents/` or `.claude/agents/`._"
+            : agents
+                .map(
+                  (a) =>
+                    `**${a.name}** _(${a.scope})_${a.description ? ` — ${a.description}` : ""}`,
+                )
+                .join("\n\n"),
+      });
+      return;
+    }
+    case "skills": {
+      const { skills } = data as {
+        skills: Array<{
+          name: string;
+          scope: string;
+          description?: string;
+        }>;
+      };
+      ctx.appendOutput({
+        echo,
+        subtitle: `${skills.length} skill${skills.length === 1 ? "" : "s"}`,
+        body:
+          skills.length === 0
+            ? "_No skills found in `~/.claude/skills/` or `.claude/skills/`._"
+            : skills
+                .map(
+                  (s) =>
+                    `**${s.name}** _(${s.scope})_${s.description ? ` — ${s.description}` : ""}`,
+                )
+                .join("\n\n"),
+      });
+      return;
+    }
+    case "hooks": {
+      const { hooks } = data as {
+        hooks: Array<{ event: string; count: number }>;
+      };
+      ctx.appendOutput({
+        echo,
+        subtitle: `${hooks.length} hook event${hooks.length === 1 ? "" : "s"}`,
+        body:
+          hooks.length === 0
+            ? "_No hooks configured in `settings.json`._\n\n" +
+              "Hooks let you run shell commands on tool events (PreToolUse, PostToolUse, Stop, etc.). " +
+              "Edit `~/.claude/settings.json` under the `hooks` key."
+            : hooks
+                .map((h) => `**${h.event}** — ${h.count} matcher${h.count === 1 ? "" : "s"}`)
+                .join("\n\n"),
+      });
+      return;
+    }
+    case "permissions": {
+      const { permissions } = data as {
+        permissions: {
+          default_mode?: string;
+          allow: string[];
+          deny: string[];
+          ask: string[];
+          additional_directories: string[];
+        };
+      };
+      const rows = [
+        {
+          label: "Default mode",
+          value: permissions.default_mode ?? "default",
+        },
+        { label: "Allow rules", value: String(permissions.allow.length) },
+        { label: "Deny rules", value: String(permissions.deny.length) },
+        { label: "Ask rules", value: String(permissions.ask.length) },
+        {
+          label: "Extra directories",
+          value: String(permissions.additional_directories.length),
+        },
+      ];
+      const sample = (label: string, list: string[]) =>
+        list.length === 0
+          ? ""
+          : `\n\n**${label}** (first 5)\n${list
+              .slice(0, 5)
+              .map((r) => `- \`${r}\``)
+              .join("\n")}`;
+      ctx.appendOutput({
+        echo,
+        subtitle: "Permission rules",
+        rows,
+        body:
+          (sample("Allow", permissions.allow) +
+            sample("Deny", permissions.deny) +
+            sample("Ask", permissions.ask)).trim() ||
+          "_No persistent rules — every tool call goes through the in-chat dialog._",
+      });
+      return;
+    }
+    case "config": {
+      const view = data as {
+        paths: {
+          user_settings: string;
+          user_local_settings: string;
+          project_settings: string;
+        };
+        loaded: { global: boolean; local: boolean };
+        summary: {
+          mcp_server_count: number;
+          hook_event_count: number;
+          permission_default_mode?: string;
+        };
+      };
+      ctx.appendOutput({
+        echo,
+        subtitle: "Configuration",
+        rows: [
+          { label: "User settings", value: view.paths.user_settings },
+          {
+            label: "User local",
+            value: `${view.paths.user_local_settings}${view.loaded.local ? "" : " _(none)_"}`,
+          },
+          { label: "Project", value: view.paths.project_settings },
+          {
+            label: "MCP servers",
+            value: String(view.summary.mcp_server_count),
+          },
+          {
+            label: "Hook events",
+            value: String(view.summary.hook_event_count),
+          },
+          {
+            label: "Default mode",
+            value: view.summary.permission_default_mode ?? "default",
+          },
+        ],
+      });
+      return;
     }
   }
 }

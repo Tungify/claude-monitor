@@ -16,6 +16,7 @@ import type {
   Attachment,
   ContextUsageBreakdown,
   Effort,
+  SessionProvider,
   SessionUsage,
 } from "@/lib/chat-types";
 import { modelById } from "@/lib/models";
@@ -44,6 +45,15 @@ interface CommonProps {
   onEffortChange: (e: Effort) => void;
   model: string;
   onModelChange: (id: string) => void;
+  // Optional metadata for the OR-aware model chip. Both must be
+  // provided together: activeProvider tells the picker which routing
+  // is in effect (so the chip recolors and lists the user's OR
+  // favorites instead of the Anthropic lineup), and orModels supplies
+  // those favorites as full OR ids. Home view fetches both; the chat
+  // session reads them off the session summary + same /api/openrouter
+  // GET.
+  activeProvider?: SessionProvider;
+  orModels?: string[];
   onSubmit: (payload: ComposerSubmit) => Promise<void> | void;
   busy?: boolean;
   disabled?: boolean;
@@ -83,6 +93,12 @@ interface HomeProps extends CommonProps {
   cwd: string;
   onCwdChange: (p: string) => void;
   recentCwds?: string[];
+  // Opens the global OR settings dialog. Wired through to the
+  // ModelEffortPicker's "Manage" link so the user can add/remove
+  // favorites without leaving the home view. Provider routing for the
+  // new session is derived from whichever model id the user picks —
+  // there's no separate provider toggle.
+  onConfigureOpenRouter: () => void;
 }
 
 interface SessionProps extends CommonProps {
@@ -489,6 +505,20 @@ export function Composer(props: Props) {
             effort={props.effort}
             onModelChange={props.onModelChange}
             onEffortChange={props.onEffortChange}
+            // Home mode leaves provider undefined → picker shows both
+            // sections; the parent infers provider from the picked id
+            // when it spawns the session. Session mode locks to the
+            // session's provider so the user can't pick a model the
+            // already-spawned binary can't reach.
+            provider={
+              props.mode === "session" ? props.activeProvider : undefined
+            }
+            orModels={props.orModels}
+            onConfigureOpenRouter={
+              props.mode === "home"
+                ? props.onConfigureOpenRouter
+                : undefined
+            }
           />
 
           <Button

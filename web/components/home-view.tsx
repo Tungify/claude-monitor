@@ -5,6 +5,7 @@ import { useRouter } from "next/navigation";
 import { X } from "lucide-react";
 import { useDaemonContext } from "@/lib/daemon-context";
 import { Composer, type ComposerSubmit } from "@/components/composer/composer";
+import { OpenRouterDialog } from "@/components/openrouter-dialog";
 import { SidebarTrigger } from "@/components/sidebar/sidebar-trigger";
 import { DEFAULT_EFFORT, DEFAULT_MODEL_ID } from "@/lib/models";
 import {
@@ -12,7 +13,11 @@ import {
   HOME_COMMANDS,
   parseSlashCommand,
 } from "@/lib/slash-commands";
-import type { Effort, PermissionMode, SessionSummary } from "@/lib/chat-types";
+import type {
+  Effort,
+  PermissionMode,
+  SessionSummary,
+} from "@/lib/chat-types";
 
 // HomeView is the empty-state landing of the workspace: a serif hero +
 // the composer. Submitting creates a session against the active account
@@ -27,8 +32,38 @@ export function HomeView() {
   const [model, setModel] = useState<string>(DEFAULT_MODEL_ID);
   const [effort, setEffort] = useState<Effort>(DEFAULT_EFFORT);
   const [mode, setMode] = useState<PermissionMode>("default");
+  const [orModels, setOrModels] = useState<string[]>([]);
   const [recentCwds, setRecentCwds] = useState<string[]>([]);
   const [helpOpen, setHelpOpen] = useState(false);
+  const [orDialogOpen, setOrDialogOpen] = useState(false);
+
+  // Always fetch the OR favorites — the unified model picker shows
+  // them inline alongside native Anthropic models, so the list has
+  // to be present whether or not the user has decided to route
+  // through OR. Re-fetched whenever the OR settings dialog closes
+  // (it's the only writer) so a fresh "Add model" appears in the
+  // picker without a page reload.
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const res = await fetch("/api/openrouter");
+        if (!res.ok || cancelled) return;
+        const data = (await res.json()) as {
+          configured: boolean;
+          has_key: boolean;
+          models: string[];
+          default_model?: string;
+        };
+        if (!cancelled) setOrModels(data.models);
+      } catch {
+        // Silent — picker just shows native models if we can't load.
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [orDialogOpen]);
 
   // Hydrate the default cwd + recent list from existing sessions on mount.
   // Keeps the picker useful without forcing the user to type a path each
@@ -79,6 +114,15 @@ export function HomeView() {
 
     if (!active) throw new Error("no active account");
     setBusy(true);
+    // Provider is derived from the picked model id: any id in the OR
+    // favorites list (or anything with a vendor "/" prefix) routes
+    // through OpenRouter; everything else is native Anthropic. There's
+    // no separate provider toggle — the unified picker is the only
+    // affordance.
+    const provider =
+      orModels.includes(model) || model.includes("/")
+        ? "openrouter"
+        : "anthropic";
     try {
       const res = await fetch("/api/chat", {
         method: "POST",
@@ -89,6 +133,7 @@ export function HomeView() {
           cwd: cwd || undefined,
           model,
           effort,
+          provider,
           permission_mode: mode,
         }),
       });
@@ -166,6 +211,8 @@ export function HomeView() {
           onModelChange={setModel}
           effort={effort}
           onEffortChange={setEffort}
+          onConfigureOpenRouter={() => setOrDialogOpen(true)}
+          orModels={orModels}
           permMode={mode}
           onPermModeChange={setMode}
           onSubmit={onSubmit}
@@ -182,6 +229,11 @@ export function HomeView() {
               : "Waiting for an active account…"
           }
           helper={helper}
+        />
+
+        <OpenRouterDialog
+          open={orDialogOpen}
+          onOpenChange={setOrDialogOpen}
         />
 
         {helpOpen && (
