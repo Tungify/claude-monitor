@@ -1453,25 +1453,12 @@ async function runChatCommand(
     }
 
     case "agents": {
-      ctx.appendOutput({
-        echo: parsed.raw,
-        subtitle: "Agents",
-        body:
-          "Subagents are loaded from `~/.claude/agents/` and per-project `.claude/agents/`. " +
-          "The web orchestrator doesn't yet enumerate them — ask the agent (e.g. " +
-          "_'list available agents'_) and it will report what it can dispatch via the Skill/Task tools.",
-      });
+      await renderCliInfo(ctx, parsed, "agents");
       return;
     }
 
     case "skills": {
-      ctx.appendOutput({
-        echo: parsed.raw,
-        subtitle: "Skills",
-        body:
-          "Skills live in `~/.claude/skills/` and plugin marketplaces. " +
-          "The agent surfaces them when relevant — ask Claude to _'list skills'_ to see what's loaded for this session.",
-      });
+      await renderCliInfo(ctx, parsed, "skills");
       return;
     }
 
@@ -1494,50 +1481,22 @@ async function runChatCommand(
     }
 
     case "hooks": {
-      ctx.appendOutput({
-        echo: parsed.raw,
-        subtitle: "Hooks",
-        body:
-          "Hooks are configured in `~/.claude/settings.json` (or per-project " +
-          "`.claude/settings.json`). The web orchestrator doesn't manage hooks " +
-          "in-app — edit the settings file or use the CLI's `/hooks`.",
-      });
+      await renderCliInfo(ctx, parsed, "hooks");
       return;
     }
 
     case "mcp": {
-      ctx.appendOutput({
-        echo: parsed.raw,
-        subtitle: "MCP servers",
-        body:
-          "MCP servers are configured in `~/.claude/settings.json` and per-project. " +
-          "The submit_plan MCP is wired into every web session for plan approval. " +
-          "Ask Claude to list active MCP tools if you need a session-scoped view.",
-      });
+      await renderCliInfo(ctx, parsed, "mcp");
       return;
     }
 
     case "config": {
-      ctx.appendOutput({
-        echo: parsed.raw,
-        subtitle: "Configuration",
-        body:
-          "Config is stored in `~/.claude/settings.json` and the per-project " +
-          "`.claude/settings.json`. Account swap and limits are managed in the " +
-          "Accounts dialog (sidebar → Accounts).",
-      });
+      await renderCliInfo(ctx, parsed, "config");
       return;
     }
 
     case "permissions": {
-      ctx.appendOutput({
-        echo: parsed.raw,
-        subtitle: "Permissions",
-        body:
-          "Tool permissions are gated through the in-chat dialog (deny/allow once " +
-          "or always). Persistent rules live in `~/.claude/settings.json` under " +
-          "`permissions`. The web orchestrator doesn't expose a settings editor yet.",
-      });
+      await renderCliInfo(ctx, parsed, "permissions");
       return;
     }
 
@@ -1610,6 +1569,212 @@ async function runChatCommand(
         tone: "warning",
         body: `Command \`/${parsed.command.name}\` isn't wired up yet.`,
       });
+    }
+  }
+}
+
+// renderCliInfo fetches the session's view of a CLI introspection topic
+// (mcp / agents / skills / hooks / config / permissions) and renders it
+// as a CommandOutput. Server-side does the filesystem reads against
+// the session's configDir + cwd; here we just shape the JSON into
+// markdown the chat bubble can render. Errors degrade to a tone:warning
+// notice — better than a blank bubble that looks like nothing happened.
+async function renderCliInfo(
+  ctx: ChatCommandContext,
+  parsed: ParsedCommand,
+  topic: "mcp" | "agents" | "skills" | "hooks" | "config" | "permissions",
+): Promise<void> {
+  let data: unknown;
+  try {
+    const res = await fetch(
+      `/api/chat/${ctx.session.id}/cli-info?topic=${topic}`,
+    );
+    if (!res.ok) throw new Error(`${res.status}: ${await res.text()}`);
+    data = await res.json();
+  } catch (err) {
+    ctx.appendOutput({
+      echo: parsed.raw,
+      tone: "error",
+      body: `Failed to load \`/${topic}\`: ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    });
+    return;
+  }
+
+  const echo = parsed.raw;
+  switch (topic) {
+    case "mcp": {
+      const { servers } = data as {
+        servers: Array<{
+          name: string;
+          scope: string;
+          type?: string;
+          target?: string;
+        }>;
+      };
+      ctx.appendOutput({
+        echo,
+        subtitle: `${servers.length} MCP server${servers.length === 1 ? "" : "s"}`,
+        body:
+          servers.length === 0
+            ? "_No MCP servers configured for this session._\n\n" +
+              "Configure servers in `settings.json` under `mcpServers`. " +
+              "The orchestrator's built-in plan/notes/leader tools are wired in automatically and don't show up here."
+            : servers
+                .map((s) => {
+                  const target = s.target ? ` — \`${s.target}\`` : "";
+                  return `**${s.name}** _(${s.scope}, ${s.type ?? "stdio"})_${target}`;
+                })
+                .join("\n\n"),
+      });
+      return;
+    }
+    case "agents": {
+      const { agents } = data as {
+        agents: Array<{
+          name: string;
+          scope: string;
+          description?: string;
+        }>;
+      };
+      ctx.appendOutput({
+        echo,
+        subtitle: `${agents.length} agent${agents.length === 1 ? "" : "s"}`,
+        body:
+          agents.length === 0
+            ? "_No subagents found in `~/.claude/agents/` or `.claude/agents/`._"
+            : agents
+                .map(
+                  (a) =>
+                    `**${a.name}** _(${a.scope})_${a.description ? ` — ${a.description}` : ""}`,
+                )
+                .join("\n\n"),
+      });
+      return;
+    }
+    case "skills": {
+      const { skills } = data as {
+        skills: Array<{
+          name: string;
+          scope: string;
+          description?: string;
+        }>;
+      };
+      ctx.appendOutput({
+        echo,
+        subtitle: `${skills.length} skill${skills.length === 1 ? "" : "s"}`,
+        body:
+          skills.length === 0
+            ? "_No skills found in `~/.claude/skills/` or `.claude/skills/`._"
+            : skills
+                .map(
+                  (s) =>
+                    `**${s.name}** _(${s.scope})_${s.description ? ` — ${s.description}` : ""}`,
+                )
+                .join("\n\n"),
+      });
+      return;
+    }
+    case "hooks": {
+      const { hooks } = data as {
+        hooks: Array<{ event: string; count: number }>;
+      };
+      ctx.appendOutput({
+        echo,
+        subtitle: `${hooks.length} hook event${hooks.length === 1 ? "" : "s"}`,
+        body:
+          hooks.length === 0
+            ? "_No hooks configured in `settings.json`._\n\n" +
+              "Hooks let you run shell commands on tool events (PreToolUse, PostToolUse, Stop, etc.). " +
+              "Edit `~/.claude/settings.json` under the `hooks` key."
+            : hooks
+                .map((h) => `**${h.event}** — ${h.count} matcher${h.count === 1 ? "" : "s"}`)
+                .join("\n\n"),
+      });
+      return;
+    }
+    case "permissions": {
+      const { permissions } = data as {
+        permissions: {
+          default_mode?: string;
+          allow: string[];
+          deny: string[];
+          ask: string[];
+          additional_directories: string[];
+        };
+      };
+      const rows = [
+        {
+          label: "Default mode",
+          value: permissions.default_mode ?? "default",
+        },
+        { label: "Allow rules", value: String(permissions.allow.length) },
+        { label: "Deny rules", value: String(permissions.deny.length) },
+        { label: "Ask rules", value: String(permissions.ask.length) },
+        {
+          label: "Extra directories",
+          value: String(permissions.additional_directories.length),
+        },
+      ];
+      const sample = (label: string, list: string[]) =>
+        list.length === 0
+          ? ""
+          : `\n\n**${label}** (first 5)\n${list
+              .slice(0, 5)
+              .map((r) => `- \`${r}\``)
+              .join("\n")}`;
+      ctx.appendOutput({
+        echo,
+        subtitle: "Permission rules",
+        rows,
+        body:
+          (sample("Allow", permissions.allow) +
+            sample("Deny", permissions.deny) +
+            sample("Ask", permissions.ask)).trim() ||
+          "_No persistent rules — every tool call goes through the in-chat dialog._",
+      });
+      return;
+    }
+    case "config": {
+      const view = data as {
+        paths: {
+          user_settings: string;
+          user_local_settings: string;
+          project_settings: string;
+        };
+        loaded: { global: boolean; local: boolean };
+        summary: {
+          mcp_server_count: number;
+          hook_event_count: number;
+          permission_default_mode?: string;
+        };
+      };
+      ctx.appendOutput({
+        echo,
+        subtitle: "Configuration",
+        rows: [
+          { label: "User settings", value: view.paths.user_settings },
+          {
+            label: "User local",
+            value: `${view.paths.user_local_settings}${view.loaded.local ? "" : " _(none)_"}`,
+          },
+          { label: "Project", value: view.paths.project_settings },
+          {
+            label: "MCP servers",
+            value: String(view.summary.mcp_server_count),
+          },
+          {
+            label: "Hook events",
+            value: String(view.summary.hook_event_count),
+          },
+          {
+            label: "Default mode",
+            value: view.summary.permission_default_mode ?? "default",
+          },
+        ],
+      });
+      return;
     }
   }
 }
