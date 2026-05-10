@@ -29,6 +29,24 @@ export interface OpenRouterConfig {
   default_model?: string;
 }
 
+// HTTP header values must be visible-ASCII (RFC 7230 §3.2.6); anything
+// outside that set makes undici/fetch reject the request with the
+// cryptic "Header 'NN' has invalid value" message before it ever leaves
+// the process. Catches the common failure mode where the user pasted
+// the wrong text into the API key field (e.g. a Vietnamese hint string,
+// a key wrapped in quotes, or a value with stray whitespace) and only
+// found out when the SDK upstream call blew up. We also reject the
+// empty string here so callers can use this as a single validation
+// gate at save + spawn time.
+const HEADER_TOKEN_RE = /^[\x21-\x7E]+$/;
+export function validateApiKey(key: string): string | null {
+  if (key.length === 0) return "API key is empty";
+  if (!HEADER_TOKEN_RE.test(key)) {
+    return "API key contains characters that aren't valid in an HTTP header (whitespace, newlines, or non-ASCII). Re-copy the key from openrouter.ai/keys.";
+  }
+  return null;
+}
+
 interface ConfigFile {
   version: 1;
   openrouter?: OpenRouterConfig | LegacyOpenRouterConfig;
@@ -162,6 +180,15 @@ export function openRouterEnv(
   config: OpenRouterConfig,
   activeModel?: string,
 ): Record<string, string> {
+  // Belt-and-braces: an older config may have been written before we
+  // added validateApiKey on the save path. If the on-disk key is
+  // garbage, refuse to set the env block at all — the spawn falls
+  // back to native Anthropic and the user gets a "missing key" path
+  // they can recover from, instead of a corrupt Bearer header crashing
+  // the SDK on first turn.
+  if (validateApiKey(config.api_key) !== null) {
+    return {};
+  }
   const env: Record<string, string> = {
     ANTHROPIC_BASE_URL: "https://openrouter.ai/api",
     ANTHROPIC_AUTH_TOKEN: config.api_key,
@@ -184,16 +211,22 @@ export interface OpenRouterStatus {
   has_key: boolean;
   models: string[];
   default_model?: string;
+  // When the on-disk key fails validateApiKey, the dialog renders a
+  // banner prompting the user to replace it. Stays undefined when the
+  // key is fine so the UI doesn't render a stray slot.
+  key_error?: string;
 }
 
 export function statusFor(config: OpenRouterConfig | undefined): OpenRouterStatus {
   if (!config) {
     return { configured: false, has_key: false, models: [] };
   }
+  const keyErr = config.api_key.length > 0 ? validateApiKey(config.api_key) : null;
   return {
     configured: true,
     has_key: config.api_key.length > 0,
     models: [...config.models],
     default_model: config.default_model,
+    key_error: keyErr ?? undefined,
   };
 }

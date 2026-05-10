@@ -21,6 +21,7 @@ import type {
   AskUserQuestionRequest,
   Effort,
   PermissionMode,
+  SessionProvider,
   SessionSummary,
   SessionUsage,
   StreamingBlock,
@@ -171,6 +172,11 @@ export function ChatPanel({ session }: Props) {
   const router = useRouter();
   const [effort, setEffort] = useState<Effort>(session.effort ?? DEFAULT_EFFORT);
   const [model, setModel] = useState<string>(session.model ?? "");
+  // Tracks the running session's active provider so the picker chip
+  // recolors when the user swaps providers mid-chat. Initialised from
+  // the session summary; updated optimistically inside patchOptions
+  // when a provider switch is in flight.
+  const [activeProvider, setActiveProvider] = useState(session.provider);
   // permission_mode is one of the only session knobs whose default
   // hasn't always existed on disk — coerce to "default" when the
   // server returned a session without it.
@@ -279,19 +285,21 @@ export function ChatPanel({ session }: Props) {
     ]);
   };
 
-  // PATCH the running session with new model/effort. Optimistic update
-  // first so the picker chip reflects the choice immediately; if the
-  // server rejects (e.g. session already closed), we revert and surface
-  // the error in the chat panel's error list.
+  // PATCH the running session with new model/effort/provider. Optimistic
+  // update first so the picker chip reflects the choice immediately; if
+  // the server rejects (e.g. session already closed), we revert and
+  // surface the error in the chat panel's error list.
   const patchOptions = async (patch: {
     model?: string;
     effort?: Effort;
     permission_mode?: PermissionMode;
+    provider?: SessionProvider;
   }) => {
-    const prev = { model, effort, permissionMode };
+    const prev = { model, effort, permissionMode, provider: activeProvider };
     if (patch.model) setModel(patch.model);
     if (patch.effort) setEffort(patch.effort);
     if (patch.permission_mode) setPermissionMode(patch.permission_mode);
+    if (patch.provider) setActiveProvider(patch.provider);
     try {
       const res = await fetch(`/api/chat/${session.id}`, {
         method: "PATCH",
@@ -303,6 +311,7 @@ export function ChatPanel({ session }: Props) {
       setModel(prev.model);
       setEffort(prev.effort);
       setPermissionMode(prev.permissionMode);
+      setActiveProvider(prev.provider);
     }
   };
 
@@ -740,10 +749,33 @@ export function ChatPanel({ session }: Props) {
               mode="session"
               cwd={session.cwd}
               model={model}
-              onModelChange={(id) => void patchOptions({ model: id })}
+              onModelChange={(id) => {
+                // Picking a model from the OTHER provider triggers a
+                // session respawn server-side (env vars route Anthropic
+                // ↔ OpenRouter and are baked in at SDK spawn time). We
+                // infer the target provider from the id shape here so
+                // the user doesn't need a separate toggle: vendor-
+                // prefixed ids (or anything saved as an OR favorite)
+                // route through OR, anything else stays native.
+                const nextProvider: SessionProvider =
+                  orModels.includes(id) || id.includes("/")
+                    ? "openrouter"
+                    : "anthropic";
+                // Treat an unset activeProvider as "anthropic" — older
+                // sessions persisted before this field existed don't
+                // need a respawn just because we're now naming the
+                // implicit default.
+                const currentProvider: SessionProvider =
+                  activeProvider ?? "anthropic";
+                const patch: Parameters<typeof patchOptions>[0] = { model: id };
+                if (nextProvider !== currentProvider) {
+                  patch.provider = nextProvider;
+                }
+                void patchOptions(patch);
+              }}
               effort={effort}
               onEffortChange={(e) => void patchOptions({ effort: e })}
-              activeProvider={session.provider}
+              activeProvider={activeProvider}
               orModels={orModels}
               permMode={permissionMode}
               onPermModeChange={(m) => patchOptions({ permission_mode: m })}

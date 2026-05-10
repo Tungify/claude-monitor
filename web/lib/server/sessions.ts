@@ -956,6 +956,21 @@ function buildLiveSession(init: BuildLiveInit): ChatSession {
     query: undefined as unknown as Query, // assigned below
   };
 
+  attachSDKQuery(session, init.isResume);
+
+  sessions.set(init.id, session);
+  void driveSession(session);
+  return session;
+}
+
+// attachSDKQuery wires a fresh SDK Query onto an existing ChatSession.
+// Reads provider/model/effort/cwd/configDir straight off the session
+// so it can be reused for both initial spawn (buildLiveSession) and
+// in-place respawn (provider switch via updateSessionOptions). The
+// caller is responsible for ensuring session.inputQueue and
+// session.abortController are fresh — leftover references from a
+// previous spawn would have already been aborted/closed.
+function attachSDKQuery(session: ChatSession, isResume: boolean): void {
   // SDK locates a native binary via optional deps; if those got
   // skipped during install we end up throwing "Native CLI binary
   // for darwin-arm64 not found" at first iteration. findClaudeBinary
@@ -971,22 +986,22 @@ function buildLiveSession(init: BuildLiveInit): ChatSession {
   // and the missing env block surfaces in the very next API call as
   // a normal Anthropic auth response the user can read.
   const orConfig =
-    init.provider === "openrouter" ? loadOpenRouterConfigSync() : undefined;
+    session.provider === "openrouter" ? loadOpenRouterConfigSync() : undefined;
   // Pass the session's chosen model so OR's tier env vars resolve to
   // the user's pick. Without this the env block falls back to
   // config.default_model — fine for the binary's tier requests, but
   // the SDK's `model:` option overrides anyway, so the env vars matter
   // only for whichever request goes through the binary's tier-naming
   // path (rare but real).
-  const providerEnv = orConfig ? openRouterEnv(orConfig, init.model) : {};
+  const providerEnv = orConfig ? openRouterEnv(orConfig, session.model) : {};
 
   session.query = query({
-    prompt: inputQueue,
+    prompt: session.inputQueue,
     options: {
-      cwd: init.cwd,
+      cwd: session.cwd,
       env: {
         ...process.env,
-        CLAUDE_CONFIG_DIR: init.configDir,
+        CLAUDE_CONFIG_DIR: session.configDir,
         ...providerEnv,
       },
       ...(claudeBin ? { pathToClaudeCodeExecutable: claudeBin } : {}),
@@ -1004,9 +1019,9 @@ function buildLiveSession(init: BuildLiveInit): ChatSession {
       systemPrompt: {
         type: "preset",
         preset: "claude_code",
-        ...(init.phaseSlug ? {} : { append: OWNER_TRIAGE_APPEND }),
+        ...(session.phaseSlug ? {} : { append: OWNER_TRIAGE_APPEND }),
       },
-      permissionMode: init.permissionMode,
+      permissionMode: session.permissionMode,
       // bypassPermissions ("Auto / Yolo" in the UI) requires the
       // session to be launched with this opt-in. Without it the SDK
       // refuses both the initial config and any later
@@ -1032,24 +1047,58 @@ function buildLiveSession(init: BuildLiveInit): ChatSession {
           ? {}
           : { [LEADER_MCP_SERVER_NAME]: makeLeaderMcp(session) }),
       },
-      abortController,
+      abortController: session.abortController,
       // Resume vs fresh: `resume` loads the session's transcript via
       // claude's own jsonl on disk; `sessionId` opens a fresh session
       // file with that id. The two are mutually exclusive in the SDK.
-      ...(init.isResume ? { resume: init.id } : { sessionId: init.id }),
+      ...(isResume ? { resume: session.id } : { sessionId: session.id }),
       // Stream Anthropic content_block_delta events through as
       // SDKPartialAssistantMessage (type: "stream_event"). Note: when
       // extended thinking is on (effort high/xhigh/max), the SDK
       // suppresses these and only ships the final assistant message.
       includePartialMessages: true,
-      ...(init.model ? { model: init.model } : {}),
-      ...(init.effort ? { effort: init.effort } : {}),
+      ...(session.model ? { model: session.model } : {}),
+      ...(session.effort ? { effort: session.effort } : {}),
     },
   });
+}
 
-  sessions.set(init.id, session);
+// respawnQuery tears down the running SDK Query for a live session and
+// stands up a fresh one against the session's CURRENT provider/model
+// fields. Used by updateSessionOptions when the provider switches —
+// the env vars that route traffic to OR vs Anthropic are baked into
+// the spawned binary's process env, so a flip needs a full respawn.
+//
+// Preserves the ChatSession identity (and its emitter, recentRequestIds,
+// alwaysAllowRules, history). SSE subscribers stay attached. The OLD
+// driveSession loop's terminal branches compare session.query to the
+// instance they were started with; mismatch (which we cause here by
+// reassigning) makes them swallow the closed/errored flips instead of
+// killing the session.
+function respawnQuery(session: ChatSession): void {
+  try {
+    session.abortController.abort();
+  } catch {
+    // already-aborted controllers throw — swallow.
+  }
+  try {
+    session.inputQueue.end();
+  } catch {
+    // already-ended queue — swallow.
+  }
+  try {
+    session.query.close();
+  } catch {
+    // close() can throw on an already-closed query — ignore.
+  }
+  session.inputQueue = new AsyncQueue<SDKUserMessage>();
+  session.abortController = new AbortController();
+  // Resume from the on-disk jsonl so the new binary picks up the
+  // conversation where the previous one left off — the user
+  // shouldn't lose context just because they swapped providers.
+  attachSDKQuery(session, true);
+  setStatus(session, "starting");
   void driveSession(session);
-  return session;
 }
 
 export function createSession(opts: {
@@ -1166,6 +1215,14 @@ function getOrResume(id: string): ChatSession | undefined {
 }
 
 async function driveSession(session: ChatSession): Promise<void> {
+  // Capture the SDK Query we were started against. respawnQuery
+  // (provider switch) tears this query down and assigns a new one to
+  // session.query, then kicks off a fresh driveSession for it. When
+  // the abort propagates through the OLD iterator and lands us in the
+  // terminal branches below, we compare against this captured ref to
+  // tell "real shutdown" from "stale instance after respawn" — the
+  // latter must not flip status to closed/errored.
+  const ownQuery = session.query;
   try {
     // The SDK Query iterator is constructed synchronously in
     // buildLiveSession but only starts producing messages once a user
@@ -1178,7 +1235,7 @@ async function driveSession(session: ChatSession): Promise<void> {
     if (session.status === "starting") {
       setStatus(session, "idle");
     }
-    for await (const msg of session.query) {
+    for await (const msg of ownQuery) {
       // stream_event messages are token deltas — we push them through
       // SSE so live clients can render incremental text, but we do NOT
       // persist them in `history`. Replay on reconnect would bloat the
@@ -1246,9 +1303,19 @@ async function driveSession(session: ChatSession): Promise<void> {
         setStatus(session, "thinking");
       }
     }
+    if (session.query !== ownQuery) {
+      // Provider switch tore down our query and started a fresh
+      // driveSession on a new one — leave the session alive.
+      return;
+    }
     setStatus(session, "closed");
     emit(session, { type: "closed", data: {} });
   } catch (err) {
+    if (session.query !== ownQuery) {
+      // Same logic as the natural-end branch: an abort during a
+      // provider switch must not surface as a session error.
+      return;
+    }
     setStatus(session, "errored");
     emit(session, {
       type: "error",
@@ -1607,14 +1674,42 @@ export function cancelAskUserQuestion(
 // Auto-resumes an interrupted session: the user changing model on a
 // chat they reopened after a restart should "just work" rather than
 // throw "session not found".
+//
+// Provider switch (anthropic ↔ openrouter) needs a respawn — the SDK
+// reads ANTHROPIC_BASE_URL/AUTH_TOKEN from the spawned binary's env,
+// which is baked in at query() construction. We tear down the running
+// query, rebuild on the same ChatSession object, and resume the
+// transcript from disk — emitter / history / SSE subscribers stay
+// pointed at the same session so the user doesn't notice the
+// reconnect except for a brief "starting" flicker.
 export async function updateSessionOptions(
   sessionId: string,
-  opts: { model?: string; effort?: EffortLevel; permissionMode?: PermissionMode },
+  opts: {
+    model?: string;
+    effort?: EffortLevel;
+    permissionMode?: PermissionMode;
+    provider?: SessionProvider;
+  },
 ): Promise<SessionSummary> {
   const s = getOrResume(sessionId);
   if (!s) throw new Error("session not found");
   if (s.status === "closed" || s.status === "errored") {
     throw new Error(`session is ${s.status}`);
+  }
+  // Provider change first — it respawns the SDK Query, after which the
+  // new query takes the rest of the patch (model/effort/permissionMode)
+  // straight via attachSDKQuery's options. Subsequent setModel /
+  // applyFlagSettings calls would race the still-spawning binary; we
+  // skip them when we already respawned with the right settings.
+  const providerChanged = opts.provider && opts.provider !== s.provider;
+  if (providerChanged) {
+    if (opts.model) s.model = opts.model;
+    if (opts.effort) s.effort = opts.effort;
+    if (opts.permissionMode) s.permissionMode = opts.permissionMode;
+    s.provider = opts.provider;
+    respawnQuery(s);
+    schedulePersist(s.id);
+    return summarize(s);
   }
   if (opts.model && opts.model !== s.model) {
     await s.query.setModel(opts.model);

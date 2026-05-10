@@ -20,6 +20,7 @@ interface OpenRouterStatus {
   has_key: boolean;
   models: string[];
   default_model?: string;
+  key_error?: string;
 }
 
 interface Props {
@@ -98,6 +99,10 @@ export function OpenRouterDialog({ open, onOpenChange }: Props) {
         // We never echo the API key back from the server. The text
         // field stays blank when one is on file; typing replaces it.
         setApiKey("");
+        // If the on-disk key is invalid (e.g. legacy paste of hint
+        // text), force the input open immediately so the user can
+        // type a clean replacement without finding the Replace button.
+        if (data.key_error) setEditingKey(true);
       } catch (err) {
         if (cancelled) return;
         setError(err instanceof Error ? err.message : String(err));
@@ -212,10 +217,15 @@ export function OpenRouterDialog({ open, onOpenChange }: Props) {
         </DialogHeader>
 
         <div className="space-y-4">
-          {status?.configured && status.has_key && (
+          {status?.configured && status.has_key && !status.key_error && (
             <div className="rounded-md border border-emerald-500/30 bg-emerald-500/5 px-3 py-2 text-xs text-emerald-700 dark:text-emerald-400">
               Connected. Pick the OpenRouter provider on the home composer
               when starting a new chat to route through it.
+            </div>
+          )}
+          {status?.key_error && (
+            <div className="rounded-md border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-xs text-amber-700 dark:text-amber-400">
+              <strong>Saved API key looks corrupted.</strong> {status.key_error}
             </div>
           )}
 

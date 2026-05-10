@@ -4,6 +4,7 @@ import {
   loadOpenRouterConfig,
   saveOpenRouterConfig,
   statusFor,
+  validateApiKey,
   type OpenRouterConfig,
 } from "@/lib/server/openrouter-config";
 
@@ -76,6 +77,15 @@ export async function PUT(req: Request) {
       { error: "api_key required (or pass clear:true to remove)" },
       { status: 400 },
     );
+  }
+
+  // Reject keys that aren't valid HTTP header tokens — undici would
+  // otherwise reject them downstream with an opaque "Header 'NN' has
+  // invalid value" error at first message. Surface it here, before
+  // it lands on disk, so the dialog can show the user a real hint.
+  const keyErr = validateApiKey(next.api_key);
+  if (keyErr) {
+    return NextResponse.json({ error: keyErr }, { status: 400 });
   }
 
   await saveOpenRouterConfig(next);

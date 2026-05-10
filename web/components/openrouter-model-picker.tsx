@@ -259,8 +259,16 @@ function ModelRow({
         </span>
         <span className="flex shrink-0 flex-col items-end gap-0.5 text-[10px] tabular-nums text-muted-foreground">
           <span>{ctx}</span>
-          {model.prompt_price && model.prompt_price !== "0" && (
-            <span>${formatPrice(model.prompt_price)}/M in</span>
+          {(model.prompt_price || model.completion_price) && (
+            <span className="flex items-baseline gap-1">
+              {model.prompt_price && model.prompt_price !== "0" && (
+                <span>${formatPrice(model.prompt_price)} in</span>
+              )}
+              {model.completion_price && model.completion_price !== "0" && (
+                <span>${formatPrice(model.completion_price)} out</span>
+              )}
+              <span className="opacity-60">/M</span>
+            </span>
           )}
         </span>
         {selected && <Check className="mt-1 size-3.5 shrink-0 text-violet-600" />}

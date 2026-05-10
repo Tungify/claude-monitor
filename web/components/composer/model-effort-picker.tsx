@@ -22,15 +22,14 @@ interface Props {
   effort: Effort;
   onModelChange: (id: string) => void;
   onEffortChange: (e: Effort) => void;
-  // Active provider for THIS picker mount.
-  //   - "anthropic"  → only show native models (chat sessions spawned
-  //                    against Anthropic; OR ids would error since
-  //                    BASE_URL is locked at spawn).
-  //   - "openrouter" → only show OR favorites for the same reason.
-  //   - undefined    → home mode: show BOTH lists in one popover so
-  //                    the user picks any model in one click; the
-  //                    parent derives provider from the chosen id at
-  //                    session-create time.
+  // Active provider for THIS picker mount. Drives the chip styling
+  // (violet for OR, neutral for native) and what counts as "current"
+  // in the popover. Both sections always render — the chat panel's
+  // onModelChange handler triggers a respawn when the user crosses
+  // provider lines, so we don't lock the picker to one side.
+  //
+  // undefined → home mode (no session yet); the parent infers
+  // provider from the chosen id at session-create time.
   provider?: SessionProvider;
   // Saved OR favorites. Required for home mode (otherwise the OR
   // section is empty), and consulted in session mode when the
@@ -108,10 +107,13 @@ export function ModelEffortPicker({
     provider ?? providerForModel(modelId, orModels);
   const isOR = effectiveProvider === "openrouter";
 
-  // Section visibility. Home mode (provider undefined) shows both;
-  // session mode shows only the locked side.
-  const showAnthropic = provider === undefined || provider === "anthropic";
-  const showOR = provider === undefined || provider === "openrouter";
+  // Both sections render in every mode. Chat sessions started against
+  // Anthropic can switch to an OR favorite (and vice versa) — the
+  // composer's onModelChange handler asks the server for a respawn
+  // when that happens. Home mode also shows both so the new session
+  // can spawn against either provider.
+  const showAnthropic = true;
+  const showOR = true;
 
   // Effort filter follows the active model: native looks up
   // ModelInfo.supportedEffortLevels; OR uses our heuristic. We don't
