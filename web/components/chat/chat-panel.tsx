@@ -39,6 +39,7 @@ import { ThinkingIndicator } from "./thinking-indicator";
 import { QueueIndicator, computeQueuedMessages } from "./queue-indicator";
 import { PermissionDialog } from "./permission-dialog";
 import { PlanCard } from "./plan-card";
+import { RewindPicker } from "./rewind-picker";
 import { AskQuestionCard } from "./ask-question-card";
 import { ToolRunCard } from "./tool-run-card";
 import { SubagentProvider } from "./subagent-context";
@@ -177,6 +178,11 @@ export function ChatPanel({ session }: Props) {
     (session.permission_mode as PermissionMode | undefined) ?? "default",
   );
   const [commandLog, setCommandLog] = useState<CommandLog[]>([]);
+  // /rewind opens the file-history picker. Boolean rather than
+  // payload because the picker fetches snapshots itself — keeping the
+  // open state minimal here lets the picker re-fetch each time the
+  // user re-opens it (history grows mid-session).
+  const [rewindOpen, setRewindOpen] = useState(false);
   // OR favorites list for the composer's model chip. Only fetched when
   // this session is OR-routed; native sessions skip the request. Picker
   // selections call patchOptions({model}) which goes through the SDK's
@@ -532,6 +538,7 @@ export function ChatPanel({ session }: Props) {
         appendOutput,
         patchOptions,
         router,
+        openRewind: () => setRewindOpen(true),
       });
       return;
     }
@@ -725,6 +732,35 @@ export function ChatPanel({ session }: Props) {
         </footer>
 
         <PermissionDialog request={chat.pendingPermission} onDecide={chat.decide} />
+        <RewindPicker
+          open={rewindOpen}
+          onOpenChange={setRewindOpen}
+          sessionId={session.id}
+          history={chat.history}
+          onRewound={({ mode }) => {
+            // Conversation rewinds abort the live query; the next user
+            // turn will re-resume against the truncated transcript.
+            // SSE re-subscribes on the next render anyway, so we don't
+            // need to do anything imperative here besides letting the
+            // user know what happened.
+            appendOutput({
+              echo: "/rewind",
+              tone: "success",
+              subtitle:
+                mode === "conversation"
+                  ? "Conversation restored"
+                  : mode === "code"
+                    ? "Code restored"
+                    : "Conversation + code restored",
+              body:
+                mode === "conversation"
+                  ? "Chat history truncated to the chosen point. Send a new message to continue."
+                  : mode === "code"
+                    ? "Working tree rolled back to the pre-edit state for the chosen restore point."
+                    : "Both surfaces restored. Send a new message to continue.",
+            });
+          }}
+        />
       </div>
     </SubagentProvider>
   );
@@ -915,6 +951,9 @@ interface ChatCommandContext {
   appendOutput: (output: CommandOutput) => void;
   patchOptions: (patch: { model?: string; effort?: Effort }) => Promise<void>;
   router: ReturnType<typeof useRouter>;
+  // Opens the file-history picker overlay. Wired by the /rewind
+  // handler; the picker manages its own loading + restore POST.
+  openRewind: () => void;
 }
 
 const ALL_EFFORTS: Effort[] = ["low", "medium", "high", "xhigh", "max"];
@@ -1539,14 +1578,7 @@ async function runChatCommand(
     }
 
     case "rewind": {
-      ctx.appendOutput({
-        echo: parsed.raw,
-        tone: "warning",
-        body:
-          "`/rewind` restores file snapshots taken by the CLI before edits. The " +
-          "web orchestrator doesn't snapshot files yet, so there's nothing to " +
-          "restore. Use `git restore` or your editor's undo for now.",
-      });
+      ctx.openRewind();
       return;
     }
 
@@ -1640,20 +1672,50 @@ async function renderCliInfo(
           target?: string;
         }>;
       };
+      // Group by scope so the output reads like the CLI's MCPListPanel:
+      // "Project · 2 servers", "User · 4 servers". We don't probe live
+      // connection status — the CLI panel does, but that needs the SDK
+      // to round-trip per server and would block the chat thread —
+      // so we surface the configuration scope as the actionable hint
+      // instead. Listed in the same scope order the CLI uses.
+      const order = ["project", "user", "enterprise", "dynamic", "claudeai"];
+      const scopes = new Map<string, typeof servers>();
+      for (const s of servers) {
+        const key = scopes.get(s.scope) ?? [];
+        key.push(s);
+        scopes.set(s.scope, key);
+      }
+      const sections: string[] = [];
+      for (const scope of order) {
+        const list = scopes.get(scope);
+        if (!list || list.length === 0) continue;
+        sections.push(`**${scope.toUpperCase()}** _(${list.length})_`);
+        for (const s of list) {
+          const type = s.type ?? "stdio";
+          const target = s.target ? ` · \`${s.target}\`` : "";
+          sections.push(`• **${s.name}** _${type}_${target}`);
+        }
+      }
+      // Anything in an unrecognised scope still surfaces below — better
+      // to show "scope=foo" than silently drop the server.
+      for (const [scope, list] of scopes) {
+        if (order.includes(scope)) continue;
+        sections.push(`**${scope.toUpperCase()}** _(${list.length})_`);
+        for (const s of list) {
+          sections.push(
+            `• **${s.name}** _${s.type ?? "stdio"}_${s.target ? ` · \`${s.target}\`` : ""}`,
+          );
+        }
+      }
       ctx.appendOutput({
         echo,
-        subtitle: `${servers.length} MCP server${servers.length === 1 ? "" : "s"}`,
+        subtitle: `${servers.length} MCP server${servers.length === 1 ? "" : "s"} · ${scopes.size} scope${scopes.size === 1 ? "" : "s"}`,
         body:
           servers.length === 0
             ? "_No MCP servers configured for this session._\n\n" +
-              "Configure servers in `settings.json` under `mcpServers`. " +
+              "Configure servers in `settings.json` under `mcpServers`, in `<cwd>/.mcp.json` for a project-scoped server, or via `claude mcp add` from a terminal. " +
               "The orchestrator's built-in plan/notes/leader tools are wired in automatically and don't show up here."
-            : servers
-                .map((s) => {
-                  const target = s.target ? ` — \`${s.target}\`` : "";
-                  return `**${s.name}** _(${s.scope}, ${s.type ?? "stdio"})_${target}`;
-                })
-                .join("\n\n"),
+            : sections.join("\n\n"),
       });
       return;
     }

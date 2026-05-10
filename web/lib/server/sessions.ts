@@ -2,6 +2,8 @@ import "server-only";
 
 import { EventEmitter } from "node:events";
 import { randomUUID } from "node:crypto";
+import { promises as fs } from "node:fs";
+import path from "node:path";
 import {
   query,
   type CanUseTool,
@@ -66,6 +68,14 @@ import type {
   SessionUsage,
 } from "@/lib/chat-types";
 import { loadOpenRouterConfigSync, openRouterEnv } from "./openrouter-config";
+import {
+  listSnapshots as fhListSnapshots,
+  pathsForTool as fhPathsForTool,
+  restoreCode as fhRestoreCode,
+  trackEdit as fhTrackEdit,
+  type FileSnapshot,
+  type RestoreFileAction,
+} from "./file-history";
 import type { PlanRecord } from "@/lib/plan-types";
 import { deriveSubagents } from "@/lib/subagents";
 
@@ -629,6 +639,21 @@ function firstUserText(history: SDKMessage[]): string | undefined {
   return undefined;
 }
 
+// latestUserMessageId scans history for the most recent user message
+// uuid. Used by the file-history hook in canUseTool so each snapshot
+// is tagged with its parent user turn — the /rewind picker groups
+// snapshots by parent so a single user message that drove ten Edits
+// shows up as one restore point.
+function latestUserMessageId(s: ChatSession): string | undefined {
+  for (let i = s.history.length - 1; i >= 0; i--) {
+    const m = s.history[i];
+    if (m.type === "user") {
+      return (m as { uuid?: string }).uuid;
+    }
+  }
+  return undefined;
+}
+
 // makeCanUseTool returns a CanUseTool callback bound to the given
 // session. Factored out so createSession (fresh) and resumeSession
 // (reanimated from disk) share one implementation — both need the
@@ -714,6 +739,21 @@ function makeCanUseTool(session: ChatSession): CanUseTool {
           },
           { once: true },
         );
+      });
+    }
+    // Snapshot file-mutating tool inputs BEFORE the permission gate so
+    // /rewind has something to restore from even when the user
+    // approves on auto. We fire-and-forget the trackEdit call so the
+    // permission flow isn't blocked on disk I/O — a failed snapshot
+    // surfaces in the server log but doesn't deny the tool.
+    const fhPaths = fhPathsForTool(toolName, input, session.cwd);
+    if (fhPaths.length > 0) {
+      void fhTrackEdit({
+        sessionId: session.id,
+        parentMessageId: latestUserMessageId(session),
+        toolName,
+        toolUseId: ctx.toolUseID,
+        paths: fhPaths,
       });
     }
     // Short-circuit if a previous "Always allow" already covered this
@@ -1604,6 +1644,122 @@ export async function updateSessionOptions(
     s.permissionMode = opts.permissionMode;
   }
   return summarize(s);
+}
+
+// listFileSnapshots is the public read API for /rewind. Returns the
+// raw FileSnapshot list — the route handler shapes it into a UI
+// payload (groups by parentMessageId, joins with history excerpts).
+export async function listFileSnapshots(
+  sessionId: string,
+): Promise<FileSnapshot[]> {
+  return fhListSnapshots(sessionId);
+}
+
+// rewindSession performs the actual restore. Takes a snapshot id and a
+// mode that selects which surfaces get rolled back:
+//   - "code"        — only files; conversation untouched
+//   - "conversation"— only history + transcript jsonl; on-disk files
+//                     untouched
+//   - "both"        — code + conversation
+// Returns the actions taken on each surface so the route can shape a
+// response the user can scan ("restored 3 files, truncated 8 messages").
+export interface RewindResult {
+  files?: RestoreFileAction[];
+  // For conversation rewinds: the index in the new (truncated)
+  // history that was kept as the last entry. Lets the UI hint the
+  // user "you're now at message #N".
+  truncatedFromIndex?: number;
+}
+
+export async function rewindSession(
+  sessionId: string,
+  opts: { snapshotId: string; mode: "code" | "conversation" | "both" },
+): Promise<RewindResult> {
+  const s = getOrResume(sessionId);
+  if (!s) throw new Error("session not found");
+  const snapshots = await fhListSnapshots(sessionId);
+  const target = snapshots.find((sn) => sn.id === opts.snapshotId);
+  if (!target) throw new Error("snapshot not found");
+
+  const result: RewindResult = {};
+  if (opts.mode === "code" || opts.mode === "both") {
+    result.files = await fhRestoreCode(sessionId, opts.snapshotId);
+  }
+  if (opts.mode === "conversation" || opts.mode === "both") {
+    // Conversation rewind: stop the live query, slice the in-memory
+    // history at the parent user message, persist the trimmed view,
+    // and re-resume so the SDK reads the truncated transcript on next
+    // turn. Without the abort the running query would keep streaming
+    // into stale history slots.
+    const cutId = target.parentMessageId;
+    if (!cutId) {
+      throw new Error(
+        "snapshot has no parentMessageId — conversation rewind unavailable",
+      );
+    }
+    const cutIdx = s.history.findIndex(
+      (m) => m.type === "user" && (m as { uuid?: string }).uuid === cutId,
+    );
+    if (cutIdx < 0) {
+      throw new Error("parent user message no longer in history");
+    }
+    // Drop everything strictly AFTER the parent user message —
+    // including the parent itself's tool_use/result chain — so the
+    // session reads as "user turn submitted, no response yet".
+    s.history = s.history.slice(0, cutIdx + 1);
+    result.truncatedFromIndex = cutIdx;
+
+    try {
+      s.abortController.abort();
+      s.inputQueue.end();
+      try {
+        s.query.close();
+      } catch {
+        // close() can throw on an already-closed query — ignore.
+      }
+    } catch (err) {
+      console.warn("[rewind] abort failed:", err);
+    }
+    sessions.delete(sessionId);
+
+    // Rewrite the on-disk transcript to match the trimmed history.
+    // The SDK's `resume` reads this file on the next spawn, and any
+    // entries past the cut would re-introduce the very state we
+    // just rewound away from.
+    await rewriteTranscript(s);
+    schedulePersist(sessionId);
+  }
+  return result;
+}
+
+// rewriteTranscript flushes the session's current in-memory history to
+// the SDK transcript jsonl so a subsequent `resume` reads the same
+// view. Touches Claude's project storage at
+// ~/.claude/projects/<projectDir>/<sessionId>.jsonl — the same file
+// the binary itself appends to during a live session.
+async function rewriteTranscript(s: ChatSession): Promise<void> {
+  // The CLI hashes cwd to derive projectDir. We mirror that with the
+  // same convention the binary uses: replace `/` with `-` and prefix
+  // with `-` (matches `~/.claude/projects/<-Users-tungngo-...>/<id>.jsonl`).
+  const projectDir = s.cwd.replace(/\//g, "-");
+  const file = path.join(
+    s.configDir,
+    "projects",
+    projectDir,
+    `${s.id}.jsonl`,
+  );
+  try {
+    await fs.mkdir(path.dirname(file), { recursive: true });
+    const lines = s.history.map((m) => JSON.stringify(m));
+    const tmp = `${file}.tmp`;
+    await fs.writeFile(tmp, lines.join("\n") + (lines.length > 0 ? "\n" : ""));
+    await fs.rename(tmp, file);
+  } catch (err) {
+    console.warn("[rewind] transcript rewrite failed:", err);
+    // The user still gets the in-memory rewind; the next resume may
+    // re-introduce trimmed messages. Visible enough to surface in the
+    // server log without crashing the operation.
+  }
 }
 
 export async function stopSession(sessionId: string): Promise<void> {
