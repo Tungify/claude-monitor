@@ -9,7 +9,7 @@ import {
   type DragEvent,
   type KeyboardEvent,
 } from "react";
-import { ArrowUp, GitBranch, Mic, Paperclip } from "lucide-react";
+import { ArrowUp, GitBranch, Mic, Paperclip, Square } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import type {
@@ -60,6 +60,9 @@ interface CommonProps {
   disabled?: boolean;
   placeholder?: string;
   helper?: string;
+  // When provided and busy is true, show a Stop button that calls this
+  // handler instead of the disabled Send button.
+  onInterrupt?: () => void | Promise<void>;
   // Optional usage payload used as the context-meter fallback before
   // the SDK has shipped a real breakdown.
   usage?: SessionUsage;
@@ -562,15 +565,26 @@ export function Composer(props: Props) {
             }
           />
 
-          <Button
-            size="icon"
-            onClick={() => void submitText()}
-            disabled={!canSend}
-            aria-label="Send (Shift+Enter)"
-            className="ml-1 rounded-full sm:size-7"
-          >
-            <ArrowUp className="size-4" />
-          </Button>
+          {props.busy && props.onInterrupt ? (
+            <Button
+              size="icon"
+              onClick={() => void props.onInterrupt?.()}
+              aria-label="Stop generation"
+              className="ml-1 rounded-full sm:size-7 bg-foreground text-background hover:bg-foreground/80"
+            >
+              <Square className="size-3 fill-current" />
+            </Button>
+          ) : (
+            <Button
+              size="icon"
+              onClick={() => void submitText()}
+              disabled={!canSend}
+              aria-label="Send (Shift+Enter)"
+              className="ml-1 rounded-full sm:size-7"
+            >
+              <ArrowUp className="size-4" />
+            </Button>
+          )}
         </div>
       </div>
 

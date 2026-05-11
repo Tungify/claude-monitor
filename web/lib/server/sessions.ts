@@ -1881,6 +1881,28 @@ async function rewriteTranscript(s: ChatSession): Promise<void> {
   }
 }
 
+// interruptTurn aborts the current in-flight Claude turn and respawns the
+// SDK query so the session goes back to idle. Unlike stopSession, the
+// session stays alive — the user can send a new message immediately.
+// Emits turn_interrupted before the respawn so SSE clients clear their
+// streaming-block previews.
+export function interruptTurn(
+  sessionId: string,
+): { ok: boolean; reason?: "not_running" | "session_missing" } {
+  const s = sessions.get(sessionId);
+  if (!s) return { ok: false, reason: "session_missing" };
+  if (
+    s.status !== "thinking" &&
+    s.status !== "awaiting_permission" &&
+    s.status !== "rate_limited"
+  ) {
+    return { ok: false, reason: "not_running" };
+  }
+  emit(s, { type: "turn_interrupted", data: {} });
+  respawnQuery(s);
+  return { ok: true };
+}
+
 export async function stopSession(sessionId: string): Promise<void> {
   const live = sessions.get(sessionId);
   if (live) {

@@ -284,6 +284,7 @@ export type ChatEvent =
   // `initialTopMostItemIndex` baked in. Eliminates the heuristic
   // 150ms idle-window approach which fails on bursty SSE delivery.
   | { type: "history_replayed"; data: Record<string, never> }
+  | { type: "turn_interrupted"; data: Record<string, never> }
   | { type: "error"; data: { message: string } }
   | { type: "closed"; data: Record<string, never> };
 

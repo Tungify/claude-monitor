@@ -2,11 +2,13 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { useMemo, useState, useTransition } from "react";
+import { useEffect, useMemo, useState, useTransition } from "react";
 import {
   CheckCircle2,
   ChevronDown,
   Clock,
+  Eye,
+  EyeOff,
   Loader2,
   MessageSquare,
   Moon,
@@ -17,6 +19,57 @@ import {
 import { cn } from "@/lib/utils";
 import { useSessions, stopSessionRemote } from "@/lib/sessions-context";
 import type { SessionSummary, SubagentSummary } from "@/lib/chat-types";
+
+const HIDDEN_KEY = "cm-hidden-sessions";
+
+function useHiddenSessions() {
+  const [hidden, setHidden] = useState<Set<string>>(new Set());
+
+  // Hydrate from localStorage after mount (avoids SSR mismatch).
+  useEffect(() => {
+    try {
+      const stored = localStorage.getItem(HIDDEN_KEY);
+      if (stored) setHidden(new Set(JSON.parse(stored) as string[]));
+    } catch {
+      // ignore parse errors
+    }
+  }, []);
+
+  const persist = (next: Set<string>) => {
+    try {
+      if (next.size === 0) {
+        localStorage.removeItem(HIDDEN_KEY);
+      } else {
+        localStorage.setItem(HIDDEN_KEY, JSON.stringify([...next]));
+      }
+    } catch {
+      // ignore storage errors
+    }
+  };
+
+  const hide = (id: string) =>
+    setHidden((prev) => {
+      const next = new Set(prev);
+      next.add(id);
+      persist(next);
+      return next;
+    });
+
+  const unhide = (id: string) =>
+    setHidden((prev) => {
+      const next = new Set(prev);
+      next.delete(id);
+      persist(next);
+      return next;
+    });
+
+  const unhideAll = () => {
+    setHidden(new Set());
+    localStorage.removeItem(HIDDEN_KEY);
+  };
+
+  return { hidden, hide, unhide, unhideAll };
+}
 
 interface PlanGroup {
   planId: string;
@@ -36,21 +89,34 @@ interface PlanGroup {
 // their owning plan. Standalone chats render flat at the top.
 export function SessionsList() {
   const { sessions, refresh, unseenDone, loaded, markVisited } = useSessions();
+  const { hidden, hide, unhide, unhideAll } = useHiddenSessions();
+  const [showHidden, setShowHidden] = useState(false);
   const pathname = usePathname();
 
-  // Pull the active session id out of /chat/[id]. Avoids carrying the
-  // pathname through every row.
   const activeId = pathname?.startsWith("/chat/")
     ? pathname.slice("/chat/".length).split("/")[0]
     : undefined;
 
-  // Bucket sessions by plan_id. /api/chat already returns sessions
-  // sorted newest-first, so within each plan the order matches the
-  // order phase agents were spawned (sequential in approve route).
+  // Sessions visible in normal mode; hidden ones filtered out unless
+  // showHidden is toggled. The active session is never filtered so the
+  // user can't accidentally disappear the chat they're looking at.
+  const visibleSessions = useMemo(
+    () =>
+      showHidden
+        ? sessions
+        : sessions.filter((s) => !hidden.has(s.id) || s.id === activeId),
+    [sessions, hidden, showHidden, activeId],
+  );
+
+  const hiddenCount = useMemo(
+    () => sessions.filter((s) => hidden.has(s.id) && s.id !== activeId).length,
+    [sessions, hidden, activeId],
+  );
+
   const { standalone, plans } = useMemo(() => {
     const standalone: SessionSummary[] = [];
     const planMap = new Map<string, PlanGroup>();
-    for (const s of sessions) {
+    for (const s of visibleSessions) {
       if (!s.plan_id) {
         standalone.push(s);
         continue;
@@ -73,7 +139,7 @@ export function SessionsList() {
       b.newestCreatedAt.localeCompare(a.newestCreatedAt),
     );
     return { standalone, plans };
-  }, [sessions]);
+  }, [visibleSessions]);
 
   if (!loaded) {
     return (
@@ -99,8 +165,11 @@ export function SessionsList() {
                 session={s}
                 active={s.id === activeId}
                 done={unseenDone.has(s.id)}
+                isHidden={hidden.has(s.id)}
                 onAfterStop={refresh}
                 onVisit={markVisited}
+                onHide={hide}
+                onUnhide={unhide}
               />
             </li>
           ))}
@@ -112,10 +181,42 @@ export function SessionsList() {
           group={group}
           activeId={activeId}
           unseenDone={unseenDone}
+          hidden={hidden}
           onAfterStop={refresh}
           onVisit={markVisited}
+          onHide={hide}
+          onUnhide={unhide}
         />
       ))}
+
+      {/* Footer toggle for hidden sessions */}
+      {(hiddenCount > 0 || showHidden) && (
+        <div className="flex items-center justify-between px-2 pt-1 pb-0.5">
+          <button
+            type="button"
+            onClick={() => setShowHidden((v) => !v)}
+            className="flex items-center gap-1.5 text-[11px] text-muted-foreground hover:text-foreground transition-colors"
+          >
+            {showHidden ? (
+              <EyeOff className="size-3" aria-hidden />
+            ) : (
+              <Eye className="size-3" aria-hidden />
+            )}
+            {showHidden
+              ? "Hide hidden sessions"
+              : `${hiddenCount} hidden session${hiddenCount !== 1 ? "s" : ""}`}
+          </button>
+          {showHidden && hiddenCount > 0 && (
+            <button
+              type="button"
+              onClick={unhideAll}
+              className="text-[11px] text-muted-foreground hover:text-foreground transition-colors"
+            >
+              Unhide all
+            </button>
+          )}
+        </div>
+      )}
     </div>
   );
 }
@@ -124,14 +225,20 @@ function PlanGroupBlock({
   group,
   activeId,
   unseenDone,
+  hidden,
   onAfterStop,
   onVisit,
+  onHide,
+  onUnhide,
 }: {
   group: PlanGroup;
   activeId?: string;
   unseenDone: Set<string>;
+  hidden: Set<string>;
   onAfterStop: () => void;
   onVisit: (id: string) => void;
+  onHide: (id: string) => void;
+  onUnhide: (id: string) => void;
 }) {
   // Default-open so newly spawned plan groups surface their phases
   // without an extra click; the user can collapse if it gets noisy.
@@ -190,8 +297,11 @@ function PlanGroupBlock({
                 session={s}
                 active={s.id === activeId}
                 done={unseenDone.has(s.id)}
+                isHidden={hidden.has(s.id)}
                 onAfterStop={onAfterStop}
                 onVisit={onVisit}
+                onHide={onHide}
+                onUnhide={onUnhide}
               />
             </li>
           ))}
@@ -205,14 +315,20 @@ function SessionRow({
   session,
   active,
   done,
+  isHidden,
   onAfterStop,
   onVisit,
+  onHide,
+  onUnhide,
 }: {
   session: SessionSummary;
   active: boolean;
   done: boolean;
+  isHidden: boolean;
   onAfterStop: () => void;
   onVisit: (id: string) => void;
+  onHide: (id: string) => void;
+  onUnhide: (id: string) => void;
 }) {
   // Phase sessions surface their slug as the headline — that's what
   // the user thinks of them as ("the publish phase", not the kickoff
@@ -264,20 +380,12 @@ function SessionRow({
       <div
         className={cn(
           "relative flex items-start rounded-md transition-colors",
-          // Running rows get a soft amber wash so the eye spots them
-          // even when scanning a long list. Active row keeps its own
-          // accent so the user doesn't lose track of where they are.
           running && !active && "bg-amber-500/[0.07]",
-          // Starting rows: same wash family but cooler, signaling
-          // "booting up" vs "actively working".
           starting && !active && "bg-sky-500/[0.07]",
-          // Rate-limited rows pull the eye with a rose wash so the
-          // user spots blocked work without scanning labels.
           rateLimited && !active && "bg-rose-500/[0.07]",
-          // Active row: stronger accent + a primary-colored vertical
-          // bar on the left edge so the eye snaps to it even in a long
-          // list with multiple amber/sky-washed rows. Previously the
-          // sidebar-accent wash blended in with running rows.
+          // Hidden sessions shown in "reveal" mode get a muted,
+          // dashed-border treatment so the user can tell them apart.
+          isHidden && !active && "opacity-50 border border-dashed border-border/60",
           active
             ? "bg-sidebar-accent text-sidebar-accent-foreground font-medium ring-1 ring-sidebar-ring/40 shadow-sm before:absolute before:inset-y-1 before:-left-0.5 before:w-[3px] before:rounded-full before:bg-primary"
             : "text-sidebar-foreground/85 hover:bg-sidebar-accent/60",
@@ -396,10 +504,7 @@ function SessionRow({
           )}
         </Link>
 
-        {/* Stop button: visible on hover for running rows. Click stops
-            the session via DELETE. We render it as a real <button>
-            (not nested inside the Link) so its click handler runs
-            without first navigating into the chat. */}
+        {/* Stop button: visible on hover for running rows. */}
         {running && (
           <button
             type="button"
@@ -415,6 +520,35 @@ function SessionRow({
             )}
           >
             <Square className="size-3" aria-hidden />
+          </button>
+        )}
+
+        {/* Hide / Unhide button: visible on hover for non-active,
+            non-running rows. Only hides from the sidebar — no server
+            call, state lives in localStorage. */}
+        {!active && !running && (
+          <button
+            type="button"
+            onClick={(e) => {
+              e.preventDefault();
+              e.stopPropagation();
+              isHidden ? onUnhide(session.id) : onHide(session.id);
+            }}
+            aria-label={isHidden ? `Unhide ${title}` : `Hide ${title}`}
+            title={isHidden ? "Unhide from sidebar" : "Hide from sidebar"}
+            className={cn(
+              "mt-1 mr-1 flex size-6 shrink-0 items-center justify-center rounded text-muted-foreground transition-all",
+              isHidden
+                ? "opacity-60 hover:opacity-100"
+                : "opacity-0 group-hover/row:opacity-100",
+              "hover:bg-muted hover:text-foreground",
+            )}
+          >
+            {isHidden ? (
+              <Eye className="size-3" aria-hidden />
+            ) : (
+              <EyeOff className="size-3" aria-hidden />
+            )}
           </button>
         )}
 

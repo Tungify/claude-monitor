@@ -955,6 +955,8 @@ export function ChatPanel({ session }: Props) {
               permMode={permissionMode}
               onPermModeChange={(m) => patchOptions({ permission_mode: m })}
               onSubmit={onSubmit}
+              busy={chat.status === "thinking" || chat.status === "rate_limited"}
+              onInterrupt={() => void chat.interrupt()}
               disabled={closed}
               usage={liveUsage}
               contextUsage={chat.contextUsage ?? session.context_usage ?? null}
