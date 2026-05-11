@@ -131,17 +131,40 @@ func TestCandidatesPriority(t *testing.T) {
 		t.Errorf("default second = %q, want %q", got[1], ServiceFor(defaultDir))
 	}
 
-	// Non-default dir → hashed first, plain second.
+	// Non-default dir → hashed entry ONLY. Plain is intentionally NOT a
+	// fallback: it represents whoever is currently active, and after a
+	// swap that's a different account than this row. Falling back to
+	// plain would silently render the active account's data in an
+	// unrelated row whose hashed entry happens to be missing.
 	other := filepath.Join(tmp, ".claude-gem")
 	got = candidates(other)
-	if len(got) != 2 {
-		t.Fatalf("non-default candidates = %v, want 2", got)
+	if len(got) != 1 {
+		t.Fatalf("non-default candidates = %v, want 1 (hashed only)", got)
 	}
 	if got[0] != ServiceFor(other) {
-		t.Errorf("non-default first = %q, want %q", got[0], ServiceFor(other))
+		t.Errorf("non-default = %q, want %q", got[0], ServiceFor(other))
 	}
-	if got[1] != PlainServiceName {
-		t.Errorf("non-default second = %q, want %q", got[1], PlainServiceName)
+}
+
+// TestHashedFirstCandidatesNoPlainFallback locks in the same invariant
+// for the hashed-first read path (used when AutoSwap is on). The default
+// dir keeps {hashed, plain} because plain is the legitimate location
+// for default's creds on a pristine install. Non-default dirs get the
+// hashed entry only.
+func TestHashedFirstCandidatesNoPlainFallback(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	defaultDir := filepath.Join(tmp, ".claude")
+	other := filepath.Join(tmp, ".claude-gem")
+
+	def := hashedFirstCandidates(defaultDir)
+	if len(def) != 2 || def[0] != ServiceFor(defaultDir) || def[1] != PlainServiceName {
+		t.Errorf("default hashed-first = %v, want [hashed, plain]", def)
+	}
+
+	nonDef := hashedFirstCandidates(other)
+	if len(nonDef) != 1 || nonDef[0] != ServiceFor(other) {
+		t.Errorf("non-default hashed-first = %v, want [hashed]", nonDef)
 	}
 }
 
@@ -230,6 +253,29 @@ func TestPlainServiceNameConstant(t *testing.T) {
 	// every existing user's keychain entry.
 	if PlainServiceName != "Claude Code-credentials" {
 		t.Errorf("PlainServiceName = %q, want %q", PlainServiceName, "Claude Code-credentials")
+	}
+}
+
+// TestLoadCredentialsForSwapTargetFileFallback covers the Linux failure
+// mode where libsecret doesn't have the target's hashed entry (headless
+// box, locked keyring, WSL, account migrated from another host) but
+// Claude Code did write <configDir>/.credentials.json. Without the file
+// fallback, every swap to that account fails with
+// `read target creds: secret-tool lookup ...: exit status 1`.
+func TestLoadCredentialsForSwapTargetFileFallback(t *testing.T) {
+	tmp := t.TempDir()
+	body := `{"claudeAiOauth":{"accessToken":"a","refreshToken":"r","expiresAt":1700000000000,"scopes":["x"]}}`
+	if err := os.WriteFile(filepath.Join(tmp, ".credentials.json"), []byte(body), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	// tmp's hashed service name will not exist in the test runner's real
+	// keychain — that's the scenario we want to exercise.
+	creds, err := LoadCredentialsForSwapTarget(tmp)
+	if err != nil {
+		t.Fatalf("LoadCredentialsForSwapTarget: %v", err)
+	}
+	if creds.AccessToken != "a" || creds.RefreshToken != "r" {
+		t.Errorf("creds = %+v, want access=a refresh=r", creds)
 	}
 }
 
