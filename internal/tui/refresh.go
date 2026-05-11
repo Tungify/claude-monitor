@@ -63,7 +63,7 @@ func (m *model) manualSwapCmd(target account.Row) tea.Cmd {
 		fromTag = account.Label(*active)
 	}
 	targetTag := account.Label(target)
-	targetUtil := account.FiveHourUtil(target.Usage)
+	targetUtil := account.EffectiveUtil(target.Usage)
 	return func() tea.Msg {
 		err := swap.Execute(rows, activeDir, target.ConfigDir)
 		return manualSwapDoneMsg{

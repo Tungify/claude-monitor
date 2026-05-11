@@ -203,6 +203,7 @@ export function PluginsDialog({ open, onOpenChange, sessionId }: Props) {
           error?: string;
           stderr?: string;
           stdout?: string;
+          refreshedMarketplace?: string;
         };
         if (!res.ok || !json.ok) {
           // The CLI's own error message lives on stderr; prefer it over
@@ -213,7 +214,10 @@ export function PluginsDialog({ open, onOpenChange, sessionId }: Props) {
             `failed (${res.status})`;
           setToast({ kind: "err", text: firstLine(reason) });
         } else {
-          setToast({ kind: "ok", text: `${busyLabel} succeeded` });
+          const suffix = json.refreshedMarketplace
+            ? ` (refreshed ${json.refreshedMarketplace})`
+            : "";
+          setToast({ kind: "ok", text: `${busyLabel} succeeded${suffix}` });
           await refresh();
         }
       } catch (err) {

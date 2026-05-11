@@ -40,6 +40,7 @@ import { ThinkingIndicator, TurnMetaLine } from "./thinking-indicator";
 import { QueueIndicator, computeQueuedMessages } from "./queue-indicator";
 import { PermissionDialog } from "./permission-dialog";
 import { PlanCard } from "./plan-card";
+import { McpDialog } from "./mcp-dialog";
 import { PluginsDialog } from "./plugins-dialog";
 import { RewindPicker } from "./rewind-picker";
 import { AskQuestionCard } from "./ask-question-card";
@@ -212,6 +213,7 @@ export function ChatPanel({ session }: Props) {
   // user re-opens it (history grows mid-session).
   const [rewindOpen, setRewindOpen] = useState(false);
   const [pluginsOpen, setPluginsOpen] = useState(false);
+  const [mcpOpen, setMcpOpen] = useState(false);
   // OR favorites list for the composer's model chip. Only fetched when
   // this session is OR-routed; native sessions skip the request. Picker
   // selections call patchOptions({model}) which goes through the SDK's
@@ -606,6 +608,7 @@ export function ChatPanel({ session }: Props) {
         router,
         openRewind: () => setRewindOpen(true),
         openPlugins: () => setPluginsOpen(true),
+        openMcp: () => setMcpOpen(true),
       });
       return;
     }
@@ -975,6 +978,12 @@ export function ChatPanel({ session }: Props) {
           onOpenChange={setPluginsOpen}
           sessionId={session.id}
         />
+        <McpDialog
+          open={mcpOpen}
+          onOpenChange={setMcpOpen}
+          sessionId={session.id}
+          accountName={session.account_name ?? undefined}
+        />
         <RewindPicker
           open={rewindOpen}
           onOpenChange={setRewindOpen}
@@ -1246,6 +1255,7 @@ interface ChatCommandContext {
   // handler; the picker manages its own loading + restore POST.
   openRewind: () => void;
   openPlugins: () => void;
+  openMcp: () => void;
 }
 
 const ALL_EFFORTS: Effort[] = ["low", "medium", "high", "xhigh", "max"];
@@ -1921,7 +1931,17 @@ async function runChatCommand(
     }
 
     case "mcp": {
-      await renderCliInfo(ctx, parsed, "mcp");
+      // Modal mirrors the CLI's MCP panel: list servers grouped by
+      // scope, per-row "View tools" / "Remove", "Re-authenticate" for
+      // claude.ai connectors, plus an Add-server form. The read-only
+      // chat-bubble rendering is preserved via `renderCliInfo` for
+      // callers that pass through the slash directly, but the slash
+      // command itself opens the dialog because actions need it.
+      ctx.openMcp();
+      ctx.appendOutput({
+        echo: parsed.raw,
+        body: "_MCP panel opened._",
+      });
       return;
     }
 

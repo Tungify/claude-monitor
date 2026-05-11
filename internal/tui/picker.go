@@ -75,7 +75,7 @@ func (m model) handlePickKey(msg tea.KeyMsg) (model, tea.Cmd, bool) {
 			// also the natural "set this as my pin" gesture — record
 			// it so rebalance-on-reset is suppressed going forward.
 			m.manualPickDir = target.ConfigDir
-			m.manualPickUtil = account.FiveHourUtil(target.Usage)
+			m.manualPickUtil = account.EffectiveUtil(target.Usage)
 			m.picking = false
 			m.flash = "pinned: " + account.Label(target)
 			m.flashExpiry = time.Now().Add(2 * time.Second)

@@ -14,28 +14,36 @@ import (
 // nil when no swap should happen. Logic:
 //
 //  1. Threshold cascade. For each tier t in ascending order:
-//     - if active.util < t and there is no eligible candidate at the
-//       lower tiers, stop — let the active account keep burning.
-//     - if active.util >= t and there is at least one candidate
+//     - if active.effective < t and there is no eligible candidate at
+//       the lower tiers, stop — let the active account keep burning.
+//     - if active.effective >= t and there is at least one candidate
 //       below t, pick the best per cfg.PickOrder and return it.
-//     - if active.util >= t but no candidate < t, escalate to the
+//     - if active.effective >= t but no candidate < t, escalate to the
 //       next tier.
 //
-//  2. Reset rebalance. If RebalanceOnReset is on and any non-active
-//     account just transitioned from positive util to ~0 since the last
-//     refresh, swap to that fresh account regardless of the threshold.
-//     This keeps load spread across accounts as their windows reset.
-//     Suppressed while the active account matches manualPickDir — once
-//     the user has manually pinned an account, only the threshold
-//     cascade is allowed to move off it.
+//     "effective util" is max(5h, weekly) per account — so an account
+//     whose 5h sits at 1% but whose weekly is at 99% is treated as
+//     exhausted, because the next 5h reset won't refresh its weekly
+//     budget and the next API call may 429.
 //
-// prevUtil maps configDir → previous-tick util, used only for the reset
-// detection. Pass nil on the first refresh.
+//  2. Reset rebalance. If RebalanceOnReset is on and any non-active
+//     account just transitioned from positive 5h util to ~0 since the
+//     last refresh, swap to that fresh account regardless of the
+//     threshold. This keeps load spread across accounts as their 5h
+//     windows reset (weekly resets are too rare and too costly to
+//     detect reliably across long restarts — they fall out via the
+//     cascade instead). Suppressed while the active account matches
+//     manualPickDir — once the user has manually pinned an account,
+//     only the threshold cascade is allowed to move off it.
+//
+// prevUtil maps configDir → previous-tick 5h util, used only for the
+// reset detection. Pass nil on the first refresh.
 //
 // manualPickDir is the configDir of the user's most recent manual pick
-// (empty when none). manualPickUtil is the 5h utilization of that
-// account at the moment the user pinned it. While the active account
-// matches manualPickDir, two relaxations apply:
+// (empty when none). manualPickUtil is the effective utilization
+// (max of 5h + weekly) of that account at the moment the user pinned
+// it. While the active account matches manualPickDir, two relaxations
+// apply:
 //
 //   - rebalance-on-reset is suppressed entirely.
 //   - threshold cascade skips any tier <= manualPickUtil — i.e. the
@@ -101,13 +109,22 @@ func decideSwap(rows []account.Row, activeDir string, prevUtil map[string]float6
 		for _, c := range candidates {
 			cur := account.FiveHourUtil(c.Usage)
 			prev, hadPrev := prevUtil[c.ConfigDir]
-			if hadPrev && prev >= 5 && cur < 1 {
-				return c, fmt.Sprintf("%s window reset", c.Name)
+			if !hadPrev || prev < 5 || cur >= 1 {
+				continue
 			}
+			// 5h reset doesn't help if the candidate's weekly is also
+			// near-exhausted — we'd just swap onto an account that
+			// 429s on its weekly limit a few requests later. Require
+			// weekly headroom below the first threshold tier too.
+			if len(cfg.SwapThresholds) > 0 &&
+				account.WeeklyUtil(c.Usage) >= cfg.SwapThresholds[0] {
+				continue
+			}
+			return c, fmt.Sprintf("%s window reset", c.Name)
 		}
 	}
 
-	activeUtil := account.FiveHourUtil(active.Usage)
+	activeUtil := account.EffectiveUtil(active.Usage)
 	for _, t := range cfg.SwapThresholds {
 		// While the user's manual pin is still in effect, skip any
 		// threshold the picked account had already exceeded at pin
@@ -122,7 +139,7 @@ func decideSwap(rows []account.Row, activeDir string, prevUtil map[string]float6
 		}
 		eligible := candidates[:0:0]
 		for _, c := range candidates {
-			if account.FiveHourUtil(c.Usage) < t {
+			if account.EffectiveUtil(c.Usage) < t {
 				eligible = append(eligible, c)
 			}
 		}
@@ -133,7 +150,15 @@ func decideSwap(rows []account.Row, activeDir string, prevUtil map[string]float6
 		if target == nil {
 			continue
 		}
-		reason := fmt.Sprintf("active hit %.0f%%", activeUtil)
+		// Surface which window drove the swap so log lines stay
+		// diagnosable when a "5h is fine but weekly is dead" rotation
+		// fires.
+		window := "5h"
+		if account.WeeklyUtil(active.Usage) >= account.FiveHourUtil(active.Usage) &&
+			account.WeeklyUtil(active.Usage) >= t {
+			window = "weekly"
+		}
+		reason := fmt.Sprintf("active hit %.0f%% (%s)", activeUtil, window)
 		return target, reason
 	}
 	return nil, ""
@@ -160,8 +185,8 @@ func pickTarget(eligible []*account.Row, order string) *account.Row {
 	}
 	sorted := append([]*account.Row(nil), eligible...)
 	sort.SliceStable(sorted, func(i, j int) bool {
-		ui := account.FiveHourUtil(sorted[i].Usage)
-		uj := account.FiveHourUtil(sorted[j].Usage)
+		ui := account.EffectiveUtil(sorted[i].Usage)
+		uj := account.EffectiveUtil(sorted[j].Usage)
 		if order == config.PickOrderHighest {
 			return ui > uj
 		}

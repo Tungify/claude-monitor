@@ -59,6 +59,59 @@ func TestRowFiveHourUtil(t *testing.T) {
 	}
 }
 
+func TestWeeklyUtil(t *testing.T) {
+	if got := WeeklyUtil(nil); got != 0 {
+		t.Errorf("WeeklyUtil(nil) = %v, want 0", got)
+	}
+	if got := WeeklyUtil(&api.Usage{}); got != 0 {
+		t.Errorf("WeeklyUtil(empty) = %v, want 0", got)
+	}
+	// Should pick the max across the three weekly windows.
+	u := &api.Usage{
+		SevenDay:       &api.Window{Utilization: 30},
+		SevenDaySonnet: &api.Window{Utilization: 90},
+		SevenDayOpus:   &api.Window{Utilization: 50},
+	}
+	if got := WeeklyUtil(u); got != 90 {
+		t.Errorf("WeeklyUtil(mixed) = %v, want 90 (max wins)", got)
+	}
+}
+
+func TestEffectiveUtil(t *testing.T) {
+	// 5h dominates.
+	hi5h := &api.Usage{
+		FiveHour: &api.Window{Utilization: 95},
+		SevenDay: &api.Window{Utilization: 20},
+	}
+	if got := EffectiveUtil(hi5h); got != 95 {
+		t.Errorf("EffectiveUtil(5h=95) = %v, want 95", got)
+	}
+	// Weekly dominates — the scenario the swap fix is about.
+	hiWk := &api.Usage{
+		FiveHour: &api.Window{Utilization: 1},
+		SevenDay: &api.Window{Utilization: 99},
+	}
+	if got := EffectiveUtil(hiWk); got != 99 {
+		t.Errorf("EffectiveUtil(5h=1 weekly=99) = %v, want 99", got)
+	}
+	if got := EffectiveUtil(nil); got != 0 {
+		t.Errorf("EffectiveUtil(nil) = %v, want 0", got)
+	}
+}
+
+func TestRowEffectiveUtil(t *testing.T) {
+	if got := RowEffectiveUtil(nil); got != 0 {
+		t.Errorf("RowEffectiveUtil(nil) = %v, want 0", got)
+	}
+	r := &Row{Usage: &api.Usage{
+		FiveHour: &api.Window{Utilization: 5},
+		SevenDay: &api.Window{Utilization: 88},
+	}}
+	if got := RowEffectiveUtil(r); got != 88 {
+		t.Errorf("RowEffectiveUtil = %v, want 88", got)
+	}
+}
+
 func TestFindRow(t *testing.T) {
 	rows := []Row{
 		{Name: "a", ConfigDir: "/a"},

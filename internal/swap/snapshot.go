@@ -135,8 +135,8 @@ func FetchAll(ctx context.Context, rootSpec string, cfg config.Config, skipUntil
 			ev := &Event{
 				FromName: account.DisplayName(active),
 				ToName:   target.Name,
-				FromUtil: account.RowFiveHourUtil(active),
-				ToUtil:   account.FiveHourUtil(target.Usage),
+				FromUtil: account.RowEffectiveUtil(active),
+				ToUtil:   account.EffectiveUtil(target.Usage),
 				Reason:   reason,
 			}
 			if err := Execute(rows, result.ActiveDir, target.ConfigDir); err != nil {
