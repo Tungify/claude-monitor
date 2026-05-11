@@ -89,10 +89,11 @@ type model struct {
 	picking       bool
 	pickCursor    int
 	manualPickDir string
-	// manualPickUtil is the 5h util of the picked account at the
-	// moment of pin. decideSwap uses it to skip threshold tiers the
-	// user already saw at pin time — so a deliberate pick at 52%
-	// with thresholds [50, 80, 100] sticks until 80, not 50.
+	// manualPickUtil is the effective util (max of 5h and weekly) of
+	// the picked account at the moment of pin. decideSwap uses it to
+	// skip threshold tiers the user already saw at pin time — so a
+	// deliberate pick at 52% with thresholds [50, 80, 100] sticks
+	// until 80, not 50.
 	manualPickUtil float64
 	manualSwapping bool
 

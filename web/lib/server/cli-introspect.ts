@@ -116,6 +116,10 @@ export interface McpServerInfo {
   // File-configured servers leave this undefined (status would need a live
   // probe through the SDK which the chat thread can't afford to block on).
   authStatus?: "ready" | "needs_auth";
+  // claude.ai connector ID (e.g. "mcprs_abc123"). Only populated for
+  // scope=claudeai rows; lets the dialog build the per-connector auth
+  // deep-link `claude.ai/api/organizations/<orgUuid>/mcp/start-auth/<id>`.
+  id?: string;
 }
 
 interface CredsEnvelope {
@@ -153,6 +157,26 @@ async function readCredsEnvelope(
     path.join(configDir, ".credentials.json"),
   );
   return env?.claudeAiOauth;
+}
+
+// Reads the OAuth account profile written by `claude` after /login.
+// Returns the organizationUuid the MCP dialog uses to build the
+// per-connector auth deep-link
+// `claude.ai/api/organizations/<orgUuid>/mcp/start-auth/<serverId>`.
+// Falls back to the home ~/.claude.json when the per-account file
+// hasn't been written yet (fresh install pre-first-/login).
+export async function readOrganizationUuid(
+  configDir: string,
+): Promise<string | undefined> {
+  const accountClaudeJson = await readJson<ClaudeJsonShape>(
+    path.join(configDir, ".claude.json"),
+  );
+  const uuid = accountClaudeJson?.oauthAccount?.organizationUuid;
+  if (uuid) return uuid;
+  const home = await readJson<ClaudeJsonShape>(
+    path.join(os.homedir(), ".claude.json"),
+  );
+  return home?.oauthAccount?.organizationUuid;
 }
 
 // Lists claude.ai-managed MCP integrations (the connectors a user
@@ -218,6 +242,7 @@ async function fetchClaudeAiMcpViaDaemon(
         // hint — the CLI does the same, since per-connector auth
         // lives on Claude's side and we can't probe it from here.
         authStatus: "needs_auth",
+        id: s.id,
       });
     }
     out.sort((a, b) => a.name.localeCompare(b.name));
@@ -286,6 +311,7 @@ async function fetchClaudeAiMcpFromFile(
       type: "http",
       target: s.url,
       authStatus: "needs_auth",
+      id: s.id,
     });
   }
   out.sort((a, b) => a.name.localeCompare(b.name));

@@ -10,6 +10,7 @@ import {
   listPlugins,
   listSkills,
   loadSettings,
+  readOrganizationUuid,
   readPermissions,
 } from "@/lib/server/cli-introspect";
 import { snapshotSession } from "@/lib/server/sessions";
@@ -41,12 +42,15 @@ export async function GET(req: Request, { params }: Ctx) {
   try {
     switch (topic) {
       case "mcp": {
-        // Fire file-walk + claude.ai connector fetch in parallel —
-        // both are I/O bound and independent. The connector fetch is
-        // wrapped to never throw (returns {servers:[], needsAuth:bool}).
-        const [configured, claudeAi] = await Promise.all([
+        // Fire file-walk + claude.ai connector fetch + org uuid read
+        // in parallel — all are I/O bound and independent. The
+        // connector fetch is wrapped to never throw (returns
+        // {servers:[], needsAuth:bool}); the org-uuid read returns
+        // undefined when no oauthAccount has been written yet.
+        const [configured, claudeAi, organizationUuid] = await Promise.all([
           listMcpServers(configDir, cwd),
           fetchClaudeAiMcpServers(configDir),
+          readOrganizationUuid(configDir),
         ]);
         // Surface the orchestrator's in-process MCP servers alongside
         // the configured ones. Without these the /mcp panel reads as
@@ -89,6 +93,10 @@ export async function GET(req: Request, { params }: Ctx) {
           // signal so the chat panel can prompt re-auth instead of
           // silently showing zero claude.ai integrations.
           claudeAiNeedsAuth: claudeAi.needsAuth,
+          // Used by the MCP dialog to build per-connector auth deep-
+          // links. Undefined when no oauthAccount is recorded yet —
+          // dialog falls back to the generic settings/connectors page.
+          organizationUuid,
         });
       }
       case "agents": {

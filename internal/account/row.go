@@ -81,6 +81,40 @@ func FiveHourUtil(u *api.Usage) float64 {
 	return u.FiveHour.Utilization
 }
 
+// WeeklyUtil returns the max utilization across the per-plan weekly
+// windows (seven_day, seven_day_sonnet, seven_day_opus). A nil window
+// contributes 0, so plans that only expose one of the three still
+// produce a meaningful number.
+func WeeklyUtil(u *api.Usage) float64 {
+	if u == nil {
+		return 0
+	}
+	w := 0.0
+	if u.SevenDay != nil && u.SevenDay.Utilization > w {
+		w = u.SevenDay.Utilization
+	}
+	if u.SevenDaySonnet != nil && u.SevenDaySonnet.Utilization > w {
+		w = u.SevenDaySonnet.Utilization
+	}
+	if u.SevenDayOpus != nil && u.SevenDayOpus.Utilization > w {
+		w = u.SevenDayOpus.Utilization
+	}
+	return w
+}
+
+// EffectiveUtil is what auto-swap compares against thresholds: the
+// worst of the 5h window and any weekly window. A 1%-5h account whose
+// weekly is at 99% is effectively exhausted — swap should treat it the
+// same as a 99%-5h account, because the next refresh fixes neither.
+func EffectiveUtil(u *api.Usage) float64 {
+	f := FiveHourUtil(u)
+	w := WeeklyUtil(u)
+	if w > f {
+		return w
+	}
+	return f
+}
+
 // RowFiveHourUtil is the nil-safe per-row variant: handy for callers
 // that hold a *Row pointer that may be nil (e.g. when the active
 // account hasn't been resolved yet).
@@ -89,6 +123,14 @@ func RowFiveHourUtil(r *Row) float64 {
 		return 0
 	}
 	return FiveHourUtil(r.Usage)
+}
+
+// RowEffectiveUtil is the nil-safe per-row variant of EffectiveUtil.
+func RowEffectiveUtil(r *Row) float64 {
+	if r == nil {
+		return 0
+	}
+	return EffectiveUtil(r.Usage)
 }
 
 // FindRow returns the row whose ConfigDir matches, or nil. Used wherever

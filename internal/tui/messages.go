@@ -69,11 +69,11 @@ type loginDoneMsg struct {
 
 // manualSwapDoneMsg is the result of a [m]-triggered keychain rewrite.
 // targetDir identifies the account the user picked; targetUtil is the
-// 5h utilization of that account at the moment of pin (used by
-// decideSwap to decide which threshold tiers to skip while the pin is
-// in effect). err is non-nil when the keychain write failed (in which
-// case the active account is unchanged and a flash banner reports the
-// error).
+// effective utilization (max of 5h and weekly) of that account at the
+// moment of pin (used by decideSwap to decide which threshold tiers to
+// skip while the pin is in effect). err is non-nil when the keychain
+// write failed (in which case the active account is unchanged and a
+// flash banner reports the error).
 type manualSwapDoneMsg struct {
 	targetDir  string
 	targetTag  string

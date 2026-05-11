@@ -61,39 +61,68 @@ export async function POST(req: Request, { params }: Ctx) {
     return NextResponse.json({ error: action.error }, { status: 400 });
   }
 
+  // Plugin marketplace state (known_marketplaces.json, installed_plugins.json,
+  // marketplace caches) is written under $CLAUDE_CONFIG_DIR/plugins/,
+  // which defaults to $HOME/.claude/plugins when CLAUDE_CONFIG_DIR is
+  // unset. cli-introspect reads from $HOME/.claude/plugins, so the
+  // catalog the user sees in this dialog is the $HOME view.
+  //
+  // We deliberately do NOT scope plugin commands by the session's per-
+  // account CLAUDE_CONFIG_DIR: doing so points the binary at an empty
+  // per-account plugin DB (zero marketplaces), so a "skill-creator@
+  // claude-plugins-official" install fails with "marketplace not found"
+  // even though the catalog clearly shows that marketplace. Mirror the
+  // catalog's scope so what's visible is also actionable. snap above
+  // is kept for its session-existence guard.
+  const env = { ...process.env };
+  delete env.CLAUDE_CONFIG_DIR;
   const argv = buildArgv(action);
   try {
-    const out = await exec(claude, argv, {
-      env: {
-        ...process.env,
-        // Pin to the session's account config dir so the install lands in
-        // the right ~/.claude. Without this the CLI would fall back to
-        // $CLAUDE_CONFIG_DIR/$HOME — wrong account when the user is
-        // running multiple sessions across accounts.
-        CLAUDE_CONFIG_DIR: snap.summary.config_dir,
-      },
-      // Generous: a fresh install can clone a marketplace repo on first
-      // touch; a 60s cap covers slow networks without letting the request
-      // hang forever on a stalled DNS.
-      timeout: 60_000,
-      // Plenty for the verbose CLI output without spending memory on
-      // edge cases.
-      maxBuffer: 4 * 1024 * 1024,
-    });
+    const out = await runClaudePlugin(claude, argv, env);
     return NextResponse.json({
       ok: true,
-      stdout: out.stdout.toString(),
-      stderr: out.stderr.toString(),
+      stdout: out.stdout,
+      stderr: out.stderr,
     });
   } catch (err) {
-    // execFile rejects with the child's stdout/stderr attached on the
-    // error. Forward both so the dialog can show the CLI's own error
-    // message instead of a generic "command failed".
-    const e = err as NodeJS.ErrnoException & {
-      stdout?: Buffer | string;
-      stderr?: Buffer | string;
-      code?: number | string;
-    };
+    const e = asExecError(err);
+    // The CLI marketplace cache is local — it gets stale as upstream
+    // adds new plugins. On a "plugin not found in marketplace … local
+    // copy may be out of date" failure, refresh that marketplace once
+    // and retry transparently. Anything else (network 5xx, settings
+    // permission, etc.) propagates as-is so the dialog shows the real
+    // error.
+    if (action.kind === "install" && isStaleMarketplaceErr(e)) {
+      const marketplace = parseMarketplaceFromPluginId(action.pluginId);
+      if (marketplace) {
+        try {
+          await runClaudePlugin(
+            claude,
+            ["plugin", "marketplace", "update", marketplace],
+            env,
+          );
+          const retry = await runClaudePlugin(claude, argv, env);
+          return NextResponse.json({
+            ok: true,
+            stdout: retry.stdout,
+            stderr: retry.stderr,
+            refreshedMarketplace: marketplace,
+          });
+        } catch (retryErr) {
+          const r = asExecError(retryErr);
+          return NextResponse.json(
+            {
+              error: r.message,
+              stdout: r.stdout?.toString?.() ?? "",
+              stderr: r.stderr?.toString?.() ?? "",
+              exitCode: typeof r.code === "number" ? r.code : undefined,
+              attemptedMarketplaceRefresh: marketplace,
+            },
+            { status: 500 },
+          );
+        }
+      }
+    }
     return NextResponse.json(
       {
         error: e.message,
@@ -104,6 +133,53 @@ export async function POST(req: Request, { params }: Ctx) {
       { status: 500 },
     );
   }
+}
+
+type ExecError = NodeJS.ErrnoException & {
+  stdout?: Buffer | string;
+  stderr?: Buffer | string;
+  code?: number | string;
+};
+
+function asExecError(err: unknown): ExecError {
+  return err as ExecError;
+}
+
+async function runClaudePlugin(
+  claude: string,
+  argv: string[],
+  env: NodeJS.ProcessEnv,
+) {
+  const out = await exec(claude, argv, {
+    env,
+    // Generous: a fresh install can clone a marketplace repo on first
+    // touch, and a marketplace refresh re-syncs the whole index;
+    // 60s covers slow networks without letting the request hang
+    // forever on a stalled DNS.
+    timeout: 60_000,
+    // Plenty for the verbose CLI output without spending memory on
+    // edge cases.
+    maxBuffer: 4 * 1024 * 1024,
+  });
+  return { stdout: out.stdout.toString(), stderr: out.stderr.toString() };
+}
+
+function isStaleMarketplaceErr(e: ExecError): boolean {
+  const blob = `${e.message ?? ""}\n${e.stdout?.toString?.() ?? ""}\n${e.stderr?.toString?.() ?? ""}`;
+  return (
+    /not found in marketplace/i.test(blob) &&
+    /(out of date|marketplace update)/i.test(blob)
+  );
+}
+
+// Plugin IDs the catalog hands us are typically "<plugin>@<marketplace>".
+// Bare "<plugin>" would mean "install whichever marketplace has it" —
+// no marketplace to refresh in that case, so we return null and let the
+// regular error path surface.
+function parseMarketplaceFromPluginId(pluginId: string): string | null {
+  const at = pluginId.lastIndexOf("@");
+  if (at <= 0 || at === pluginId.length - 1) return null;
+  return pluginId.slice(at + 1);
 }
 
 function parseAction(body: unknown): Action | { error: string } {

@@ -2,6 +2,7 @@ package swap
 
 import (
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -15,6 +16,17 @@ import (
 func row(name, dir string, util float64, refresh string) account.Row {
 	r := account.Row{Name: name, ConfigDir: dir, RefreshToken: refresh}
 	r.Usage = &api.Usage{FiveHour: &api.Window{Utilization: util}}
+	return r
+}
+
+// rowWk is row + an explicit weekly utilization. Used by tests that
+// care about the "5h fine, weekly maxed" rotation path.
+func rowWk(name, dir string, fiveHour, weekly float64, refresh string) account.Row {
+	r := account.Row{Name: name, ConfigDir: dir, RefreshToken: refresh}
+	r.Usage = &api.Usage{
+		FiveHour: &api.Window{Utilization: fiveHour},
+		SevenDay: &api.Window{Utilization: weekly},
+	}
 	return r
 }
 
@@ -260,6 +272,23 @@ func TestDecideSwapRebalanceNeedsThreshold(t *testing.T) {
 	}
 }
 
+// TestDecideSwapRebalanceSkipsWeeklyDeadCandidate: rebalance-on-reset
+// must not swap to a freshly-reset 5h candidate whose weekly is already
+// near its limit. The first threshold tier guards against rotating onto
+// an about-to-die account.
+func TestDecideSwapRebalanceSkipsWeeklyDeadCandidate(t *testing.T) {
+	cfg := defaultCfg()
+	rows := []account.Row{
+		row("a", "/a", 30, "ra"),
+		rowWk("b", "/b", 0, 95, "rb"), // 5h reset (60→0) but weekly=95 (>= 90 tier)
+	}
+	prev := map[string]float64{"/b": 60}
+	got, _ := decideSwap(rows, "/a", prev, "", 0, cfg)
+	if got != nil {
+		t.Errorf("rebalance should skip weekly-exhausted candidate, got %+v", got)
+	}
+}
+
 func TestDecideSwapRebalanceNoFireOnPositiveCurrent(t *testing.T) {
 	cfg := defaultCfg()
 	rows := []account.Row{
@@ -422,6 +451,88 @@ func TestDecideSwapActiveUsageRateLimitedRespectsManualPin(t *testing.T) {
 	got, _ := decideSwap(rows, "/a", nil, "/a", 50, defaultCfg())
 	if got != nil {
 		t.Errorf("expected nil when active is the manual pin, got %+v", got)
+	}
+}
+
+// TestDecideSwapFiresOnWeeklyAlone covers the user-reported scenario:
+// the active account's 5h is barely touched (1%) but its weekly is
+// pinned at 99%. The next request will likely 429 on the weekly limit,
+// so the threshold cascade must rotate even though 5h is fine.
+func TestDecideSwapFiresOnWeeklyAlone(t *testing.T) {
+	rows := []account.Row{
+		rowWk("a", "/a", 1, 99, "ra"), // 5h=1, weekly=99 → effective=99
+		rowWk("b", "/b", 10, 10, "rb"),
+	}
+	got, reason := decideSwap(rows, "/a", nil, "", 0, defaultCfg())
+	if got == nil {
+		t.Fatal("expected swap when active's weekly is at 99%, got nil")
+	}
+	if got.Name != "b" {
+		t.Errorf("target = %q, want b", got.Name)
+	}
+	if reason == "" {
+		t.Error("expected non-empty reason")
+	}
+	// The reason should label which window drove the swap; weekly here.
+	if !strings.Contains(reason, "weekly") {
+		t.Errorf("reason = %q, want it to mention 'weekly'", reason)
+	}
+}
+
+// TestDecideSwapWeeklyDoesNotMaskFiveHour: 5h drives the cascade when
+// it's the worse window. The reason should label "5h", not "weekly".
+func TestDecideSwapFiresOnFiveHourWhenWorse(t *testing.T) {
+	rows := []account.Row{
+		rowWk("a", "/a", 95, 20, "ra"), // 5h=95, weekly=20 → effective=95
+		rowWk("b", "/b", 10, 10, "rb"),
+	}
+	got, reason := decideSwap(rows, "/a", nil, "", 0, defaultCfg())
+	if got == nil {
+		t.Fatal("expected swap, got nil")
+	}
+	if got.Name != "b" {
+		t.Errorf("target = %q, want b", got.Name)
+	}
+	if !strings.Contains(reason, "5h") {
+		t.Errorf("reason = %q, want it to mention '5h'", reason)
+	}
+}
+
+// TestDecideSwapPicksByEffectiveUtil: when two candidates differ on
+// weekly even though 5h looks similar, pickTarget (lowest) should prefer
+// the one whose effective util is lower. Otherwise we'd swap onto an
+// account that's about to hit its weekly limit.
+func TestDecideSwapPicksByEffectiveUtil(t *testing.T) {
+	rows := []account.Row{
+		rowWk("a", "/a", 95, 20, "ra"),    // active, needs to rotate
+		rowWk("almost", "/al", 10, 95, "ral"), // 5h fresh but weekly almost dead
+		rowWk("fresh", "/fr", 30, 30, "rfr"),   // worse 5h, MUCH better effective
+	}
+	got, _ := decideSwap(rows, "/a", nil, "", 0, defaultCfg())
+	if got == nil {
+		t.Fatal("expected swap, got nil")
+	}
+	if got.Name != "fresh" {
+		t.Errorf("target = %q, want fresh (lower effective util beats lower 5h)", got.Name)
+	}
+}
+
+// TestDecideSwapWeeklyMaxedAllCandidates: when every candidate's weekly
+// is also above the first tier, escalation should pick whichever still
+// sits below the next tier — same as the existing 5h escalation, just
+// driven by weekly.
+func TestDecideSwapWeeklyEscalates(t *testing.T) {
+	rows := []account.Row{
+		rowWk("a", "/a", 1, 99.5, "ra"),  // active, weekly above tier 99
+		rowWk("b", "/b", 1, 92, "rb"),    // weekly < 99, eligible at tier 2
+		rowWk("c", "/c", 1, 99, "rc"),    // weekly exactly 99, not < 99
+	}
+	got, _ := decideSwap(rows, "/a", nil, "", 0, defaultCfg())
+	if got == nil {
+		t.Fatal("expected escalation, got nil")
+	}
+	if got.Name != "b" {
+		t.Errorf("target = %q, want b (only candidate < 99 weekly)", got.Name)
 	}
 }
 
