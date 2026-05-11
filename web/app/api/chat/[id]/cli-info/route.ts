@@ -36,8 +36,43 @@ export async function GET(req: Request, { params }: Ctx) {
   try {
     switch (topic) {
       case "mcp": {
-        const servers = await listMcpServers(configDir, cwd);
-        return NextResponse.json({ servers });
+        const configured = await listMcpServers(configDir, cwd);
+        // Surface the orchestrator's in-process MCP servers alongside
+        // the configured ones. Without these the /mcp panel reads as
+        // "no MCP servers" for a fresh account — confusing because the
+        // session very much has plan/notes/leader tools available. The
+        // builtins are session-shape dependent: phase sessions get
+        // notes, owner sessions get the leader toolkit, both get plan.
+        const builtins: Array<{
+          name: string;
+          scope: "builtin";
+          type: string;
+          target?: string;
+        }> = [
+          {
+            name: "plan",
+            scope: "builtin",
+            type: "sdk",
+            target: "claude-monitor · plan submit / read",
+          },
+        ];
+        if (snap.summary.plan_id && snap.summary.phase_slug) {
+          builtins.push({
+            name: "notes",
+            scope: "builtin",
+            type: "sdk",
+            target: "claude-monitor · sibling-phase notes",
+          });
+        }
+        if (!snap.summary.phase_slug) {
+          builtins.push({
+            name: "leader",
+            scope: "builtin",
+            type: "sdk",
+            target: "claude-monitor · cross-phase planner toolkit",
+          });
+        }
+        return NextResponse.json({ servers: [...builtins, ...configured] });
       }
       case "agents": {
         const agents = await listAgents(configDir, cwd);

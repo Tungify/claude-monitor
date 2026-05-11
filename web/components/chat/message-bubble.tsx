@@ -9,6 +9,8 @@ import { isSubagentDispatchTool } from "@/lib/subagents";
 import { cn } from "@/lib/utils";
 import { SubagentCard } from "./subagent-card";
 import { useSubagents } from "./subagent-context";
+import { TurnMetaLine } from "./thinking-indicator";
+import { useTurnEndMeta, type TurnEndMeta } from "./turn-end-meta-context";
 
 interface Props {
   msg: SDKMessage;
@@ -26,7 +28,12 @@ export function MessageBubble({ msg }: Props) {
     case "user":
       return <UserBubble msg={msg} />;
     case "result":
-      return <ResultBubble msg={msg} />;
+      // Result messages used to render their own divider, but the
+      // meta + cost now ride along on the assistant bubble that ended
+      // the turn (via TurnEndMetaContext). Skipping them here keeps
+      // the meta visually glued to the response instead of jumping to
+      // a separate row, which read as "the time disappeared".
+      return null;
     default:
       // system/init and stream_event variants are silenced — the header
       // already shows session metadata, and stream deltas drive the
@@ -42,6 +49,12 @@ function AssistantBubble({
 }) {
   const content = msg.message.content;
   const subagents = useSubagents();
+  // Only the last assistant message of each turn has an entry in the
+  // map — see chat-panel.tsx where `turnEndMeta` is computed. For
+  // mid-turn assistants (Claude calling a tool, getting a result,
+  // then continuing) this returns null and no footer renders.
+  const uuid = (msg as { uuid?: string }).uuid;
+  const endMeta = useTurnEndMeta(uuid);
   return (
     <div className="space-y-1">
       {content.map((block, i) => {
@@ -98,6 +111,27 @@ function AssistantBubble({
         }
         return null;
       })}
+      {endMeta && <AssistantTurnFooter meta={endMeta} />}
+    </div>
+  );
+}
+
+// AssistantTurnFooter renders the per-turn meta line ("3m 43s · ↑
+// 17.5k tokens · ↓ 1.2k") directly underneath the assistant content
+// that ended the turn. Glued to the bubble (not a separate divider)
+// so the meta visible during streaming stays in the same spot once
+// the turn settles — no "the time disappeared" jump.
+function AssistantTurnFooter({ meta }: { meta: TurnEndMeta }) {
+  return (
+    <div className="flex flex-wrap items-center gap-2 px-1 pt-0.5 text-xs text-muted-foreground">
+      <TurnMetaLine
+        elapsedMs={meta.durationMs}
+        inputTokens={meta.inputTokens}
+        outputTokens={meta.outputTokens}
+      />
+      {meta.isError && meta.errorLabel && (
+        <span className="text-destructive">{meta.errorLabel}</span>
+      )}
     </div>
   );
 }
@@ -198,28 +232,6 @@ function UserBubble({ msg }: { msg: Extract<SDKMessage, { type: "user" }> }) {
   );
 }
 
-function ResultBubble({
-  msg,
-}: {
-  msg: Extract<SDKMessage, { type: "result" }>;
-}) {
-  return (
-    <div className="rounded-md border-l-2 border-l-muted-foreground/40 bg-muted/30 px-3 py-1.5 text-xs text-muted-foreground">
-      <span className="font-mono">turn end</span>
-      <span> · {msg.num_turns} turns</span>
-      <span> · {Math.round(msg.duration_ms)}ms</span>
-      <span>
-        {" "}
-        · ${msg.total_cost_usd.toFixed(4)}
-      </span>
-      {msg.is_error && (
-        <span className="ml-2 text-destructive">
-          {msg.subtype.replace("error_", "error: ")}
-        </span>
-      )}
-    </div>
-  );
-}
 
 // Shared block renderers used by both finalized history and the streaming
 // preview. Keeping them here so the in-progress rendering can't drift away

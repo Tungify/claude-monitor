@@ -1768,16 +1768,41 @@ export interface RewindResult {
 
 export async function rewindSession(
   sessionId: string,
-  opts: { snapshotId: string; mode: "code" | "conversation" | "both" },
+  opts: {
+    snapshotId?: string;
+    // Conversation-only rewinds: the picker passes the target user
+    // message id directly when no file snapshot exists for that turn.
+    // Code/both still require snapshotId — file restore can't happen
+    // without backups to write back.
+    parentMessageId?: string;
+    mode: "code" | "conversation" | "both";
+  },
 ): Promise<RewindResult> {
   const s = getOrResume(sessionId);
   if (!s) throw new Error("session not found");
-  const snapshots = await fhListSnapshots(sessionId);
-  const target = snapshots.find((sn) => sn.id === opts.snapshotId);
-  if (!target) throw new Error("snapshot not found");
+
+  // Resolve the cut id once. Prefer the explicit parentMessageId so
+  // conversation-only rewinds work without touching file history; fall
+  // back to the snapshot's recorded parent when only snapshotId came in.
+  let cutId = opts.parentMessageId;
+  if (!cutId && opts.snapshotId) {
+    const snapshots = await fhListSnapshots(sessionId);
+    const target = snapshots.find((sn) => sn.id === opts.snapshotId);
+    if (!target) throw new Error("snapshot not found");
+    cutId = target.parentMessageId;
+  }
+  if (opts.snapshotId && opts.mode !== "conversation") {
+    // Validate the snapshot exists when we'll actually use it for file
+    // restore — listSnapshots reads disk so we avoid the extra call
+    // unless code/both is the active mode.
+    const snapshots = await fhListSnapshots(sessionId);
+    if (!snapshots.some((sn) => sn.id === opts.snapshotId)) {
+      throw new Error("snapshot not found");
+    }
+  }
 
   const result: RewindResult = {};
-  if (opts.mode === "code" || opts.mode === "both") {
+  if ((opts.mode === "code" || opts.mode === "both") && opts.snapshotId) {
     result.files = await fhRestoreCode(sessionId, opts.snapshotId);
   }
   if (opts.mode === "conversation" || opts.mode === "both") {
@@ -1786,10 +1811,9 @@ export async function rewindSession(
     // and re-resume so the SDK reads the truncated transcript on next
     // turn. Without the abort the running query would keep streaming
     // into stale history slots.
-    const cutId = target.parentMessageId;
     if (!cutId) {
       throw new Error(
-        "snapshot has no parentMessageId — conversation rewind unavailable",
+        "parent_message_id missing — conversation rewind needs a target user message",
       );
     }
     const cutIdx = s.history.findIndex(

@@ -117,12 +117,13 @@ type Props = HomeProps | SessionProps;
 // Behavior change vs the old composer: per the user's request, Enter
 // inserts a newline and Shift+Enter (or the send button) submits.
 export function Composer(props: Props) {
-  // Pull the persisted draft synchronously on mount so the textarea
-  // never flashes empty on a chat switch. We pass the initialiser to
-  // useState (function form) so this only runs once per mount.
-  const [text, setText] = useState<string>(() =>
-    readDraft(props.draftKey),
-  );
+  // Start empty so SSR and the first client render agree: reading
+  // localStorage in the useState initializer would diverge from the
+  // server's empty string and cascade into a hydration mismatch on
+  // every downstream attribute (the Send button's `disabled` flips on
+  // text length). The draft is rehydrated in an effect below, post-
+  // mount, so the textarea picks it up on the next paint.
+  const [text, setText] = useState<string>("");
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   const [errors, setErrors] = useState<string[]>([]);
   const [dragOver, setDragOver] = useState(false);
@@ -143,15 +144,17 @@ export function Composer(props: Props) {
   // updated yet on the same keystroke.
   const submittingRef = useRef(false);
 
-  // Re-hydrate when the draftKey changes. Switching between chats
-  // remounts ChatPanel (different route segment), so this normally
-  // doesn't fire — but home view → another route → home view keeps
-  // the component mounted across page transitions in some flows. Keep
-  // the textarea and storage in lockstep regardless.
+  // Load the persisted draft post-mount. Runs on first render (initial
+  // draftKey) so the textarea picks up the stored value as soon as
+  // hydration completes, and again whenever draftKey changes (e.g. home
+  // view → another route → home view, where the component stays mounted
+  // across page transitions). Reading localStorage here — not in the
+  // useState initializer — is what keeps SSR and client hydration in
+  // sync; see the `text` state declaration above.
   useEffect(() => {
     if (!props.draftKey) return;
     const stored = readDraft(props.draftKey);
-    setText(stored);
+    if (stored) setText(stored);
     // Don't trigger a write back here; useEffect for persistence
     // (below) will no-op if the value matches storage already.
   }, [props.draftKey]);

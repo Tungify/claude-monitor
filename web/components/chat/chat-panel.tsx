@@ -36,7 +36,7 @@ import {
 import { nextPermissionMode } from "@/lib/permission-mode";
 import { SidebarTrigger } from "@/components/sidebar/sidebar-trigger";
 import { MessageBubble, StreamingTurn } from "./message-bubble";
-import { ThinkingIndicator } from "./thinking-indicator";
+import { ThinkingIndicator, TurnMetaLine } from "./thinking-indicator";
 import { QueueIndicator, computeQueuedMessages } from "./queue-indicator";
 import { PermissionDialog } from "./permission-dialog";
 import { PlanCard } from "./plan-card";
@@ -44,6 +44,10 @@ import { RewindPicker } from "./rewind-picker";
 import { AskQuestionCard } from "./ask-question-card";
 import { ToolRunCard } from "./tool-run-card";
 import { SubagentProvider } from "./subagent-context";
+import {
+  TurnEndMetaProvider,
+  type TurnEndMeta,
+} from "./turn-end-meta-context";
 import { isSubagentDispatchTool, shouldHideFromMainTimeline } from "@/lib/subagents";
 import {
   CommandOutputBubble,
@@ -83,6 +87,23 @@ interface Props {
 // (ExitPlanMode, AskUserQuestion would be siblings if they weren't
 // already lifted out via dedicated cards).
 const STANDALONE_TOOLS = new Set(["TodoWrite"]);
+
+// A user message that begins a new turn: typed text or image input the
+// human authored. Tool-result-only echoes (`content` is an array where
+// every block is `tool_result`) are mid-turn replies from the previous
+// assistant tool_use, not new turns — exclude them so the duration chip
+// only appears on the messages users actually typed.
+function isTurnStartingUserMessage(msg: SDKMessage): boolean {
+  if (msg.type !== "user") return false;
+  const content = msg.message?.content;
+  if (typeof content === "string") return true;
+  if (!Array.isArray(content) || content.length === 0) return false;
+  for (const b of content) {
+    const t = (b as { type?: string }).type;
+    if (t && t !== "tool_result") return true;
+  }
+  return false;
+}
 
 function hasStandaloneTool(blocks: { type: string; name?: string }[]): boolean {
   for (const b of blocks) {
@@ -604,12 +625,152 @@ export function ChatPanel({ session }: Props) {
 
   const cwdLabel = shortenCwd(session.cwd);
 
+  // Per-turn timings: powers the "took Ns" chip shown under each user
+  // message. Three pieces fit together:
+  //
+  //   1. `seenStarts` records when each user-typed message first
+  //      entered the renderer's view. Drives the live ticker for the
+  //      in-flight turn — resume/refresh loses these, which is fine
+  //      because completed turns also carry `result.duration_ms`.
+  //   2. `turnTimings` walks history and pairs each selectable user
+  //      message with the next `result` message; the result's
+  //      `duration_ms` is the authoritative finished number.
+  //   3. `now1Hz` ticks at 1 Hz only while a turn is in flight, so the
+  //      live chip re-renders without waking idle chats.
+  const [seenStarts, setSeenStarts] = useState<Map<string, number>>(
+    () => new Map(),
+  );
+  useEffect(() => {
+    // Record the moment each newly-observed user message arrived.
+    // First-time observation only — never overwrite (a re-render with
+    // the same uuid keeps its original start). React 19's lint warns
+    // against set-state-in-effect in general; this is the legitimate
+    // "capture first-seen wall clock" pattern that has no alternative
+    // (Date.now() can't run during render, refs can't be read during
+    // render).
+    let next: Map<string, number> | null = null;
+    for (const m of chat.history) {
+      if (!isTurnStartingUserMessage(m)) continue;
+      const uuid = (m as { uuid?: string }).uuid;
+      if (!uuid || seenStarts.has(uuid)) continue;
+      if (!next) next = new Map(seenStarts);
+      // Fall back to the SDK-provided timestamp when present — it's
+      // closer to the true turn start (server-side input arrival) than
+      // our client-side Date.now() (post-SSE round-trip).
+      const sdkTs = (m as { timestamp?: string }).timestamp;
+      const parsed = sdkTs ? Date.parse(sdkTs) : NaN;
+      next.set(uuid, Number.isFinite(parsed) ? parsed : Date.now());
+    }
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    if (next) setSeenStarts(next);
+  }, [chat.history, seenStarts]);
+
+  const liveTurnUuid = useMemo(() => {
+    if (chat.status !== "thinking") return null;
+    let candidate: string | null = null;
+    for (const m of chat.history) {
+      if (isTurnStartingUserMessage(m)) {
+        const uuid = (m as { uuid?: string }).uuid;
+        if (uuid) candidate = uuid;
+      } else if (m.type === "result") {
+        candidate = null;
+      }
+    }
+    return candidate;
+  }, [chat.history, chat.status]);
+
+  const [now1Hz, setNow1Hz] = useState<number>(() => Date.now());
+  useEffect(() => {
+    if (!liveTurnUuid) return;
+    // 1 Hz: human-readable resolution without thrashing React. We
+    // schedule the first tick via setTimeout(...,0) so it lands in the
+    // event-handler frame (lint-allowed pattern) and the chip refreshes
+    // immediately on turn start rather than waiting up to a second.
+    const kick = setTimeout(() => setNow1Hz(Date.now()), 0);
+    const id = setInterval(() => setNow1Hz(Date.now()), 1000);
+    return () => {
+      clearTimeout(kick);
+      clearInterval(id);
+    };
+  }, [liveTurnUuid]);
+
+  // Per-completed-turn finish meta, keyed by the assistant message
+  // that ended the turn. Walks history pairing each `result` message
+  // with its preceding top-level assistant message; the meta then
+  // renders as a permanent footer on AssistantBubble so users never
+  // see the in-flight chip "disappear" at end-of-turn.
+  const turnEndMeta = useMemo(() => {
+    const map = new Map<string, TurnEndMeta>();
+    let lastAssistantUuid: string | null = null;
+    for (const m of chat.history) {
+      if (m.type === "assistant") {
+        // Subagent assistants (parent_tool_use_id != null) run in their
+        // own context window — their result never lands at the top
+        // level, so skip them when looking for "the message that ended
+        // the user-visible turn".
+        const parent = (m as { parent_tool_use_id?: string | null })
+          .parent_tool_use_id;
+        if (parent) continue;
+        const uuid = (m as { uuid?: string }).uuid;
+        if (uuid) lastAssistantUuid = uuid;
+      } else if (m.type === "result" && lastAssistantUuid) {
+        const usage = (
+          m as {
+            usage?: Partial<{
+              input_tokens: number;
+              output_tokens: number;
+              cache_read_input_tokens: number;
+              cache_creation_input_tokens: number;
+            }>;
+          }
+        ).usage;
+        const inputTokens = usage
+          ? (usage.input_tokens ?? 0) +
+            (usage.cache_read_input_tokens ?? 0) +
+            (usage.cache_creation_input_tokens ?? 0)
+          : undefined;
+        map.set(lastAssistantUuid, {
+          durationMs: m.duration_ms,
+          inputTokens,
+          outputTokens: usage?.output_tokens,
+          isError: m.is_error,
+          errorLabel: m.is_error
+            ? m.subtype.replace("error_", "error: ")
+            : undefined,
+        });
+        lastAssistantUuid = null;
+      }
+    }
+    return map;
+  }, [chat.history]);
+
+  // Live meta strings consumed by the in-flight turn's "thinking" /
+  // streaming meta line ("(3m 43s · ↑ 17.5k tokens · ↓ 1.2k)"). These
+  // are undefined when no turn is running so the meta chip drops out
+  // entirely instead of rendering "(0s)".
+  const liveTurnElapsedMs: number | undefined = (() => {
+    if (!liveTurnUuid) return undefined;
+    const start = seenStarts.get(liveTurnUuid);
+    if (typeof start !== "number") return undefined;
+    return Math.max(0, now1Hz - start);
+  })();
+  // Input is total context pumped into the model — raw + both cache
+  // variants. That matches the CLI's "↑ N tokens" reading, which is
+  // the size of the prompt sent, not just the uncached delta.
+  const liveInputTokens: number | undefined = liveUsage
+    ? liveUsage.input_tokens +
+      (liveUsage.cache_read_input_tokens ?? 0) +
+      (liveUsage.cache_creation_input_tokens ?? 0)
+    : undefined;
+  const liveOutputTokens: number | undefined = liveUsage?.output_tokens;
+
   return (
     <SubagentProvider
       byTaskId={subagentDerivation.byTaskId}
       childrenByTaskId={subagentDerivation.childrenByTaskId}
       resultTaskIds={subagentDerivation.resultTaskIds}
     >
+     <TurnEndMetaProvider byAssistantUuid={turnEndMeta}>
       <div className="relative flex h-full min-h-0 flex-col">
         <header
           className="pointer-events-none absolute inset-x-0 top-0 z-10 flex items-center justify-between gap-2 px-2 py-2 sm:px-4"
@@ -702,6 +863,9 @@ export function ChatPanel({ session }: Props) {
                   }}
                   answerQuestion={chat.answer}
                   cancelQuestion={chat.cancelQuestion}
+                  liveElapsedMs={liveTurnElapsedMs}
+                  liveInputTokens={liveInputTokens}
+                  liveOutputTokens={liveOutputTokens}
                 />
               )}
             />
@@ -828,6 +992,7 @@ export function ChatPanel({ session }: Props) {
           }}
         />
       </div>
+     </TurnEndMetaProvider>
     </SubagentProvider>
   );
 }
@@ -865,6 +1030,9 @@ function ItemRow({
   discussPlan,
   answerQuestion,
   cancelQuestion,
+  liveElapsedMs,
+  liveInputTokens,
+  liveOutputTokens,
 }: {
   item: ChatItem;
   approvePlan: (
@@ -874,6 +1042,12 @@ function ItemRow({
   discussPlan: (planId: string, feedback: string) => Promise<void>;
   answerQuestion: (answers: AskUserQuestionAnswers) => Promise<void>;
   cancelQuestion: (message?: string) => Promise<void>;
+  // In-flight turn meta — only used by the thinking + streaming
+  // branches below. Undefined when the corresponding turn isn't
+  // running, which drops the meta chip rather than rendering "(0s)".
+  liveElapsedMs?: number;
+  liveInputTokens?: number;
+  liveOutputTokens?: number;
 }) {
   // Card rows get a wider gap so a TodoListBlock / ToolRunCard /
   // PlanCard doesn't sit flush against its neighbour. Tight rows
@@ -884,7 +1058,18 @@ function ItemRow({
     <div className={`px-4 ${padY}`}>
       <div className="mx-auto max-w-3xl">
         {item.kind === "message" && <MessageBubble msg={item.msg} />}
-        {item.kind === "streaming" && <StreamingTurn blocks={item.blocks} />}
+        {item.kind === "streaming" && (
+          <div className="space-y-1">
+            <StreamingTurn blocks={item.blocks} />
+            <div className="px-1">
+              <TurnMetaLine
+                elapsedMs={liveElapsedMs}
+                inputTokens={liveInputTokens}
+                outputTokens={liveOutputTokens}
+              />
+            </div>
+          </div>
+        )}
         {item.kind === "tool_run" && <ToolRunCard messages={item.messages} />}
         {item.kind === "plan" && (
           <PlanCard
@@ -908,7 +1093,13 @@ function ItemRow({
         {item.kind === "command_output" && (
           <CommandOutputBubble output={item.output} />
         )}
-        {item.kind === "thinking" && <ThinkingIndicator />}
+        {item.kind === "thinking" && (
+          <ThinkingIndicator
+            elapsedMs={liveElapsedMs}
+            inputTokens={liveInputTokens}
+            outputTokens={liveOutputTokens}
+          />
+        )}
       </div>
     </div>
   );
@@ -1765,7 +1956,19 @@ async function renderCliInfo(
       // to round-trip per server and would block the chat thread —
       // so we surface the configuration scope as the actionable hint
       // instead. Listed in the same scope order the CLI uses.
-      const order = ["project", "user", "enterprise", "dynamic", "claudeai"];
+      const order = [
+        // Builtins are orchestrator-provided in-process servers (plan /
+        // notes / leader). Listed first because they're always present
+        // and clarify "this session has MCP tools available even though
+        // no external server is configured" — otherwise a fresh
+        // account's /mcp would read as completely empty.
+        "builtin",
+        "project",
+        "user",
+        "enterprise",
+        "dynamic",
+        "claudeai",
+      ];
       const scopes = new Map<string, typeof servers>();
       for (const s of servers) {
         const key = scopes.get(s.scope) ?? [];

@@ -35,17 +35,23 @@ export async function GET(_req: Request, { params }: Ctx) {
 
 interface PostBody {
   snapshot_id?: string;
+  // Conversation-only rewinds don't need a file snapshot — the cut
+  // point is defined entirely by the user message we're rolling back
+  // to. The picker sends parent_message_id for turns with no code
+  // edits so the rewind path still works.
+  parent_message_id?: string;
   mode?: "code" | "conversation" | "both";
 }
 
 // POST /api/chat/[id]/rewind — runs the restore. Body picks:
-//   - snapshot_id: which file-history entry to roll back to
+//   - snapshot_id OR parent_message_id: where to roll back to
 //   - mode: code | conversation | both
 //
 // Conversation mode aborts the live query, truncates history at the
-// snapshot's parent user message, rewrites the on-disk transcript, and
-// schedules a re-resume on the next user input. Code mode walks the
-// file backups and writes them back over the working tree.
+// target user message, rewrites the on-disk transcript, and schedules a
+// re-resume on the next user input. Code mode walks the file backups
+// and writes them back over the working tree — that path still requires
+// a snapshot id.
 export async function POST(req: Request, { params }: Ctx) {
   const { id } = await params;
   const snap = snapshotSession(id);
@@ -59,15 +65,29 @@ export async function POST(req: Request, { params }: Ctx) {
     return NextResponse.json({ error: "invalid json" }, { status: 400 });
   }
   const snapshotId = body.snapshot_id;
+  const parentMessageId = body.parent_message_id;
   const mode = body.mode;
-  if (!snapshotId || !mode) {
+  if (!mode) {
+    return NextResponse.json({ error: "mode required" }, { status: 400 });
+  }
+  if (!snapshotId && !parentMessageId) {
     return NextResponse.json(
-      { error: "snapshot_id + mode required" },
+      { error: "snapshot_id or parent_message_id required" },
+      { status: 400 },
+    );
+  }
+  if ((mode === "code" || mode === "both") && !snapshotId) {
+    return NextResponse.json(
+      { error: "snapshot_id required for code/both restore" },
       { status: 400 },
     );
   }
   try {
-    const result = await rewindSession(id, { snapshotId, mode });
+    const result = await rewindSession(id, {
+      snapshotId,
+      parentMessageId,
+      mode,
+    });
     return NextResponse.json(result);
   } catch (err) {
     return NextResponse.json(

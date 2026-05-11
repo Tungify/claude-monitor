@@ -30,10 +30,13 @@ interface FileSnapshot {
   }>;
 }
 
-// One row in the picker: the parent user message plus all snapshots
-// captured while that message was the active turn. Grouping condenses
-// "user asks question → 5 Edits" into one restore point so the user
-// reads the timeline as conversation beats, not raw tool calls.
+// One row in the picker: a user message plus any file snapshots
+// captured while that message was the active turn. The CLI's
+// MessageSelector lists every selectable user message regardless of
+// whether code changed — code/both restore options are gated per-row,
+// but conversation rewind is always available — and we mirror that
+// behavior here so a chat with zero file edits still has restore
+// points.
 interface RewindGroup {
   // The user message id this group rolls back to. Conversation rewind
   // truncates history right after this message; code rewind restores
@@ -41,9 +44,11 @@ interface RewindGroup {
   parentMessageId: string;
   preview: string;
   // Earliest snapshot in the group is what we hand the server for
-  // restore — restoreCode walks from this snapshot forward, so picking
-  // the earliest covers all later edits within the group.
-  anchorSnapshotId: string;
+  // code/both restore — restoreCode walks from this snapshot forward,
+  // so picking the earliest covers all later edits within the group.
+  // Undefined when this user turn produced no file edits; in that
+  // state only the Conversation button is enabled.
+  anchorSnapshotId?: string;
   // Every file path touched in this group. Surfaced in the row hint
   // ("3 files: src/foo.ts, src/bar.ts, …") so the user knows what
   // they're restoring.
@@ -122,39 +127,58 @@ export function RewindPicker({
   }, [open, sessionId]);
 
   const groups = useMemo<RewindGroup[]>(() => {
+    // Wait for the snapshots fetch to land before computing — we still
+    // build rows from history, but we want snapshot decoration ready in
+    // the same render so rows don't briefly flash "no code restore".
     if (!snapshots) return [];
-    const byParent = new Map<string, RewindGroup>();
+
+    // Index snapshots by parent message id once so the per-row lookup is
+    // O(1). Multiple snapshots can share one parent (one user turn → N
+    // tool calls); we keep them ordered by timestamp so picking the
+    // earliest as the anchor covers every later edit in the group.
+    const byParent = new Map<string, FileSnapshot[]>();
     for (const s of snapshots) {
       if (!s.parentMessageId) continue;
-      const preview = userMessagePreview(history, s.parentMessageId);
-      const existing = byParent.get(s.parentMessageId);
-      if (existing) {
-        for (const f of s.files) {
-          if (!existing.files.includes(f.path)) {
-            existing.files.push(f.path);
-          }
-        }
-        existing.fileCount = existing.files.length;
-        // Keep anchor pointing at the earliest snapshot — that's what
-        // the restore logic walks from.
-        if (s.timestamp < existing.timestamp) {
-          existing.anchorSnapshotId = s.id;
-          existing.timestamp = s.timestamp;
-        }
-      } else {
-        byParent.set(s.parentMessageId, {
-          parentMessageId: s.parentMessageId,
-          preview,
-          anchorSnapshotId: s.id,
-          files: s.files.map((f) => f.path),
-          fileCount: s.files.length,
-          timestamp: s.timestamp,
-        });
-      }
+      const list = byParent.get(s.parentMessageId) ?? [];
+      list.push(s);
+      byParent.set(s.parentMessageId, list);
     }
-    return [...byParent.values()].sort((a, b) =>
-      a.timestamp < b.timestamp ? -1 : 1,
-    );
+    for (const list of byParent.values()) {
+      list.sort((a, b) => (a.timestamp < b.timestamp ? -1 : 1));
+    }
+
+    // Source of truth for rows: history's user messages, filtered the
+    // same way the CLI's MessageSelector filters them (drop tool
+    // results, synthetic / meta entries, slash-command stdout, etc.).
+    // Without this filter the picker would surface internal turns the
+    // user never typed.
+    const rows: RewindGroup[] = [];
+    for (const m of history) {
+      if (!isSelectableUserMessage(m)) continue;
+      const uuid = (m as { uuid?: string }).uuid;
+      if (!uuid) continue;
+      const preview = extractText(m);
+      const ts = (m as { timestamp?: string }).timestamp;
+      const snapshotsForTurn = byParent.get(uuid) ?? [];
+      const files: string[] = [];
+      for (const s of snapshotsForTurn) {
+        for (const f of s.files) {
+          if (!files.includes(f.path)) files.push(f.path);
+        }
+      }
+      rows.push({
+        parentMessageId: uuid,
+        preview,
+        anchorSnapshotId: snapshotsForTurn[0]?.id,
+        files,
+        fileCount: files.length,
+        // Prefer the user message's own timestamp; fall back to the
+        // first snapshot's timestamp; finally now() so the row still
+        // sorts in some sensible order.
+        timestamp: ts ?? snapshotsForTurn[0]?.timestamp ?? new Date().toISOString(),
+      });
+    }
+    return rows;
   }, [snapshots, history]);
 
   const onConfirm = async () => {
@@ -162,13 +186,27 @@ export function RewindPicker({
     setBusy(true);
     setError(null);
     try {
+      // POST shape: pass snapshot_id when we have one (covers all three
+      // modes); otherwise fall back to parent_message_id, which the
+      // server accepts for conversation-only rewinds. Code/both POSTs
+      // without a snapshot are blocked client-side via row gating, but
+      // we still send anchorSnapshotId when present so a future "code
+      // even when no snapshot" path (e.g. soft-delete created files)
+      // doesn't need a wire change.
+      const body: Record<string, string> =
+        pendingChoice.group.anchorSnapshotId
+          ? {
+              snapshot_id: pendingChoice.group.anchorSnapshotId,
+              mode: pendingChoice.mode,
+            }
+          : {
+              parent_message_id: pendingChoice.group.parentMessageId,
+              mode: pendingChoice.mode,
+            };
       const res = await fetch(`/api/chat/${sessionId}/rewind`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          snapshot_id: pendingChoice.group.anchorSnapshotId,
-          mode: pendingChoice.mode,
-        }),
+        body: JSON.stringify(body),
       });
       if (!res.ok) throw new Error(`${res.status}: ${await res.text()}`);
       onRewound({ mode: pendingChoice.mode });
@@ -213,8 +251,7 @@ export function RewindPicker({
           )}
           {snapshots && groups.length === 0 && (
             <div className="px-3 py-8 text-center text-sm text-muted-foreground">
-              No restore points yet — file backups appear here once a tool
-              modifies a file in this session.
+              No restore points yet — send a message to create one.
             </div>
           )}
           {groups.length > 0 && (
@@ -253,12 +290,16 @@ function RewindRow({
   disabled: boolean;
   onPickMode: (mode: Mode) => void;
 }) {
-  const filesPreview =
-    group.fileCount === 0
-      ? "no files"
-      : group.fileCount === 1
-        ? group.files[0]
-        : `${group.fileCount} files: ${shortenList(group.files, 3)}`;
+  // Code/both restore is only meaningful when at least one file
+  // snapshot was captured during this turn. The CLI surfaces the same
+  // gating ("No code restore" hint) — without it, clicking Code on a
+  // conversation-only turn would no-op silently and look broken.
+  const hasCode = !!group.anchorSnapshotId && group.fileCount > 0;
+  const filesPreview = hasCode
+    ? group.fileCount === 1
+      ? group.files[0]
+      : `${group.fileCount} files: ${shortenList(group.files, 3)}`
+    : "No code changes";
   return (
     <li
       className={cn(
@@ -276,7 +317,12 @@ function RewindRow({
           )}
         </span>
       </div>
-      <div className="mb-1.5 truncate font-mono text-[10px] text-muted-foreground">
+      <div
+        className={cn(
+          "mb-1.5 truncate font-mono text-[10px]",
+          hasCode ? "text-muted-foreground" : "italic text-muted-foreground/70",
+        )}
+      >
         {filesPreview}
       </div>
       <div className="flex flex-wrap items-center gap-1.5">
@@ -284,17 +330,18 @@ function RewindRow({
           disabled={disabled}
           onClick={() => onPickMode("conversation")}
           label="Conversation"
+          tone={hasCode ? "subtle" : "primary"}
         />
         <RowAction
-          disabled={disabled}
+          disabled={disabled || !hasCode}
           onClick={() => onPickMode("code")}
           label="Code"
         />
         <RowAction
-          disabled={disabled}
+          disabled={disabled || !hasCode}
           onClick={() => onPickMode("both")}
           label="Both"
-          tone="primary"
+          tone={hasCode ? "primary" : "subtle"}
         />
       </div>
     </li>
@@ -394,26 +441,60 @@ function ConfirmRewind({
   );
 }
 
-function userMessagePreview(
-  history: SDKMessage[],
-  parentMessageId: string,
-): string {
-  for (const m of history) {
-    if (m.type !== "user") continue;
-    const uuid = (m as { uuid?: string }).uuid;
-    if (uuid !== parentMessageId) continue;
-    const content = m.message.content;
-    if (typeof content === "string") return content;
-    if (Array.isArray(content)) {
-      for (const block of content) {
-        if (
-          block &&
-          typeof block === "object" &&
-          (block as { type?: string }).type === "text"
-        ) {
-          const text = (block as { text?: string }).text;
-          if (text) return text;
-        }
+// Mirrors selectableUserMessagesFilter from the leaked CLI: only true
+// user-authored turns are rewindable. Tool results, synthetic / meta
+// messages, compact summaries, and slash-command stdout are all dropped
+// — those aren't things the user can meaningfully "rewind to" because
+// they were never typed.
+function isSelectableUserMessage(m: SDKMessage): boolean {
+  if (m.type !== "user") return false;
+  const msg = (m as { message?: { content?: unknown } }).message;
+  if (!msg) return false;
+  const content = msg.content;
+  if (Array.isArray(content) && content.length > 0) {
+    const first = content[0] as { type?: string } | undefined;
+    if (first?.type === "tool_result") return false;
+  }
+  const flags = m as {
+    isMeta?: boolean;
+    isCompactSummary?: boolean;
+    isVisibleInTranscriptOnly?: boolean;
+  };
+  if (flags.isMeta) return false;
+  if (flags.isCompactSummary) return false;
+  if (flags.isVisibleInTranscriptOnly) return false;
+  const text = extractText(m);
+  // Slash-command stdout, bash output, task notifications, ticks, and
+  // teammate messages all arrive wrapped in these tags. Match the CLI's
+  // filter so the picker doesn't surface them as rewindable turns.
+  for (const tag of [
+    "local-command-stdout",
+    "local-command-stderr",
+    "bash-stdout",
+    "bash-stderr",
+    "task-notification",
+    "tick",
+    "teammate-message",
+  ]) {
+    if (text.indexOf(`<${tag}>`) !== -1) return false;
+    if (text.indexOf(`<${tag} `) !== -1) return false;
+  }
+  return true;
+}
+
+function extractText(m: SDKMessage): string {
+  if (m.type !== "user") return "";
+  const content = m.message.content;
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    for (const block of content) {
+      if (
+        block &&
+        typeof block === "object" &&
+        (block as { type?: string }).type === "text"
+      ) {
+        const text = (block as { text?: string }).text;
+        if (text) return text;
       }
     }
   }
