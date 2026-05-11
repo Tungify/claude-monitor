@@ -36,7 +36,7 @@ func Execute(rows []account.Row, activeDir, targetDir string) error {
 	if target == nil {
 		return fmt.Errorf("target %s not in current snapshot", targetDir)
 	}
-	targetCreds, err := keychain.LoadCredentialsByService(keychain.ServiceFor(targetDir))
+	targetCreds, err := keychain.LoadCredentialsForSwapTarget(targetDir)
 	if err != nil {
 		return fmt.Errorf("read target creds: %w", err)
 	}

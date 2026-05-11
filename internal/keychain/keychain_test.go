@@ -233,6 +233,29 @@ func TestPlainServiceNameConstant(t *testing.T) {
 	}
 }
 
+// TestLoadCredentialsForSwapTargetFileFallback covers the Linux failure
+// mode where libsecret doesn't have the target's hashed entry (headless
+// box, locked keyring, WSL, account migrated from another host) but
+// Claude Code did write <configDir>/.credentials.json. Without the file
+// fallback, every swap to that account fails with
+// `read target creds: secret-tool lookup ...: exit status 1`.
+func TestLoadCredentialsForSwapTargetFileFallback(t *testing.T) {
+	tmp := t.TempDir()
+	body := `{"claudeAiOauth":{"accessToken":"a","refreshToken":"r","expiresAt":1700000000000,"scopes":["x"]}}`
+	if err := os.WriteFile(filepath.Join(tmp, ".credentials.json"), []byte(body), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	// tmp's hashed service name will not exist in the test runner's real
+	// keychain — that's the scenario we want to exercise.
+	creds, err := LoadCredentialsForSwapTarget(tmp)
+	if err != nil {
+		t.Fatalf("LoadCredentialsForSwapTarget: %v", err)
+	}
+	if creds.AccessToken != "a" || creds.RefreshToken != "r" {
+		t.Errorf("creds = %+v, want access=a refresh=r", creds)
+	}
+}
+
 // TestRoundTripPreservesRateLimitTier guards the OAuthCreds JSON tags
 // against a regression that previously stripped rateLimitTier on every
 // read-write cycle. Claude Code uses that field (and the embedded

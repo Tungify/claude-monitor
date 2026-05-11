@@ -201,6 +201,28 @@ func LoadCredentialsByService(svc string) (*OAuthCreds, error) {
 	return readKeychainEntry(u.Username, svc)
 }
 
+// LoadCredentialsForSwapTarget reads a swap target's creds: the per-dir
+// hashed keychain entry first, then <configDir>/.credentials.json. The
+// plain slot is intentionally excluded — it represents whoever is
+// currently active, so falling back to it would silently substitute the
+// wrong account's creds for the target.
+//
+// File fallback matters on Linux: when libsecret/Secret Service isn't
+// reachable (headless box, locked keyring, WSL) Claude Code writes creds
+// to <configDir>/.credentials.json and the hashed keychain entry never
+// gets created. Without this fallback, every swap on such a host fails
+// with `secret-tool lookup ...: exit status 1`.
+func LoadCredentialsForSwapTarget(configDir string) (*OAuthCreds, error) {
+	creds, err := LoadCredentialsByService(ServiceFor(configDir))
+	if err == nil {
+		return creds, nil
+	}
+	if fileCreds, ferr := loadFromFile(configDir); ferr == nil {
+		return fileCreds, nil
+	}
+	return nil, err
+}
+
 // CredSource tags where a successfully-loaded set of OAuth creds came
 // from, so a refreshed pair can be written back to the same slot.
 // Exactly one of Service / File is set on success.
