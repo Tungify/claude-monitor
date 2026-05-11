@@ -133,7 +133,7 @@
 /* Prose styles for assistant chat messages. Tight spacing, no horizontal
    margins (the bubble already pads), and code blocks get full-bleed look. */
 .prose-chat {
-  @apply text-[0.95rem] leading-relaxed;
+  @apply text-[0.95rem] leading-relaxed break-all;
 }
 .prose-chat > * + * {
   @apply mt-2;

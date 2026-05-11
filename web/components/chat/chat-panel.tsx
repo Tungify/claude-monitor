@@ -1079,8 +1079,8 @@ function ItemRow({
   // back-to-back replies still read as one block.
   const padY = isCardItem(item) ? "py-1.5" : "py-0.5";
   return (
-    <div className={`px-4 ${padY}`}>
-      <div className="mx-auto max-w-3xl">
+    <div className={`px-4 ${padY} w-full min-w-0`}>
+      <div className="mx-auto max-w-3xl min-w-0">
         {item.kind === "message" && <MessageBubble msg={item.msg} />}
         {item.kind === "streaming" && (
           <div className="space-y-1">
