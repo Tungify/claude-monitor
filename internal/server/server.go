@@ -125,8 +125,18 @@ func (s *Server) Routes() *http.ServeMux {
 	mux.HandleFunc("GET /api/health", s.handleHealth)
 	mux.HandleFunc("GET /api/accounts", s.handleAccounts)
 	mux.HandleFunc("POST /api/swap-to", s.handleSwapTo)
+	// Auto-swap settings (threshold cascade, pick order, etc.). The TUI
+	// has its own editor; the web UI POSTs partial updates here so users
+	// don't need to drop into the terminal to tune the swap behavior.
+	mux.HandleFunc("GET /api/swap-config", s.handleSwapConfigGet)
+	mux.HandleFunc("POST /api/swap-config", s.handleSwapConfigUpdate)
 	mux.HandleFunc("POST /api/account/login", s.handleAccountLogin)
 	mux.HandleFunc("POST /api/account/add", s.handleAccountAdd)
+	// GET /api/account/mcp-servers — proxies claude.ai's MCP integration
+	// list using the account's keychain-stored OAuth token. The token
+	// stays inside the daemon; only the parsed server names/URLs cross
+	// to the orchestrator UI.
+	mux.HandleFunc("GET /api/account/mcp-servers", s.handleAccountMcpServers)
 	mux.HandleFunc("GET /api/events", s.handleEvents)
 	mux.HandleFunc("POST /api/worktrees", s.handleCreateWorktrees)
 	mux.HandleFunc("POST /api/phases/assign", s.handleAssignPhases)

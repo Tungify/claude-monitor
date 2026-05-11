@@ -1,8 +1,13 @@
 import { NextResponse } from "next/server";
 import {
+  buildStatusInfo,
+  fetchClaudeAiMcpServers,
   listAgents,
+  listCatalogPlugins,
   listHooks,
+  listMarketplaces,
   listMcpServers,
+  listPlugins,
   listSkills,
   loadSettings,
   readPermissions,
@@ -36,7 +41,13 @@ export async function GET(req: Request, { params }: Ctx) {
   try {
     switch (topic) {
       case "mcp": {
-        const configured = await listMcpServers(configDir, cwd);
+        // Fire file-walk + claude.ai connector fetch in parallel —
+        // both are I/O bound and independent. The connector fetch is
+        // wrapped to never throw (returns {servers:[], needsAuth:bool}).
+        const [configured, claudeAi] = await Promise.all([
+          listMcpServers(configDir, cwd),
+          fetchClaudeAiMcpServers(configDir),
+        ]);
         // Surface the orchestrator's in-process MCP servers alongside
         // the configured ones. Without these the /mcp panel reads as
         // "no MCP servers" for a fresh account — confusing because the
@@ -72,7 +83,13 @@ export async function GET(req: Request, { params }: Ctx) {
             target: "claude-monitor · cross-phase planner toolkit",
           });
         }
-        return NextResponse.json({ servers: [...builtins, ...configured] });
+        return NextResponse.json({
+          servers: [...builtins, ...configured, ...claudeAi.servers],
+          // Surface the "user is signed in but OAuth scope missing"
+          // signal so the chat panel can prompt re-auth instead of
+          // silently showing zero claude.ai integrations.
+          claudeAiNeedsAuth: claudeAi.needsAuth,
+        });
       }
       case "agents": {
         const agents = await listAgents(configDir, cwd);
@@ -112,11 +129,36 @@ export async function GET(req: Request, { params }: Ctx) {
           },
         });
       }
+      case "plugins": {
+        // Three independent reads — installed-set, marketplace
+        // catalog, and the marketplace registry. All best-effort; an
+        // empty list from any of them still renders a useful panel.
+        const [plugins, catalog, marketplaces] = await Promise.all([
+          listPlugins(),
+          listCatalogPlugins(),
+          listMarketplaces(),
+        ]);
+        return NextResponse.json({ plugins, catalog, marketplaces });
+      }
+      case "status": {
+        const info = await buildStatusInfo(configDir, cwd);
+        // Builtin count is session-shape dependent — match the same
+        // logic as the /mcp branch so /status agrees with /mcp. Plan
+        // is always there; notes when scheduled inside a phase tree;
+        // leader on the owner session.
+        let builtin = 1;
+        if (snap.summary.plan_id && snap.summary.phase_slug) builtin += 1;
+        if (!snap.summary.phase_slug) builtin += 1;
+        return NextResponse.json({
+          ...info,
+          mcp: { ...info.mcp, builtin },
+        });
+      }
       default:
         return NextResponse.json(
           {
             error:
-              "topic must be one of: mcp, agents, skills, hooks, config, permissions",
+              "topic must be one of: mcp, agents, skills, hooks, config, permissions, status, plugins",
           },
           { status: 400 },
         );

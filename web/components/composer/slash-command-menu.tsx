@@ -9,6 +9,10 @@ interface Props {
   selectedIndex: number;
   onHover: (index: number) => void;
   onSelect: (command: SlashCommand) => void;
+  // Lowercased substring the user typed after "/" — used to bold the
+  // matching prefix on each row so it's obvious why a command is in the
+  // list. Empty when the menu is showing the full registry.
+  query: string;
 }
 
 // SlashCommandMenu is the autocomplete list rendered above the composer
@@ -20,6 +24,7 @@ export function SlashCommandMenu({
   selectedIndex,
   onHover,
   onSelect,
+  query,
 }: Props) {
   const listRef = useRef<HTMLUListElement>(null);
 
@@ -69,7 +74,7 @@ export function SlashCommandMenu({
                   )}
                 >
                   <span className="font-mono text-xs">
-                    /{cmd.name}
+                    /<MatchHighlight text={cmd.name} query={query} />
                     {cmd.argHint && (
                       <span className="ml-1 text-muted-foreground">
                         {cmd.argHint}
@@ -89,5 +94,24 @@ export function SlashCommandMenu({
         </div>
       </div>
     </div>
+  );
+}
+
+// MatchHighlight bolds the leading characters of `text` that match the
+// user's query — same affordance the CLI uses when filtering /commands.
+// Case-insensitive; falls back to plain text when query is empty or
+// doesn't actually prefix the name (alias-only matches stay un-bolded
+// rather than guessing which alias matched).
+function MatchHighlight({ text, query }: { text: string; query: string }) {
+  if (!query) return <>{text}</>;
+  const lower = text.toLowerCase();
+  if (!lower.startsWith(query)) return <>{text}</>;
+  const head = text.slice(0, query.length);
+  const tail = text.slice(query.length);
+  return (
+    <>
+      <span className="font-semibold text-foreground">{head}</span>
+      {tail}
+    </>
   );
 }

@@ -237,6 +237,12 @@ export const CHAT_COMMANDS: SlashCommand[] = [
     group: "Skills",
   },
   {
+    name: "plugin",
+    aliases: ["plugins"],
+    description: "List installed plugins and marketplaces",
+    group: "Skills",
+  },
+  {
     name: "loop",
     argHint: "[interval] [prompt]",
     description: "Run a prompt or slash command on a recurring interval",

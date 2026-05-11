@@ -14,10 +14,11 @@ import type { ReactNode } from "react";
 
 export interface TurnEndMeta {
   durationMs: number;
-  // Sum across the whole turn — input_tokens + cache_read + cache_create.
-  // That's the "context size pumped into Claude" reading the CLI shows
-  // as `↑`. Optional because some providers (OpenRouter shims, mocks)
-  // ship a result with no usage payload.
+  // New prompt content for the turn — input_tokens + cache_create.
+  // Excludes cache_read so a one-line user message doesn't render as
+  // 26k tokens just because the cached system prompt rides along.
+  // Optional because some providers (OpenRouter shims, mocks) ship a
+  // result with no usage payload.
   inputTokens?: number;
   outputTokens?: number;
   isError?: boolean;

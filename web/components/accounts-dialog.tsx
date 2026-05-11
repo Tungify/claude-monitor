@@ -1,13 +1,24 @@
 "use client";
 
-import { useEffect, useState, useTransition } from "react";
-import { AlertCircle, Plus, RefreshCw, Timer } from "lucide-react";
+import { useCallback, useEffect, useState, useTransition } from "react";
+import {
+  AlertCircle,
+  ChevronDown,
+  Loader2,
+  Plus,
+  RefreshCw,
+  Settings2,
+  Timer,
+} from "lucide-react";
 import { useDaemonContext } from "@/lib/daemon-context";
 import {
   addAccount,
+  fetchSwapConfig,
   reloginAccount,
   swapTo,
+  updateSwapConfig,
   type AccountState,
+  type SwapConfig,
   type Window,
 } from "@/lib/daemon";
 import {
@@ -160,6 +171,8 @@ export function AccountsDialog({ open, onOpenChange }: Props) {
             })
           )}
         </div>
+
+        <SwapSettingsSection open={open} />
 
         {(swapEvents.length > 0 || errors.length > 0) && (
           <section className="space-y-1.5">
@@ -487,6 +500,343 @@ function formatAge(iso: string, now: number): string {
   if (m < 60) return `${m}m ago`;
   const h = Math.floor(m / 60);
   return `${h}h ago`;
+}
+
+// SwapSettingsSection exposes the auto-swap knobs the TUI's editor
+// surfaces (auto-swap toggle, threshold cascade, pick order, auto-kick,
+// rebalance-on-reset). Collapsed by default — the panel is dense and most
+// users tune it once then forget. We fetch once on first expansion so the
+// network roundtrip doesn't fire on every dialog open.
+function SwapSettingsSection({ open }: { open: boolean }) {
+  const [expanded, setExpanded] = useState(false);
+  const [cfg, setCfg] = useState<SwapConfig | null>(null);
+  // Text mirror of the threshold list — we keep this as a string while
+  // the user is editing (so "90, ," intermediate states don't trigger
+  // re-sanitize) and only parse on save.
+  const [thresholdsText, setThresholdsText] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [savedAt, setSavedAt] = useState<number | null>(null);
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      const c = await fetchSwapConfig();
+      setCfg(c);
+      setThresholdsText(thresholdsToText(c.swap_thresholds));
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  // Lazy-load: fetch the first time the section expands while the dialog
+  // is open. Re-collapse + re-expand reuses the cached state.
+  useEffect(() => {
+    if (!open || !expanded || cfg || loading) return;
+    void load();
+  }, [open, expanded, cfg, loading, load]);
+
+  // Reset state when the dialog closes so a fresh open shows fresh data
+  // rather than a stale snapshot from an earlier session.
+  useEffect(() => {
+    if (open) return;
+    setExpanded(false);
+    setCfg(null);
+    setThresholdsText("");
+    setError(null);
+    setSavedAt(null);
+  }, [open]);
+
+  // Auto-dismiss the "Saved" pill so it doesn't pin to the row.
+  useEffect(() => {
+    if (savedAt == null) return;
+    const t = setTimeout(() => setSavedAt(null), 2_500);
+    return () => clearTimeout(t);
+  }, [savedAt]);
+
+  // Toggles save immediately — boolean fields don't have an
+  // intermediate-edit state, so deferring would be noise. Threshold and
+  // pick-order edits go through onSave.
+  const patchBool = async (
+    field: keyof Pick<
+      SwapConfig,
+      "auto_swap" | "auto_kick" | "rebalance_on_reset"
+    >,
+    value: boolean,
+  ) => {
+    if (!cfg) return;
+    // Optimistic update keeps the toggle responsive; we roll back on error.
+    const prev = cfg;
+    setCfg({ ...cfg, [field]: value });
+    setError(null);
+    try {
+      const next = await updateSwapConfig({ [field]: value });
+      setCfg(next);
+      setSavedAt(Date.now());
+    } catch (e) {
+      setCfg(prev);
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  const patchPickOrder = async (value: "lowest" | "highest") => {
+    if (!cfg) return;
+    const prev = cfg;
+    setCfg({ ...cfg, pick_order: value });
+    setError(null);
+    try {
+      const next = await updateSwapConfig({ pick_order: value });
+      setCfg(next);
+      setSavedAt(Date.now());
+    } catch (e) {
+      setCfg(prev);
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  const saveThresholds = async () => {
+    if (!cfg) return;
+    const parsed = parseThresholds(thresholdsText);
+    if ("error" in parsed) {
+      setError(parsed.error);
+      return;
+    }
+    setSaving(true);
+    setError(null);
+    try {
+      const next = await updateSwapConfig({ swap_thresholds: parsed.values });
+      setCfg(next);
+      // Reflect the sanitized form (sorted, dedup) back into the input so
+      // the user sees what's actually persisted instead of their raw text.
+      setThresholdsText(thresholdsToText(next.swap_thresholds));
+      setSavedAt(Date.now());
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <section className="rounded-lg border bg-card">
+      <button
+        type="button"
+        onClick={() => setExpanded((v) => !v)}
+        className="flex w-full items-center justify-between gap-2 px-3 py-2 text-left text-sm font-medium hover:bg-muted/40"
+        aria-expanded={expanded}
+      >
+        <span className="flex items-center gap-2">
+          <Settings2 className="size-3.5 text-muted-foreground" />
+          Auto-swap settings
+          {cfg && (
+            <span className="text-[11px] font-normal text-muted-foreground">
+              · {cfg.auto_swap ? "on" : "off"}
+              {cfg.auto_swap && (
+                <> · cascade {thresholdsToText(cfg.swap_thresholds)}%</>
+              )}
+            </span>
+          )}
+        </span>
+        <ChevronDown
+          className={`size-4 text-muted-foreground transition-transform ${
+            expanded ? "rotate-180" : ""
+          }`}
+        />
+      </button>
+      {expanded && (
+        <div className="space-y-3 border-t px-3 py-3 text-sm">
+          {error && (
+            <div className="rounded-md bg-destructive/10 px-2 py-1 text-xs text-destructive">
+              {error}
+            </div>
+          )}
+          {loading && !cfg && (
+            <div className="flex items-center gap-2 text-xs text-muted-foreground">
+              <Loader2 className="size-3 animate-spin" /> Loading…
+            </div>
+          )}
+          {cfg && (
+            <>
+              <ToggleRow
+                label="Auto-swap"
+                hint="Rotate the active OAuth slot among accounts when the 5h window crosses a threshold."
+                checked={cfg.auto_swap}
+                onChange={(v) => void patchBool("auto_swap", v)}
+              />
+              {/* Threshold editor — keep it visible even when auto-swap is
+                  off so users can prep the cascade before flipping the
+                  toggle. The hint clarifies that values without auto-swap
+                  on are inert. */}
+              <div className="space-y-1">
+                <label className="flex items-baseline justify-between text-xs">
+                  <span className="font-medium">Swap thresholds (%)</span>
+                  {savedAt != null && (
+                    <span className="text-[11px] text-emerald-600 dark:text-emerald-400">
+                      Saved
+                    </span>
+                  )}
+                </label>
+                <div className="flex gap-2">
+                  <input
+                    type="text"
+                    value={thresholdsText}
+                    onChange={(e) => setThresholdsText(e.target.value)}
+                    placeholder="90, 99, 100"
+                    className="flex-1 rounded-md border bg-background px-2 py-1.5 text-xs font-mono outline-none focus:border-ring"
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") {
+                        e.preventDefault();
+                        void saveThresholds();
+                      }
+                    }}
+                  />
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={() => void saveThresholds()}
+                    disabled={saving}
+                  >
+                    {saving ? "Saving…" : "Save"}
+                  </Button>
+                </div>
+                <p className="text-[11px] text-muted-foreground">
+                  Ascending cascade. Daemon tries to swap at the first tier
+                  the active account crosses, looking for a candidate
+                  below that tier.
+                </p>
+              </div>
+              <div className="space-y-1">
+                <label className="text-xs font-medium">Pick order</label>
+                <div className="flex gap-1.5">
+                  <PickOrderButton
+                    label="Lowest first"
+                    active={cfg.pick_order === "lowest"}
+                    onClick={() => void patchPickOrder("lowest")}
+                    hint="Pick the freshest account · spreads load"
+                  />
+                  <PickOrderButton
+                    label="Highest first"
+                    active={cfg.pick_order === "highest"}
+                    onClick={() => void patchPickOrder("highest")}
+                    hint="Drain accounts one at a time"
+                  />
+                </div>
+              </div>
+              <ToggleRow
+                label="Rebalance on reset"
+                hint="Swap to any non-active account whose 5h window just rolled over, even if the active is well below the threshold."
+                checked={cfg.rebalance_on_reset}
+                onChange={(v) => void patchBool("rebalance_on_reset", v)}
+              />
+              <ToggleRow
+                label="Auto-kick"
+                hint="Force-evict the active account from its slot when its quota's exhausted, so a sibling account can take over without a manual swap."
+                checked={cfg.auto_kick}
+                onChange={(v) => void patchBool("auto_kick", v)}
+              />
+            </>
+          )}
+        </div>
+      )}
+    </section>
+  );
+}
+
+// Compact one-row toggle with inline hint underneath. Used for the
+// boolean auto-swap knobs — distinct from the threshold editor which
+// needs a save action.
+function ToggleRow({
+  label,
+  hint,
+  checked,
+  onChange,
+}: {
+  label: string;
+  hint: string;
+  checked: boolean;
+  onChange: (v: boolean) => void;
+}) {
+  return (
+    <div className="flex items-start justify-between gap-3">
+      <div className="min-w-0">
+        <div className="text-xs font-medium">{label}</div>
+        <div className="text-[11px] text-muted-foreground">{hint}</div>
+      </div>
+      <button
+        type="button"
+        role="switch"
+        aria-checked={checked}
+        onClick={() => onChange(!checked)}
+        className={`relative inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors ${
+          checked ? "bg-primary" : "bg-muted"
+        }`}
+      >
+        <span
+          className={`inline-block size-4 transform rounded-full bg-background shadow transition-transform ${
+            checked ? "translate-x-4" : "translate-x-0.5"
+          }`}
+        />
+      </button>
+    </div>
+  );
+}
+
+function PickOrderButton({
+  label,
+  active,
+  onClick,
+  hint,
+}: {
+  label: string;
+  active: boolean;
+  onClick: () => void;
+  hint: string;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      title={hint}
+      className={`flex-1 rounded-md border px-2 py-1.5 text-left text-[11px] transition-colors ${
+        active
+          ? "border-primary bg-primary/10 text-foreground"
+          : "border-border bg-background text-muted-foreground hover:bg-muted/60"
+      }`}
+    >
+      <div className="font-medium">{label}</div>
+      <div className="text-[10px] text-muted-foreground">{hint}</div>
+    </button>
+  );
+}
+
+function thresholdsToText(ts: number[]): string {
+  return ts.map((n) => (Number.isInteger(n) ? String(n) : String(n))).join(", ");
+}
+
+// parseThresholds mirrors the TUI's parser: trims, splits on comma,
+// drops empties, validates [0, 100]. Returns the parsed list or an
+// error string for inline feedback before we even hit the daemon.
+function parseThresholds(
+  s: string,
+): { values: number[] } | { error: string } {
+  const trimmed = s.trim();
+  if (!trimmed) return { error: "Enter at least one threshold" };
+  const out: number[] = [];
+  for (const part of trimmed.split(",")) {
+    const p = part.trim();
+    if (!p) continue;
+    const v = Number(p);
+    if (!Number.isFinite(v)) return { error: `Not a number: ${p}` };
+    if (v < 0 || v > 100)
+      return { error: `Out of range 0-100: ${p}` };
+    out.push(v);
+  }
+  if (out.length === 0) return { error: "Enter at least one threshold" };
+  return { values: out };
 }
 
 // useNowTick re-renders on a fixed interval so countdown displays show
