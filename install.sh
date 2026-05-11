@@ -4,12 +4,15 @@
 # ----------------------------------------
 #   curl -fsSL https://raw.githubusercontent.com/Tungify/claude-monitor/main/install.sh | sh
 #
-# Downloads the latest pre-built binary for your OS/arch, drops it into
-# $INSTALL_DIR (default ~/.local/bin), ad-hoc codesigns it on macOS, and
-# ensures the dir is on PATH via $SHELL_RC (default ~/.zshrc).
+# Downloads the latest release tarball for your OS/arch, extracts the
+# claude-monitor binary into $INSTALL_DIR (default ~/.local/bin) and the
+# Next.js web bundle into $SHARE_DIR (default <prefix>/share/claude-monitor),
+# ad-hoc codesigns the binary on macOS, and ensures the bin dir is on PATH
+# via $SHELL_RC (default ~/.zshrc).
 #
 # Override with env vars:
 #   INSTALL_DIR=/usr/local/bin   SHELL_RC=~/.bashrc   sh install.sh
+#   SHARE_DIR=/opt/claude-monitor sh install.sh
 #
 # Linux note: claude-monitor reads OAuth tokens from whichever store
 # `claude` is using — libsecret (Secret Service) when available, or the
@@ -48,9 +51,11 @@ esac
 
 target="${os}-${arch}"
 
+# Default share dir sits next to bin/: e.g. ~/.local/bin → ~/.local/share/claude-monitor.
+# This matches FindWebDir()'s `<prefix>/share/claude-monitor/web` candidate.
+SHARE_DIR="${SHARE_DIR:-$(dirname "$INSTALL_DIR")/share/claude-monitor}"
+
 # ---------- libsecret check (Linux) ----------
-# Optional: claude-monitor falls back to ~/.claude/.credentials.json
-# when libsecret isn't available, so this is just a heads-up.
 if [ "$os" = "linux" ] && ! command -v secret-tool >/dev/null 2>&1; then
     echo "ℹ secret-tool (libsecret) not found — falling back to ~/.claude/.credentials.json."
     echo "   If 'claude' uses the system keyring on this box, install libsecret for full feature parity:"
@@ -59,17 +64,44 @@ if [ "$os" = "linux" ] && ! command -v secret-tool >/dev/null 2>&1; then
     echo "     Arch:          sudo pacman -S libsecret"
 fi
 
-# ---------- download ----------
-url="https://github.com/$REPO/releases/latest/download/$BINARY-$target"
-dest="$INSTALL_DIR/$BINARY"
+# ---------- resolve latest tag ----------
+# Follow the redirect from /releases/latest to /releases/tag/<tag> instead of
+# hitting the API (no rate limit, no jq dependency).
+latest_url=$(curl -fsSLI -o /dev/null -w '%{url_effective}' "https://github.com/$REPO/releases/latest") \
+    || die "could not reach https://github.com/$REPO/releases/latest"
+tag="${latest_url##*/}"
+case "$tag" in
+    v*) ;;
+    *)  die "could not parse release tag from $latest_url" ;;
+esac
 
-blue "→ downloading $target binary"
-mkdir -p "$INSTALL_DIR"
-if ! curl -fL --progress-bar -o "$dest" "$url"; then
-    die "download failed — confirm a release exists at https://github.com/$REPO/releases/latest"
+# ---------- download + extract ----------
+archive="claude-monitor-${tag}-${target}.tar.gz"
+url="https://github.com/$REPO/releases/download/${tag}/${archive}"
+
+tmpdir=$(mktemp -d)
+trap 'rm -rf "$tmpdir"' EXIT INT TERM
+
+blue "→ downloading ${tag} ${target} bundle"
+if ! curl -fL --progress-bar -o "$tmpdir/$archive" "$url"; then
+    die "download failed — confirm an asset exists at $url"
 fi
 
+tar -xzf "$tmpdir/$archive" -C "$tmpdir" || die "failed to extract $archive"
+extract_dir="$tmpdir/claude-monitor-${tag}-${target}"
+[ -d "$extract_dir" ] || die "extracted archive missing expected directory: $extract_dir"
+[ -f "$extract_dir/claude-monitor" ] || die "binary missing from archive"
+[ -d "$extract_dir/web" ] || die "web bundle missing from archive"
+
+# ---------- install ----------
+mkdir -p "$INSTALL_DIR" "$SHARE_DIR"
+dest="$INSTALL_DIR/$BINARY"
+mv "$extract_dir/claude-monitor" "$dest"
 chmod +x "$dest"
+
+# Replace any previous web bundle atomically-ish (rm + mv).
+rm -rf "$SHARE_DIR/web"
+mv "$extract_dir/web" "$SHARE_DIR/web"
 
 if [ "$os" = "darwin" ]; then
     xattr -d com.apple.quarantine "$dest" 2>/dev/null || true
@@ -77,6 +109,7 @@ if [ "$os" = "darwin" ]; then
 fi
 
 green "✓ installed $dest"
+green "✓ installed web bundle at $SHARE_DIR/web"
 
 # ---------- PATH wiring ----------
 case ":$PATH:" in
