@@ -162,9 +162,9 @@ function UserBubble({ msg }: { msg: Extract<SDKMessage, { type: "user" }> }) {
       );
     }
     return (
-      <div className="ml-auto flex max-w-[85%] flex-col items-end gap-1">
+      <div className="ml-auto flex max-w-[85%] min-w-0 flex-col items-end gap-1">
         {env.intent && <IntentBadge intent={env.intent} />}
-        <div className="whitespace-pre-wrap rounded-md bg-primary px-3 py-2 text-sm text-primary-foreground">
+        <div className="whitespace-pre-wrap break-all rounded-md bg-primary px-3 py-2 text-sm text-primary-foreground">
           {env.text}
         </div>
       </div>
@@ -192,10 +192,10 @@ function UserBubble({ msg }: { msg: Extract<SDKMessage, { type: "user" }> }) {
           return (
             <div
               key={i}
-              className="ml-auto flex max-w-[85%] flex-col items-end gap-1"
+              className="ml-auto flex max-w-[85%] min-w-0 flex-col items-end gap-1"
             >
               {env.intent && <IntentBadge intent={env.intent} />}
-              <div className="whitespace-pre-wrap rounded-md bg-primary px-3 py-2 text-sm text-primary-foreground">
+              <div className="whitespace-pre-wrap break-all rounded-md bg-primary px-3 py-2 text-sm text-primary-foreground">
                 {env.text}
               </div>
             </div>
@@ -288,7 +288,7 @@ export function ThinkingBlock({ thinking }: { thinking: string }) {
       <summary className="cursor-pointer select-none not-italic font-mono text-[11px] text-muted-foreground/80">
         thinking
       </summary>
-      <div className="mt-1.5 whitespace-pre-wrap">{thinking}</div>
+      <div className="mt-1.5 whitespace-pre-wrap break-all">{thinking}</div>
     </details>
   );
 }
@@ -541,7 +541,7 @@ export function ToolResultLine({ content, isError }: ToolResultLineProps) {
         <span aria-hidden>⎿</span>
         <span className="truncate font-mono">{summary}</span>
       </summary>
-      <pre className="mx-2 mt-1 max-h-72 overflow-auto whitespace-pre-wrap rounded bg-muted/40 p-2 text-[11px]">
+      <pre className="mx-2 mt-1 max-h-72 overflow-auto whitespace-pre-wrap break-all rounded bg-muted/40 p-2 text-[11px]">
         {full || "(empty)"}
       </pre>
     </details>
