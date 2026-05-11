@@ -181,8 +181,40 @@ jobs:
           # them up via the binary's parent directory.
           shopt -s dotglob
           mv ./web-bundle/* "${name}/web/"
+          # build-web ships every @openai/codex-${os}-${arch} optional
+          # dep (pnpm supportedArchitectures in web/pnpm-workspace.yaml)
+          # so the single web-bundle artifact can fan out to every per-
+          # platform tarball. Prune back to the one that matches this
+          # target so the tarball stays ~50MB instead of dragging 5
+          # extra ~30MB binaries the runtime never loads.
+          case "${{ matrix.goos }}" in
+            darwin)  codex_os=darwin ;;
+            linux)   codex_os=linux ;;
+            windows) codex_os=win32 ;;
+          esac
+          case "${{ matrix.goarch }}" in
+            amd64) codex_arch=x64 ;;
+            arm64) codex_arch=arm64 ;;
+          esac
+          keep="codex-${codex_os}-${codex_arch}"
+          openai_dir="${name}/web/node_modules/@openai"
+          if [ -d "${openai_dir}" ]; then
+            for dir in "${openai_dir}"/codex-*; do
+              [ -d "${dir}" ] || continue
+              base=$(basename "${dir}")
+              if [ "${base}" = "codex-sdk" ] || [ "${base}" = "${keep}" ]; then
+                continue
+              fi
+              rm -rf "${dir}"
+            done
+            # Fail loudly if the matching binary didn't survive the
+            # strip — beats shipping another broken tarball.
+            test -d "${openai_dir}/${keep}" \
+              || { echo "missing @openai/${keep} after strip"; exit 1; }
+          fi
           ls -la "${name}"
           ls -la "${name}/web" | head -10
+          ls -la "${openai_dir}" 2>/dev/null || true
           if [ "${{ matrix.archive }}" = "zip" ]; then
             zip -r "${name}.zip" "${name}"
           else

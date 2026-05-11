@@ -1,3 +1,20 @@
 ignoredBuiltDependencies:
   - sharp
   - unrs-resolver
+
+# Force pnpm to materialize every @openai/codex-${os}-${arch} optional
+# dep on disk regardless of the install host. The release workflow
+# builds the Next standalone bundle once on Linux and fans it out to
+# every per-platform tarball; without this, only codex-linux-x64
+# lands in node_modules and macOS/Windows users hit
+# "Unable to locate Codex CLI binaries" on their first Codex turn.
+# The release `package` job prunes back to the one matching binary
+# per target so tarballs stay lean.
+supportedArchitectures:
+  os:
+    - darwin
+    - linux
+    - win32
+  cpu:
+    - x64
+    - arm64
