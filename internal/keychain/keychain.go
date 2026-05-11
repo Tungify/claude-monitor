@@ -97,25 +97,41 @@ func ServiceFor(configDir string) string {
 // config dir, in priority order. Two cases matter:
 //
 //   - default location (~/.claude): Claude Code stores the entry without
-//     any suffix, as plain "Claude Code-credentials".
+//     any suffix, as plain "Claude Code-credentials". We also try the
+//     hashed entry as a fallback because our parking step writes default's
+//     creds there on swap-away.
 //   - explicit CLAUDE_CONFIG_DIR (~/.claude-gem, ~/.claude-account/foo):
-//     the entry carries the 8-hex sha256 suffix.
+//     the entry carries the 8-hex sha256 suffix. The plain slot is
+//     intentionally NOT a fallback here — Claude Code never writes a
+//     non-default account's creds to plain, and after a swap plain
+//     represents whoever is currently active. Falling back to plain
+//     would silently render the active account's data inside an
+//     unrelated row whenever the row's hashed entry is missing (account
+//     copied from another host, libsecret unavailable at /login,
+//     keychain entry manually removed).
 //
 // We try the most likely match first so the common case doesn't trigger
 // an extra credential-store invocation (which can prompt for biometric
 // auth on macOS or unlock the keyring on Linux).
 func candidates(configDir string) []string {
+	hashed := ServiceFor(configDir)
+	if isDefaultDir(configDir) {
+		return []string{PlainServiceName, hashed}
+	}
+	return []string{hashed}
+}
+
+// isDefaultDir reports whether configDir resolves to $HOME/.claude (the
+// implicit CLAUDE_CONFIG_DIR location). Normalizes the path the same way
+// ServiceFor does so relative inputs and trailing separators don't
+// produce a different answer.
+func isDefaultDir(configDir string) bool {
 	abs, err := filepath.Abs(configDir)
 	if err != nil {
 		abs = configDir
 	}
 	abs = strings.TrimRight(abs, `/\`)
-
-	hashed := ServiceFor(configDir)
-	if abs == defaultClaudeDir() {
-		return []string{PlainServiceName, hashed}
-	}
-	return []string{hashed, PlainServiceName}
+	return abs == defaultClaudeDir()
 }
 
 // defaultClaudeDir is duplicated from internal/account so this package
@@ -154,12 +170,19 @@ func LoadCredentials(configDir string) (*OAuthCreds, error) {
 // some other account's creds), so reading hashed-first keeps the
 // dashboard row pointing at the original account's parked credentials.
 //
-// Falls back to plain when the hashed entry doesn't exist (clean install
-// pre-park, or AutoSwap was just turned on), and finally to
-// <configDir>/.credentials.json for file-based storage.
+// For the DEFAULT dir we also try the plain slot as a fallback when the
+// hashed entry doesn't exist (clean install pre-park, or AutoSwap was
+// just turned on — default's creds still live in plain at that point).
+// For NON-DEFAULT dirs the plain slot is never a fallback: Claude Code
+// never writes a non-default account's creds to plain, and after a swap
+// plain represents whoever is currently active. Falling back to plain
+// for a non-default row would silently render the active account's
+// usage in that row whenever its hashed entry is missing.
+//
+// Final fallback is <configDir>/.credentials.json for file-based
+// storage (Linux without libsecret, accounts migrated from another host).
 func LoadCredentialsHashedFirst(configDir string) (*OAuthCreds, error) {
-	hashed := ServiceFor(configDir)
-	creds, err := loadFromCandidates([]string{hashed, PlainServiceName})
+	creds, err := loadFromCandidates(hashedFirstCandidates(configDir))
 	if err == nil {
 		return creds, nil
 	}
@@ -167,6 +190,18 @@ func LoadCredentialsHashedFirst(configDir string) (*OAuthCreds, error) {
 		return fileCreds, nil
 	}
 	return nil, err
+}
+
+// hashedFirstCandidates returns the read order for hashed-first mode:
+// hashed → plain for the default dir (plain is the legitimate location
+// for default's creds pre-park), hashed only for non-default dirs (plain
+// would point at the wrong account).
+func hashedFirstCandidates(configDir string) []string {
+	hashed := ServiceFor(configDir)
+	if isDefaultDir(configDir) {
+		return []string{hashed, PlainServiceName}
+	}
+	return []string{hashed}
 }
 
 // loadFromFile reads <configDir>/.credentials.json — Claude Code's
@@ -258,7 +293,7 @@ func (s CredSource) Persist(creds *OAuthCreds) error {
 func LoadForRefresh(configDir string, hashedFirst bool) (*OAuthCreds, CredSource, error) {
 	var svcs []string
 	if hashedFirst {
-		svcs = []string{ServiceFor(configDir), PlainServiceName}
+		svcs = hashedFirstCandidates(configDir)
 	} else {
 		svcs = candidates(configDir)
 	}

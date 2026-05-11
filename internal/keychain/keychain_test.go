@@ -131,17 +131,40 @@ func TestCandidatesPriority(t *testing.T) {
 		t.Errorf("default second = %q, want %q", got[1], ServiceFor(defaultDir))
 	}
 
-	// Non-default dir → hashed first, plain second.
+	// Non-default dir → hashed entry ONLY. Plain is intentionally NOT a
+	// fallback: it represents whoever is currently active, and after a
+	// swap that's a different account than this row. Falling back to
+	// plain would silently render the active account's data in an
+	// unrelated row whose hashed entry happens to be missing.
 	other := filepath.Join(tmp, ".claude-gem")
 	got = candidates(other)
-	if len(got) != 2 {
-		t.Fatalf("non-default candidates = %v, want 2", got)
+	if len(got) != 1 {
+		t.Fatalf("non-default candidates = %v, want 1 (hashed only)", got)
 	}
 	if got[0] != ServiceFor(other) {
-		t.Errorf("non-default first = %q, want %q", got[0], ServiceFor(other))
+		t.Errorf("non-default = %q, want %q", got[0], ServiceFor(other))
 	}
-	if got[1] != PlainServiceName {
-		t.Errorf("non-default second = %q, want %q", got[1], PlainServiceName)
+}
+
+// TestHashedFirstCandidatesNoPlainFallback locks in the same invariant
+// for the hashed-first read path (used when AutoSwap is on). The default
+// dir keeps {hashed, plain} because plain is the legitimate location
+// for default's creds on a pristine install. Non-default dirs get the
+// hashed entry only.
+func TestHashedFirstCandidatesNoPlainFallback(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	defaultDir := filepath.Join(tmp, ".claude")
+	other := filepath.Join(tmp, ".claude-gem")
+
+	def := hashedFirstCandidates(defaultDir)
+	if len(def) != 2 || def[0] != ServiceFor(defaultDir) || def[1] != PlainServiceName {
+		t.Errorf("default hashed-first = %v, want [hashed, plain]", def)
+	}
+
+	nonDef := hashedFirstCandidates(other)
+	if len(nonDef) != 1 || nonDef[0] != ServiceFor(other) {
+		t.Errorf("non-default hashed-first = %v, want [hashed]", nonDef)
 	}
 }
 
