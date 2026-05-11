@@ -22,6 +22,7 @@ import type {
 import { modelById } from "@/lib/models";
 import {
   matchSlashCommands,
+  parseSlashCommand,
   type SlashCommand,
 } from "@/lib/slash-commands";
 import { fileToAttachment } from "./attachments";
@@ -189,6 +190,16 @@ export function Composer(props: Props) {
     return matchSlashCommands(text, props.commands);
   }, [props.commands, text, menuDismissed]);
   const menuOpen = menuMatches.length > 0;
+  // The lowercased substring after the leading slash — what the menu is
+  // filtering by. Passed through so each row can bold the matched
+  // prefix. Whitespace means the user has moved into arg territory, in
+  // which case the menu is hidden anyway.
+  const menuQuery = useMemo(() => {
+    const trimmed = text.trimStart();
+    if (!trimmed.startsWith("/")) return "";
+    if (/\s/.test(trimmed)) return "";
+    return trimmed.slice(1).toLowerCase();
+  }, [text]);
 
   // Reset highlight + dismissal whenever the visible list changes shape:
   // out-of-range index becomes a no-op selection, and re-opening the menu
@@ -335,6 +346,21 @@ export function Composer(props: Props) {
         return;
       }
     }
+    // Enter on a recognized slash command submits, even when the menu
+    // is closed (user dismissed it with Esc, or typed past the name
+    // into arg territory like "/model claude-sonnet-4"). Without this,
+    // plain Enter falls through to the default newline behavior and
+    // the command sits in the input looking like it wasn't received.
+    if (
+      e.key === "Enter" &&
+      !e.shiftKey &&
+      props.commands &&
+      parseSlashCommand(text, props.commands)
+    ) {
+      e.preventDefault();
+      void submitText();
+      return;
+    }
     // Enter inserts newline (default browser behavior). Shift+Enter sends.
     if (e.key === "Enter" && e.shiftKey) {
       e.preventDefault();
@@ -393,6 +419,7 @@ export function Composer(props: Props) {
           selectedIndex={menuIndex}
           onHover={setMenuIndex}
           onSelect={chooseFromMenu}
+          query={menuQuery}
         />
       )}
       {/* Top chip row — folder + (model when home) */}
@@ -447,6 +474,17 @@ export function Composer(props: Props) {
         placeholder={props.placeholder ?? "Describe a task or ask a question"}
         rows={2}
         disabled={props.disabled}
+        // Native form autofill races our Tab handler when the user has
+        // submitted `/rewind` before — the browser inserts its remembered
+        // completion at the cursor while our handler also rewrites the
+        // value, producing artifacts like "/rewindre". Disable browser
+        // assistance across the board; the slash menu IS our autocomplete.
+        autoComplete="off"
+        autoCorrect="off"
+        autoCapitalize="off"
+        spellCheck={false}
+        data-1p-ignore
+        data-lpignore="true"
         className="block w-full resize-none border-0 bg-transparent px-3 py-2.5 text-sm placeholder:text-muted-foreground focus:outline-none focus:ring-0 disabled:opacity-60"
       />
 

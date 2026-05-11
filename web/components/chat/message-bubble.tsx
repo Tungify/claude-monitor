@@ -1,7 +1,7 @@
 "use client";
 
 import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
-import { Check, CircleDashed, Loader2 } from "lucide-react";
+import { Check, CircleDashed, GitBranch, Loader2 } from "lucide-react";
 import { Markdown } from "@/components/markdown/markdown";
 import type { StreamingBlock } from "@/lib/chat-types";
 import { parseCliEnvelope } from "@/lib/cli-envelope";
@@ -162,8 +162,11 @@ function UserBubble({ msg }: { msg: Extract<SDKMessage, { type: "user" }> }) {
       );
     }
     return (
-      <div className="ml-auto max-w-[85%] whitespace-pre-wrap rounded-md bg-primary px-3 py-2 text-sm text-primary-foreground">
-        {env.text}
+      <div className="ml-auto flex max-w-[85%] flex-col items-end gap-1">
+        {env.intent && <IntentBadge intent={env.intent} />}
+        <div className="whitespace-pre-wrap rounded-md bg-primary px-3 py-2 text-sm text-primary-foreground">
+          {env.text}
+        </div>
       </div>
     );
   }
@@ -189,9 +192,12 @@ function UserBubble({ msg }: { msg: Extract<SDKMessage, { type: "user" }> }) {
           return (
             <div
               key={i}
-              className="ml-auto max-w-[85%] whitespace-pre-wrap rounded-md bg-primary px-3 py-2 text-sm text-primary-foreground"
+              className="ml-auto flex max-w-[85%] flex-col items-end gap-1"
             >
-              {env.text}
+              {env.intent && <IntentBadge intent={env.intent} />}
+              <div className="whitespace-pre-wrap rounded-md bg-primary px-3 py-2 text-sm text-primary-foreground">
+                {env.text}
+              </div>
             </div>
           );
         }
@@ -232,6 +238,31 @@ function UserBubble({ msg }: { msg: Extract<SDKMessage, { type: "user" }> }) {
   );
 }
 
+
+// IntentBadge renders a tiny pill above a user bubble when the message
+// carried an orchestrator-intent envelope (currently only "multi-phase",
+// see hintForMultiPhase). The directive text itself stays hidden — it
+// would dump a wall of decompose-instruction noise into the user's
+// transcript — but this pill keeps the user aware of how the message
+// was framed so they remember why the leader behaves the way it does.
+function IntentBadge({ intent }: { intent: string }) {
+  if (intent === "multi-phase") {
+    return (
+      <span className="inline-flex items-center gap-1 rounded-md border border-violet-500/40 bg-violet-500/10 px-1.5 py-0.5 text-[10px] font-medium text-violet-700 dark:text-violet-300">
+        <GitBranch className="size-2.5" aria-hidden />
+        Multi-phase
+      </span>
+    );
+  }
+  // Future intents fall back to a neutral label. Keeps the rendering
+  // forward-compatible if we add more directive types without needing
+  // to land the UI change in the same release.
+  return (
+    <span className="inline-flex items-center rounded-md border border-muted-foreground/40 bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground">
+      {intent}
+    </span>
+  );
+}
 
 // Shared block renderers used by both finalized history and the streaming
 // preview. Keeping them here so the in-progress rendering can't drift away

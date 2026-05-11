@@ -221,7 +221,7 @@ export function RewindPicker({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="flex max-h-[calc(100dvh-1rem)] max-w-2xl flex-col gap-3 overflow-hidden p-3 shadow-2xl sm:max-h-[calc(100dvh-2rem)] sm:p-4">
+      <DialogContent className="flex max-h-[calc(100dvh-1rem)] w-[min(96vw,72rem)] !max-w-[min(96vw,72rem)] flex-col gap-3 overflow-hidden p-3 shadow-2xl sm:max-h-[calc(100dvh-2rem)] sm:p-4">
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2 pr-8">
             <History className="size-4" />

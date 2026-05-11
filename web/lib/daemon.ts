@@ -123,6 +123,55 @@ export async function addAccount(
   return jsonOrThrow(res);
 }
 
+// SwapConfig mirrors server.SwapConfigView in Go. Wraps the writable
+// auto-swap knobs the TUI's editor exposes — the web UI hits
+// /api/swap-config so users don't need to drop into the terminal.
+export interface SwapConfig {
+  auto_swap: boolean;
+  auto_kick: boolean;
+  // Ascending tier cascade in percent, e.g. [90, 99, 100]. Daemon
+  // sanitizes on write (sort, dedup, clamp 0-100) so the value the UI
+  // re-reads after PATCH may differ from what it sent.
+  swap_thresholds: number[];
+  // "lowest" prefers the freshest account; "highest" drains accounts
+  // one at a time.
+  pick_order: "lowest" | "highest";
+  rebalance_on_reset: boolean;
+}
+
+export interface SwapConfigUpdate {
+  auto_swap?: boolean;
+  auto_kick?: boolean;
+  swap_thresholds?: number[];
+  pick_order?: "lowest" | "highest";
+  rebalance_on_reset?: boolean;
+}
+
+export async function fetchSwapConfig(
+  signal?: AbortSignal,
+): Promise<SwapConfig> {
+  const res = await fetch(`${DAEMON_URL}/api/swap-config`, { signal });
+  return jsonOrThrow(res);
+}
+
+// PATCH-style: omitted fields preserve their existing value, so a UI
+// toggling auto_swap can send just that field without re-stating
+// thresholds. The daemon returns the new effective view after sanitize
+// — the UI should adopt it as the new source of truth so threshold
+// edits like "100, 90" reflect their sorted form on the next render.
+export async function updateSwapConfig(
+  patch: SwapConfigUpdate,
+  signal?: AbortSignal,
+): Promise<SwapConfig> {
+  const res = await fetch(`${DAEMON_URL}/api/swap-config`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(patch),
+    signal,
+  });
+  return jsonOrThrow(res);
+}
+
 // WorktreePhase + WorktreeResult mirror the Go shapes in
 // internal/server/worktrees.go. The daemon expects branch names per
 // phase; web picks the convention (currently `wo/<plan-short>/<slug>`).

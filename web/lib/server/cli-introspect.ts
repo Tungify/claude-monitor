@@ -104,11 +104,192 @@ export async function loadSettings(configDir: string): Promise<{
 
 export interface McpServerInfo {
   name: string;
-  scope: "user" | "project";
+  scope: "user" | "project" | "claudeai";
   type?: string;
-  // Display-friendly target: command for stdio, url for http/sse.
+  // Display-friendly target: command for stdio, url for http/sse, or the
+  // remote integration URL for claude.ai connectors.
   target?: string;
-  raw: McpServerEntry;
+  raw?: McpServerEntry;
+  // Authentication status for claude.ai-managed integrations:
+  //   "ready"    → OAuth token has user:mcp_servers scope, integration listed
+  //   "needs_auth" → token missing scope, or integration not yet authorized
+  // File-configured servers leave this undefined (status would need a live
+  // probe through the SDK which the chat thread can't afford to block on).
+  authStatus?: "ready" | "needs_auth";
+}
+
+interface CredsEnvelope {
+  claudeAiOauth?: {
+    accessToken?: string;
+    refreshToken?: string;
+    expiresAt?: number;
+    scopes?: string[];
+  };
+}
+
+interface ClaudeAiMcpResponse {
+  data: Array<{
+    type: "mcp_server";
+    id: string;
+    display_name: string;
+    url: string;
+    created_at: string;
+  }>;
+  has_more?: boolean;
+}
+
+const CLAUDE_AI_API_BASE = "https://api.anthropic.com";
+const MCP_SERVERS_BETA = "mcp-servers-2025-12-04";
+const CLAUDE_AI_MCP_FETCH_TIMEOUT_MS = 5000;
+
+// Reads the orchestrator-scoped credentials envelope. The launcher
+// either mirrors a keychain entry here or — on systems without a
+// keychain — keeps the only copy in this file. Schema mirrors the
+// Claude binary's own claudeAiOauth shape; see internal/keychain.
+async function readCredsEnvelope(
+  configDir: string,
+): Promise<CredsEnvelope["claudeAiOauth"] | undefined> {
+  const env = await readJson<CredsEnvelope>(
+    path.join(configDir, ".credentials.json"),
+  );
+  return env?.claudeAiOauth;
+}
+
+// Lists claude.ai-managed MCP integrations (the connectors a user
+// authorizes on claude.ai/settings/connectors — Asana, Atlassian, Box,
+// etc.). The CLI's /mcp panel groups these under a "claude.ai" section;
+// see leaked source's services/mcp/claudeai.ts.
+//
+// On macOS the OAuth token lives in the keychain (not .credentials.json)
+// and Node can't read it. We delegate the API call to the Go daemon,
+// which has the keychain plumbing and proxies the response. The token
+// never crosses to Node — daemon returns just the parsed server list.
+//
+// Falls back to reading .credentials.json directly when the daemon is
+// unreachable, so Linux setups (where the binary stores creds in the
+// file) keep working even if the daemon is down. Either path returns
+// {servers: [], needsAuth: bool} so /mcp degrades gracefully on failure.
+export async function fetchClaudeAiMcpServers(
+  configDir: string,
+): Promise<{ servers: McpServerInfo[]; needsAuth: boolean }> {
+  const viaDaemon = await fetchClaudeAiMcpViaDaemon(configDir);
+  if (viaDaemon !== null) return viaDaemon;
+  return fetchClaudeAiMcpFromFile(configDir);
+}
+
+// fetchClaudeAiMcpViaDaemon hits /api/account/mcp-servers on the Go
+// daemon. Returns null when the daemon itself can't be reached (so the
+// caller falls back to the local file path); otherwise returns the
+// daemon's parsed response — including the needs_auth signal.
+async function fetchClaudeAiMcpViaDaemon(
+  configDir: string,
+): Promise<{ servers: McpServerInfo[]; needsAuth: boolean } | null> {
+  const base = process.env.DAEMON_INTERNAL_URL ?? "http://127.0.0.1:8788";
+  const controller = new AbortController();
+  const timeout = setTimeout(
+    () => controller.abort(),
+    CLAUDE_AI_MCP_FETCH_TIMEOUT_MS,
+  );
+  try {
+    const url = `${base}/api/account/mcp-servers?config_dir=${encodeURIComponent(configDir)}`;
+    const res = await fetch(url, { signal: controller.signal });
+    if (!res.ok) {
+      // Daemon reachable but returned an error code — treat as
+      // "no integrations" rather than retrying. The daemon already
+      // collapses upstream 401/403 into a 200 with needs_auth=true,
+      // so a 500 here is a daemon bug we don't want to mask.
+      console.warn(
+        `[cli-introspect] daemon /api/account/mcp-servers ${res.status}`,
+      );
+      return { servers: [], needsAuth: false };
+    }
+    const body = (await res.json()) as {
+      servers: Array<{ id: string; display_name: string; url: string }>;
+      needs_auth: boolean;
+    };
+    const out: McpServerInfo[] = [];
+    for (const s of body.servers ?? []) {
+      out.push({
+        name: `claude.ai ${s.display_name}`,
+        scope: "claudeai",
+        type: "http",
+        target: s.url,
+        // Listed integrations always render with the "needs auth"
+        // hint — the CLI does the same, since per-connector auth
+        // lives on Claude's side and we can't probe it from here.
+        authStatus: "needs_auth",
+      });
+    }
+    out.sort((a, b) => a.name.localeCompare(b.name));
+    return { servers: out, needsAuth: body.needs_auth };
+  } catch {
+    // ECONNREFUSED / abort / DNS — daemon isn't running. Tell the
+    // caller to try the file fallback.
+    return null;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+// fetchClaudeAiMcpFromFile is the pre-daemon implementation, retained
+// as a fallback for environments where the binary persists creds to
+// .credentials.json (headless Linux, WSL, CI). Macs and most desktop
+// Linuxes go through the daemon path above.
+async function fetchClaudeAiMcpFromFile(
+  configDir: string,
+): Promise<{ servers: McpServerInfo[]; needsAuth: boolean }> {
+  const creds = await readCredsEnvelope(configDir);
+  if (!creds?.accessToken) {
+    return { servers: [], needsAuth: false };
+  }
+  const hasScope = (creds.scopes ?? []).includes("user:mcp_servers");
+  if (!hasScope) {
+    return { servers: [], needsAuth: true };
+  }
+  const controller = new AbortController();
+  const timeout = setTimeout(
+    () => controller.abort(),
+    CLAUDE_AI_MCP_FETCH_TIMEOUT_MS,
+  );
+  let body: ClaudeAiMcpResponse | undefined;
+  try {
+    const res = await fetch(
+      `${CLAUDE_AI_API_BASE}/v1/mcp_servers?limit=1000`,
+      {
+        headers: {
+          Authorization: `Bearer ${creds.accessToken}`,
+          "Content-Type": "application/json",
+          "anthropic-beta": MCP_SERVERS_BETA,
+          "anthropic-version": "2023-06-01",
+        },
+        signal: controller.signal,
+      },
+    );
+    if (!res.ok) {
+      return {
+        servers: [],
+        needsAuth: res.status === 401 || res.status === 403,
+      };
+    }
+    body = (await res.json()) as ClaudeAiMcpResponse;
+  } catch (err) {
+    console.warn("[cli-introspect] claude.ai /v1/mcp_servers failed:", err);
+    return { servers: [], needsAuth: false };
+  } finally {
+    clearTimeout(timeout);
+  }
+  const out: McpServerInfo[] = [];
+  for (const s of body?.data ?? []) {
+    out.push({
+      name: `claude.ai ${s.display_name}`,
+      scope: "claudeai",
+      type: "http",
+      target: s.url,
+      authStatus: "needs_auth",
+    });
+  }
+  out.sort((a, b) => a.name.localeCompare(b.name));
+  return { servers: out, needsAuth: false };
 }
 
 // Lists MCP servers visible to the session. The Claude binary itself
@@ -198,6 +379,134 @@ interface ClaudeJsonShape {
       mcpServers?: Record<string, McpServerEntry>;
     }
   >;
+  // The Claude binary writes the active OAuth account's profile here
+  // after login — Status pane reads it for "Login method / Org / Email".
+  // Field names mirror the binary; do not rename without the CLI
+  // updating in lockstep.
+  oauthAccount?: {
+    organizationName?: string;
+    organizationUuid?: string;
+    organizationRole?: string;
+    emailAddress?: string;
+    accountUuid?: string;
+  };
+}
+
+// Subscription label rendered as "Login method: <X> Account" — taken
+// from the OAuth token's subscriptionType, which the binary stores in
+// .credentials.json (or keychain). We map the binary's raw lowercase
+// tokens to the same title-case display the CLI uses; unknown values
+// fall through verbatim so a new tier doesn't crash the panel.
+function subscriptionLabel(raw?: string): string | undefined {
+  if (!raw) return undefined;
+  const map: Record<string, string> = {
+    pro: "Claude Pro",
+    max: "Claude Max",
+    team: "Claude Team",
+    enterprise: "Claude Enterprise",
+  };
+  return map[raw.toLowerCase()] ?? raw;
+}
+
+export interface StatusInfo {
+  version?: string;
+  loginMethod?: string;
+  organization?: string;
+  email?: string;
+  // Counts mirror the CLI's "X connected, Y need auth, Z failed" pill.
+  // configured = file-based (project/user/enterprise) — those don't
+  // probe live, so we report them as a single "configured" bucket.
+  mcp: {
+    builtin: number;
+    configured: number;
+    claudeAi: number;
+    claudeAiNeedsAuth: boolean;
+  };
+  // Setting sources that actually contributed something to the merged
+  // settings view, in CLI order. Same labels the binary uses so a user
+  // toggling between CLI and orchestrator doesn't relearn names.
+  settingSources: string[];
+}
+
+// Builds the Status payload — everything the CLI's Status pane shows
+// minus the diagnostics block, which would need live MCP probes /
+// install checks that don't belong on a chat-panel command. Best-
+// effort throughout: missing files / keychain-only tokens degrade
+// individual fields to undefined rather than failing the whole call.
+export async function buildStatusInfo(
+  configDir: string,
+  cwd: string,
+): Promise<StatusInfo> {
+  // OAuth account profile — written by the binary after /login. Lives
+  // in the per-account config dir; the home ~/.claude.json fallback
+  // is only relevant when CLAUDE_CONFIG_DIR isn't set, which our
+  // sessions always set.
+  const accountClaudeJson = await readJson<ClaudeJsonShape>(
+    path.join(configDir, ".claude.json"),
+  );
+  const oauth = accountClaudeJson?.oauthAccount;
+
+  // Subscription type lives on the OAuth token (creds envelope).
+  // Reading the file is best-effort: on macOS the token is in the
+  // keychain by default and the creds file is absent. In that case
+  // we just omit "Login method" rather than guessing.
+  const creds = await readCredsEnvelope(configDir);
+  // SubscriptionType isn't part of the creds shape we already
+  // declared, so cast through unknown for the extra field.
+  const subscription = subscriptionLabel(
+    (creds as { subscriptionType?: string } | undefined)?.subscriptionType,
+  );
+
+  // MCP counts. listMcpServers walks every config file; the count is
+  // "configured user/project servers" — the CLI's "X connected" pill
+  // would need live probes we don't run from the chat thread.
+  const [configured, claudeAi] = await Promise.all([
+    listMcpServers(configDir, cwd),
+    fetchClaudeAiMcpServers(configDir),
+  ]);
+  // Plan is always wired; notes/leader come and go with the session
+  // shape, but we don't have that here — caller (route) decides the
+  // builtin count. Hard-code "1" as a floor; route can override.
+  const builtin = 1;
+
+  // Setting sources — only count the ones that actually produced
+  // a non-empty merged file, mirroring the CLI's "actually loaded"
+  // filter. We treat global+local+project as separate sources so a
+  // user can see if local overrides are landing.
+  const sources: string[] = [];
+  const userSettings = await loadSettings(configDir);
+  if (userSettings.global && Object.keys(userSettings.global).length > 0) {
+    sources.push("User settings");
+  }
+  if (userSettings.local && Object.keys(userSettings.local).length > 0) {
+    sources.push("User local settings");
+  }
+  const projectSettings = await loadSettings(path.join(cwd, ".claude"));
+  if (
+    projectSettings.global &&
+    Object.keys(projectSettings.global).length > 0
+  ) {
+    sources.push("Project settings");
+  }
+  if (
+    projectSettings.local &&
+    Object.keys(projectSettings.local).length > 0
+  ) {
+    sources.push("Project local settings");
+  }
+
+  return {
+    loginMethod: subscription,
+    organization: oauth?.organizationName,
+    email: oauth?.emailAddress,
+    mcp: {
+      builtin,
+      configured: configured.length,
+      claudeAi: claudeAi.servers.length,
+      claudeAiNeedsAuth: claudeAi.needsAuth,
+    },
+    settingSources: sources,
+  };
 }
 
 function infoFor(
@@ -315,7 +624,7 @@ async function listSkillsDir(
   return out;
 }
 
-// pluginRoots walks ~/.claude/plugins/marketplaces/<repo>/<plugin>
+// pluginRoots walks ~/.claude/plugins/marketplaces/<repo>/plugins/<name>
 // directories. Each plugin can ship agents/ + skills/ subdirs that
 // the binary surfaces alongside user/project ones; we mirror that
 // behavior so /agents and /skills don't underreport against the CLI.
@@ -329,17 +638,323 @@ async function pluginRoots(): Promise<string[]> {
   }
   const out: string[] = [];
   for (const repo of repos) {
-    const repoDir = path.join(base, repo);
+    // Marketplace layout: <repo>/plugins/<name>. Older versions of
+    // this walker treated the repo dir itself as a plugin container
+    // and picked up README/LICENSE as fake plugins — keep it scoped
+    // to the actual /plugins subdir so listings don't lie.
+    const repoPluginsDir = path.join(base, repo, "plugins");
     let plugins: string[];
     try {
-      plugins = await fs.readdir(repoDir);
+      plugins = await fs.readdir(repoPluginsDir);
     } catch {
       continue;
     }
     for (const plugin of plugins) {
-      out.push(path.join(repoDir, plugin));
+      out.push(path.join(repoPluginsDir, plugin));
     }
   }
+  return out;
+}
+
+export interface PluginEntry {
+  // "<plugin>@<marketplace>" — same fully-qualified id the binary uses
+  // in installed_plugins.json. Lets the user copy/paste it into a CLI
+  // `claude plugins ...` invocation without translation.
+  id: string;
+  name: string;
+  marketplace: string;
+  scope: "user" | "project";
+  version?: string;
+  // Commit SHA the install was last synced to. Useful for spotting
+  // a stale plugin against an updated upstream.
+  gitCommitSha?: string;
+  description?: string;
+  // Capabilities walked off-disk: which subdirs the plugin actually
+  // populates. Mirrors what shows up in the CLI's "(N tools / N agents
+  // / N skills / N commands / N hooks)" tail per row.
+  capabilities: {
+    agents: number;
+    skills: number;
+    commands: number;
+    hooks: number;
+    mcpServers: number;
+  };
+}
+
+export interface MarketplaceEntry {
+  name: string;
+  source?: string;
+  repo?: string;
+  installLocation?: string;
+  lastUpdated?: string;
+}
+
+// One row of the Discover tab — the merged catalog view: name +
+// marketplace + author + description + install count + whether
+// this user has it installed already. Built by joining the
+// marketplaces' .claude-plugin/marketplace.json catalogs with
+// install-counts-cache.json and installed_plugins.json.
+export interface CatalogPluginEntry {
+  // "<plugin>@<marketplace>" — same id installed_plugins.json uses.
+  id: string;
+  name: string;
+  marketplace: string;
+  description?: string;
+  category?: string;
+  author?: string;
+  homepage?: string;
+  // unique install count from install-counts-cache.json; missing for
+  // plugins added since the cache was last refreshed.
+  installs?: number;
+  // True when this exact plugin@marketplace shows up in
+  // installed_plugins.json. We don't distinguish scope here — the
+  // Discover tab cares about "is it installed somewhere" not where.
+  installed: boolean;
+}
+
+// installedPluginsShape mirrors ~/.claude/plugins/installed_plugins.json.
+// "plugins" is keyed by "<plugin>@<marketplace>"; each entry is the
+// list of scoped install records (a plugin can be installed at user +
+// project scope independently — both records show up here). We only
+// care about scope/version/installPath/gitCommitSha for the listing.
+interface InstalledPluginsShape {
+  version?: number;
+  plugins?: Record<
+    string,
+    Array<{
+      scope?: "user" | "project";
+      installPath?: string;
+      version?: string;
+      installedAt?: string;
+      lastUpdated?: string;
+      gitCommitSha?: string;
+    }>
+  >;
+}
+
+interface KnownMarketplacesShape {
+  [name: string]: {
+    source?: { source?: string; repo?: string };
+    installLocation?: string;
+    lastUpdated?: string;
+  };
+}
+
+interface PluginJsonShape {
+  name?: string;
+  description?: string;
+  author?: { name?: string; email?: string };
+}
+
+// Counts how many *.md files in a directory the binary would surface
+// as agents/skills/commands. Tolerant of missing dirs — those just
+// score 0 and never throw.
+async function countMarkdown(dir: string): Promise<number> {
+  try {
+    const entries = await fs.readdir(dir);
+    let n = 0;
+    for (const e of entries) {
+      if (e.endsWith(".md")) n += 1;
+    }
+    return n;
+  } catch {
+    return 0;
+  }
+}
+
+// Skills are directories (each holding a SKILL.md), not flat files.
+// Count subdirs that actually contain a SKILL.md so unfinished
+// scaffolds don't inflate the number.
+async function countSkillsDir(dir: string): Promise<number> {
+  try {
+    const entries = await fs.readdir(dir);
+    let n = 0;
+    for (const e of entries) {
+      const skillFile = path.join(dir, e, "SKILL.md");
+      try {
+        await fs.stat(skillFile);
+        n += 1;
+      } catch {
+        // missing SKILL.md — skip
+      }
+    }
+    return n;
+  } catch {
+    return 0;
+  }
+}
+
+// Lists installed plugins as the CLI's /plugin command would, including
+// the marketplace they came from, their version + commit, and a per-
+// plugin capability count (agents/skills/commands/hooks/mcp). Source of
+// truth is installed_plugins.json — the marketplaces/ subtree is just
+// where the file lookups land. Plugins that exist on disk but aren't in
+// installed_plugins.json (rare: orphaned cache from an aborted install)
+// are skipped, matching CLI behavior.
+export async function listPlugins(): Promise<PluginEntry[]> {
+  const base = path.join(os.homedir(), ".claude", "plugins");
+  const installed = await readJson<InstalledPluginsShape>(
+    path.join(base, "installed_plugins.json"),
+  );
+  if (!installed?.plugins) return [];
+
+  const out: PluginEntry[] = [];
+  for (const [id, records] of Object.entries(installed.plugins)) {
+    // id shape: "<plugin>@<marketplace>"; bail out on malformed
+    // entries rather than rendering "(undefined)" rows.
+    const at = id.lastIndexOf("@");
+    if (at <= 0) continue;
+    const name = id.slice(0, at);
+    const marketplace = id.slice(at + 1);
+    for (const r of records ?? []) {
+      const installPath = r.installPath;
+      let description: string | undefined;
+      let capabilities = {
+        agents: 0,
+        skills: 0,
+        commands: 0,
+        hooks: 0,
+        mcpServers: 0,
+      };
+      if (installPath) {
+        const meta = await readJson<PluginJsonShape>(
+          path.join(installPath, ".claude-plugin", "plugin.json"),
+        );
+        description = meta?.description;
+        capabilities = {
+          agents: await countMarkdown(path.join(installPath, "agents")),
+          skills: await countSkillsDir(path.join(installPath, "skills")),
+          commands: await countMarkdown(path.join(installPath, "commands")),
+          hooks: await countMarkdown(path.join(installPath, "hooks")),
+          mcpServers: 0, // populated below if .mcp.json exists
+        };
+        // MCP servers ship as a single .mcp.json with mcpServers map
+        // — count entries rather than treating presence as binary.
+        const mcp = await readJson<{
+          mcpServers?: Record<string, unknown>;
+        }>(path.join(installPath, ".mcp.json"));
+        if (mcp?.mcpServers)
+          capabilities.mcpServers = Object.keys(mcp.mcpServers).length;
+      }
+      out.push({
+        id,
+        name,
+        marketplace,
+        scope: r.scope ?? "user",
+        version: r.version,
+        gitCommitSha: r.gitCommitSha,
+        description,
+        capabilities,
+      });
+    }
+  }
+  // Sort by marketplace first, then plugin name — keeps groups
+  // visually stable across reloads.
+  out.sort((a, b) => {
+    const m = a.marketplace.localeCompare(b.marketplace);
+    return m !== 0 ? m : a.name.localeCompare(b.name);
+  });
+  return out;
+}
+
+// Reads the full plugin catalog the user could install — every
+// marketplace's .claude-plugin/marketplace.json joined with the
+// install-count cache and the installed_plugins.json file. Powers
+// the "Discover" tab the CLI shows.
+//
+// Best-effort throughout: a marketplace whose marketplace.json is
+// missing or malformed simply contributes 0 plugins to the catalog
+// rather than failing the whole call.
+export async function listCatalogPlugins(): Promise<CatalogPluginEntry[]> {
+  const base = path.join(os.homedir(), ".claude", "plugins");
+
+  // Install counts — one fetched-at-a-time cache the binary writes;
+  // we read it as a static snapshot. Missing file = 0 counts.
+  const countsFile = await readJson<{
+    counts?: Array<{ plugin?: string; unique_installs?: number }>;
+  }>(path.join(base, "install-counts-cache.json"));
+  const countsById = new Map<string, number>();
+  for (const c of countsFile?.counts ?? []) {
+    if (c.plugin && typeof c.unique_installs === "number") {
+      countsById.set(c.plugin, c.unique_installs);
+    }
+  }
+
+  // Installed set — same key the catalog uses, so we just check
+  // membership when rendering the Discover row's "installed" badge.
+  const installed = await readJson<InstalledPluginsShape>(
+    path.join(base, "installed_plugins.json"),
+  );
+  const installedIds = new Set<string>(
+    Object.keys(installed?.plugins ?? {}),
+  );
+
+  // Walk each marketplace's catalog file.
+  const known = await readJson<KnownMarketplacesShape>(
+    path.join(base, "known_marketplaces.json"),
+  );
+  const out: CatalogPluginEntry[] = [];
+  for (const [marketplaceName, info] of Object.entries(known ?? {})) {
+    const installLocation = info.installLocation;
+    if (!installLocation) continue;
+    const catalog = await readJson<{
+      plugins?: Array<{
+        name?: string;
+        description?: string;
+        category?: string;
+        author?: { name?: string };
+        homepage?: string;
+      }>;
+    }>(path.join(installLocation, ".claude-plugin", "marketplace.json"));
+    for (const p of catalog?.plugins ?? []) {
+      if (!p.name) continue;
+      const id = `${p.name}@${marketplaceName}`;
+      out.push({
+        id,
+        name: p.name,
+        marketplace: marketplaceName,
+        description: p.description,
+        category: p.category,
+        author: p.author?.name,
+        homepage: p.homepage,
+        installs: countsById.get(id),
+        installed: installedIds.has(id),
+      });
+    }
+  }
+
+  // Sort by install count desc — same default order the CLI's
+  // Discover tab uses (so "frontend-design (721K)" floats to the
+  // top). Plugins missing install counts fall to the bottom.
+  out.sort((a, b) => {
+    const ai = a.installs ?? -1;
+    const bi = b.installs ?? -1;
+    if (ai !== bi) return bi - ai;
+    return a.name.localeCompare(b.name);
+  });
+  return out;
+}
+
+// Lists the marketplaces the binary knows about. Read straight from
+// known_marketplaces.json so we surface the same set the user would
+// see in `claude plugins marketplace list`.
+export async function listMarketplaces(): Promise<MarketplaceEntry[]> {
+  const base = path.join(os.homedir(), ".claude", "plugins");
+  const known = await readJson<KnownMarketplacesShape>(
+    path.join(base, "known_marketplaces.json"),
+  );
+  if (!known) return [];
+  const out: MarketplaceEntry[] = [];
+  for (const [name, entry] of Object.entries(known)) {
+    out.push({
+      name,
+      source: entry.source?.source,
+      repo: entry.source?.repo,
+      installLocation: entry.installLocation,
+      lastUpdated: entry.lastUpdated,
+    });
+  }
+  out.sort((a, b) => a.name.localeCompare(b.name));
   return out;
 }
 

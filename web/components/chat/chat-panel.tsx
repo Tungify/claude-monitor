@@ -40,6 +40,7 @@ import { ThinkingIndicator, TurnMetaLine } from "./thinking-indicator";
 import { QueueIndicator, computeQueuedMessages } from "./queue-indicator";
 import { PermissionDialog } from "./permission-dialog";
 import { PlanCard } from "./plan-card";
+import { PluginsDialog } from "./plugins-dialog";
 import { RewindPicker } from "./rewind-picker";
 import { AskQuestionCard } from "./ask-question-card";
 import { ToolRunCard } from "./tool-run-card";
@@ -210,6 +211,7 @@ export function ChatPanel({ session }: Props) {
   // open state minimal here lets the picker re-fetch each time the
   // user re-opens it (history grows mid-session).
   const [rewindOpen, setRewindOpen] = useState(false);
+  const [pluginsOpen, setPluginsOpen] = useState(false);
   // OR favorites list for the composer's model chip. Only fetched when
   // this session is OR-routed; native sessions skip the request. Picker
   // selections call patchOptions({model}) which goes through the SDK's
@@ -603,6 +605,7 @@ export function ChatPanel({ session }: Props) {
         patchOptions,
         router,
         openRewind: () => setRewindOpen(true),
+        openPlugins: () => setPluginsOpen(true),
       });
       return;
     }
@@ -724,9 +727,14 @@ export function ChatPanel({ session }: Props) {
             }>;
           }
         ).usage;
+        // ↑ tokens reads as "new prompt content sent on this turn":
+        // raw uncached input + cache writes. Excludes cache reads,
+        // which are the recurring system prompt / tools / history —
+        // including those makes a one-line user message look like
+        // 26k tokens. Total-context-window utilization belongs on the
+        // ContextMeter, not on the per-turn footer.
         const inputTokens = usage
           ? (usage.input_tokens ?? 0) +
-            (usage.cache_read_input_tokens ?? 0) +
             (usage.cache_creation_input_tokens ?? 0)
           : undefined;
         map.set(lastAssistantUuid, {
@@ -754,12 +762,12 @@ export function ChatPanel({ session }: Props) {
     if (typeof start !== "number") return undefined;
     return Math.max(0, now1Hz - start);
   })();
-  // Input is total context pumped into the model — raw + both cache
-  // variants. That matches the CLI's "↑ N tokens" reading, which is
-  // the size of the prompt sent, not just the uncached delta.
+  // New prompt content for this turn (raw input + cache writes).
+  // Mirrors the turnEndMeta math above — cache reads stay out so the
+  // live counter doesn't claim a small user message cost 26k tokens
+  // just because the system prompt is cached behind it.
   const liveInputTokens: number | undefined = liveUsage
     ? liveUsage.input_tokens +
-      (liveUsage.cache_read_input_tokens ?? 0) +
       (liveUsage.cache_creation_input_tokens ?? 0)
     : undefined;
   const liveOutputTokens: number | undefined = liveUsage?.output_tokens;
@@ -962,6 +970,11 @@ export function ChatPanel({ session }: Props) {
         </footer>
 
         <PermissionDialog request={chat.pendingPermission} onDecide={chat.decide} />
+        <PluginsDialog
+          open={pluginsOpen}
+          onOpenChange={setPluginsOpen}
+          sessionId={session.id}
+        />
         <RewindPicker
           open={rewindOpen}
           onOpenChange={setRewindOpen}
@@ -1232,6 +1245,7 @@ interface ChatCommandContext {
   // Opens the file-history picker overlay. Wired by the /rewind
   // handler; the picker manages its own loading + restore POST.
   openRewind: () => void;
+  openPlugins: () => void;
 }
 
 const ALL_EFFORTS: Effort[] = ["low", "medium", "high", "xhigh", "max"];
@@ -1594,16 +1608,93 @@ async function runChatCommand(
     }
 
     case "status": {
+      // Mirrors the CLI's Status pane: Version / Session name / Session
+      // ID / cwd / Login method / Org / Email / Model / MCP servers /
+      // Setting sources. Orchestrator extras (rate-limit utilization,
+      // chat status, plan) ride along below the CLI block so the
+      // familiar layout sits up top.
+      let info:
+        | {
+            loginMethod?: string;
+            organization?: string;
+            email?: string;
+            mcp: {
+              builtin: number;
+              configured: number;
+              claudeAi: number;
+              claudeAiNeedsAuth: boolean;
+            };
+            settingSources: string[];
+          }
+        | null = null;
+      try {
+        const res = await fetch(
+          `/api/chat/${encodeURIComponent(ctx.session.id)}/cli-info?topic=status`,
+        );
+        if (res.ok) info = await res.json();
+      } catch {
+        // Network failure or session-not-found — degrade to local-only
+        // fields rather than refusing to render.
+      }
+
+      // MCP summary line — same shape the CLI screenshot shows:
+      //   "1 connected, 13 need auth, 1 failed · /mcp"
+      // We don't probe live connection state, so file-configured
+      // servers count as "configured" and claude.ai integrations as
+      // "need auth" (Claude's side of the OAuth per-connector flow).
+      const mcpParts: string[] = [];
+      if (info) {
+        const m = info.mcp;
+        const totalConfigured = m.builtin + m.configured;
+        if (totalConfigured)
+          mcpParts.push(`${totalConfigured} configured`);
+        if (m.claudeAi) mcpParts.push(`${m.claudeAi} need auth`);
+        if (m.claudeAiNeedsAuth && m.claudeAi === 0)
+          mcpParts.push("login missing user:mcp_servers scope");
+      }
+      const mcpLine =
+        mcpParts.length > 0 ? `${mcpParts.join(", ")} · /mcp` : "/mcp";
+
       const acc = ctx.account;
+      const sessionName = ctx.session.account_name
+        ? ctx.session.account_name
+        : "(no name) · /rename";
+
       ctx.appendOutput({
         echo: parsed.raw,
         subtitle: "Session status",
         rows: [
+          { label: "Session name", value: sessionName },
+          { label: "Session ID", value: ctx.session.id },
+          { label: "cwd", value: ctx.session.cwd },
+          ...(info?.loginMethod
+            ? [{ label: "Login method", value: info.loginMethod }]
+            : []),
+          ...(info?.organization
+            ? [{ label: "Organization", value: info.organization }]
+            : []),
+          ...(info?.email
+            ? [{ label: "Email", value: info.email }]
+            : ctx.session.account_name
+              ? [{ label: "Account", value: ctx.session.account_name }]
+              : []),
+          { label: "Model", value: ctx.session.model ?? "—" },
+          { label: "MCP servers", value: mcpLine },
+          ...(info && info.settingSources.length > 0
+            ? [
+                {
+                  label: "Setting sources",
+                  value: info.settingSources.join(", "),
+                },
+              ]
+            : []),
+          // ───── Orchestrator extras kept below the CLI-shaped block.
           { label: "Status", value: ctx.chat.status.replace("_", " ") },
           { label: "Connection", value: ctx.chat.connection },
           { label: "Messages", value: String(ctx.chat.history.length) },
-          { label: "Errors", value: String(ctx.chat.errors.length) },
-          { label: "Account", value: ctx.session.account_name ?? "—" },
+          ...(ctx.chat.errors.length > 0
+            ? [{ label: "Errors", value: String(ctx.chat.errors.length) }]
+            : []),
           ...(acc?.five_hour
             ? [
                 {
@@ -1834,6 +1925,20 @@ async function runChatCommand(
       return;
     }
 
+    case "plugin": {
+      // Modal mirrors the CLI's PluginSettings dialog — tabs for
+      // Discover / Installed / Marketplaces with search. Heavier than
+      // a chat bubble but the catalog is big enough (~170 plugins
+      // for the official marketplace alone) that a scrolling list of
+      // 200 markdown rows would clobber the chat thread.
+      ctx.openPlugins();
+      ctx.appendOutput({
+        echo: parsed.raw,
+        body: "_Plugins panel opened._",
+      });
+      return;
+    }
+
     case "config": {
       await renderCliInfo(ctx, parsed, "config");
       return;
@@ -1919,7 +2024,14 @@ async function runChatCommand(
 async function renderCliInfo(
   ctx: ChatCommandContext,
   parsed: ParsedCommand,
-  topic: "mcp" | "agents" | "skills" | "hooks" | "config" | "permissions",
+  topic:
+    | "mcp"
+    | "agents"
+    | "skills"
+    | "hooks"
+    | "config"
+    | "permissions"
+    | "plugins",
 ): Promise<void> {
   let data: unknown;
   try {
@@ -1942,13 +2054,15 @@ async function renderCliInfo(
   const echo = parsed.raw;
   switch (topic) {
     case "mcp": {
-      const { servers } = data as {
+      const { servers, claudeAiNeedsAuth } = data as {
         servers: Array<{
           name: string;
           scope: string;
           type?: string;
           target?: string;
+          authStatus?: "ready" | "needs_auth";
         }>;
+        claudeAiNeedsAuth?: boolean;
       };
       // Group by scope so the output reads like the CLI's MCPListPanel:
       // "Project · 2 servers", "User · 4 servers". We don't probe live
@@ -1976,33 +2090,59 @@ async function renderCliInfo(
         scopes.set(s.scope, key);
       }
       const sections: string[] = [];
+      // Pretty-print the scope heading; "claudeai" deserves the special
+      // "claude.ai" label everyone recognizes.
+      const scopeLabel: Record<string, string> = {
+        builtin: "Built-in MCPs",
+        project: "Project MCPs",
+        user: "User MCPs",
+        enterprise: "Enterprise MCPs",
+        dynamic: "Dynamic MCPs",
+        claudeai: "claude.ai integrations",
+      };
+      const renderRow = (s: typeof servers[number]) => {
+        const type = s.type ?? "stdio";
+        const target = s.target ? ` · \`${s.target}\`` : "";
+        // △ matches the CLI's "needs authentication" glyph in the
+        // /mcp panel screenshot; ready/file-configured rows stay quiet.
+        const status =
+          s.authStatus === "needs_auth"
+            ? " · ⚠ needs authentication"
+            : "";
+        return `• **${s.name}** _${type}_${target}${status}`;
+      };
       for (const scope of order) {
         const list = scopes.get(scope);
         if (!list || list.length === 0) continue;
-        sections.push(`**${scope.toUpperCase()}** _(${list.length})_`);
-        for (const s of list) {
-          const type = s.type ?? "stdio";
-          const target = s.target ? ` · \`${s.target}\`` : "";
-          sections.push(`• **${s.name}** _${type}_${target}`);
-        }
+        sections.push(
+          `**${scopeLabel[scope] ?? scope.toUpperCase()}** _(${list.length})_`,
+        );
+        for (const s of list) sections.push(renderRow(s));
       }
       // Anything in an unrecognised scope still surfaces below — better
       // to show "scope=foo" than silently drop the server.
       for (const [scope, list] of scopes) {
         if (order.includes(scope)) continue;
         sections.push(`**${scope.toUpperCase()}** _(${list.length})_`);
-        for (const s of list) {
-          sections.push(
-            `• **${s.name}** _${s.type ?? "stdio"}_${s.target ? ` · \`${s.target}\`` : ""}`,
-          );
-        }
+        for (const s of list) sections.push(renderRow(s));
+      }
+      // claudeAiNeedsAuth = signed in but the OAuth token wasn't
+      // issued with user:mcp_servers. Surface the re-login hint above
+      // the body so the user understands why the section is empty,
+      // even when no other MCPs are configured.
+      if (claudeAiNeedsAuth) {
+        sections.unshift(
+          "_Your claude.ai login is missing the `user:mcp_servers` scope — re-login from the sidebar to see Asana/Atlassian/etc. connectors._",
+        );
       }
       ctx.appendOutput({
         echo,
         subtitle: `${servers.length} MCP server${servers.length === 1 ? "" : "s"} · ${scopes.size} scope${scopes.size === 1 ? "" : "s"}`,
         body:
           servers.length === 0
-            ? "_No MCP servers configured for this session._\n\n" +
+            ? (claudeAiNeedsAuth
+                ? "_Your claude.ai login is missing the `user:mcp_servers` scope. Re-login to surface claude.ai integrations._\n\n"
+                : "_No MCP servers configured for this session._\n\n") +
               "Configure servers in `settings.json` under `mcpServers`, in `<cwd>/.mcp.json` for a project-scoped server, or via `claude mcp add` from a terminal. " +
               "The orchestrator's built-in plan/notes/leader tools are wired in automatically and don't show up here."
             : sections.join("\n\n"),
@@ -2070,6 +2210,105 @@ async function renderCliInfo(
             : hooks
                 .map((h) => `**${h.event}** — ${h.count} matcher${h.count === 1 ? "" : "s"}`)
                 .join("\n\n"),
+      });
+      return;
+    }
+    case "plugins": {
+      const { plugins, marketplaces } = data as {
+        plugins: Array<{
+          id: string;
+          name: string;
+          marketplace: string;
+          scope: "user" | "project";
+          version?: string;
+          gitCommitSha?: string;
+          description?: string;
+          capabilities: {
+            agents: number;
+            skills: number;
+            commands: number;
+            hooks: number;
+            mcpServers: number;
+          };
+        }>;
+        marketplaces: Array<{
+          name: string;
+          source?: string;
+          repo?: string;
+          installLocation?: string;
+          lastUpdated?: string;
+        }>;
+      };
+
+      // Group by marketplace so the panel reads "Marketplace A · N
+      // plugins" then the rows below, matching how /plugin lists in
+      // the CLI's PluginSettings dialog.
+      const byMarketplace = new Map<string, typeof plugins>();
+      for (const p of plugins) {
+        const list = byMarketplace.get(p.marketplace) ?? [];
+        list.push(p);
+        byMarketplace.set(p.marketplace, list);
+      }
+
+      const sections: string[] = [];
+
+      // Marketplaces block first — orients the reader on what's
+      // configured before showing the actual plugin rows.
+      if (marketplaces.length > 0) {
+        sections.push(
+          `**Marketplaces** _(${marketplaces.length})_`,
+        );
+        for (const m of marketplaces) {
+          const repo = m.repo ? ` · \`${m.repo}\`` : "";
+          const updated = m.lastUpdated
+            ? ` · updated ${new Date(m.lastUpdated).toLocaleDateString()}`
+            : "";
+          sections.push(`• **${m.name}**${repo}${updated}`);
+        }
+      }
+
+      // Format a single plugin row — capability tail mirrors the
+      // CLI's "(N agents · N skills · …)" hint so the user can see
+      // at a glance what each plugin contributes.
+      const renderPlugin = (p: typeof plugins[number]) => {
+        const caps: string[] = [];
+        if (p.capabilities.agents)
+          caps.push(`${p.capabilities.agents} agent${p.capabilities.agents === 1 ? "" : "s"}`);
+        if (p.capabilities.skills)
+          caps.push(`${p.capabilities.skills} skill${p.capabilities.skills === 1 ? "" : "s"}`);
+        if (p.capabilities.commands)
+          caps.push(`${p.capabilities.commands} command${p.capabilities.commands === 1 ? "" : "s"}`);
+        if (p.capabilities.hooks)
+          caps.push(`${p.capabilities.hooks} hook${p.capabilities.hooks === 1 ? "" : "s"}`);
+        if (p.capabilities.mcpServers)
+          caps.push(`${p.capabilities.mcpServers} mcp`);
+        const capsLine = caps.length > 0 ? ` _(${caps.join(" · ")})_` : "";
+        const versionLine = p.version ? ` \`v${p.version}\`` : "";
+        const scope = p.scope === "project" ? ` _[project]_` : "";
+        const desc = p.description ? ` — ${p.description}` : "";
+        return `• **${p.name}**${versionLine}${scope}${capsLine}${desc}`;
+      };
+
+      for (const [marketplace, list] of byMarketplace) {
+        sections.push(
+          `**${marketplace}** _(${list.length} plugin${list.length === 1 ? "" : "s"})_`,
+        );
+        for (const p of list) sections.push(renderPlugin(p));
+      }
+
+      ctx.appendOutput({
+        echo,
+        subtitle:
+          plugins.length === 0
+            ? marketplaces.length === 0
+              ? "No plugins installed"
+              : `${marketplaces.length} marketplace${marketplaces.length === 1 ? "" : "s"}, no plugins installed`
+            : `${plugins.length} plugin${plugins.length === 1 ? "" : "s"} · ${byMarketplace.size} marketplace${byMarketplace.size === 1 ? "" : "s"}`,
+        body:
+          plugins.length === 0 && marketplaces.length === 0
+            ? "_No plugins or marketplaces configured._\n\n" +
+              "Install plugins via `claude plugins install <name>` from a terminal, or add a marketplace with `claude plugins marketplace add <repo>`."
+            : sections.join("\n\n"),
       });
       return;
     }
