@@ -22,10 +22,11 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"sync"
 	"time"
+
+	"claude-monitor/internal/term"
 )
 
 // SetupPhase tracks what the auto-setup runner is currently doing so
@@ -92,11 +93,11 @@ func (s *Setup) HasLogin() bool {
 	return err == nil
 }
 
-// EnsureLogin spawns Terminal.app running `cloudflared tunnel login`
-// if cert.pem is missing, then polls until cert.pem appears or the
-// deadline elapses. Returns nil immediately when cert.pem already
-// exists. macOS-only for the Terminal launch — Linux/Windows users
-// get a useful error pointing them at the manual command.
+// EnsureLogin spawns a terminal running `cloudflared tunnel login` if
+// cert.pem is missing, then polls until cert.pem appears or the deadline
+// elapses. Returns nil immediately when cert.pem already exists. On
+// headless hosts (no terminal emulator on PATH) the error includes the
+// manual command the user should run.
 func (s *Setup) EnsureLogin(ctx context.Context) error {
 	if s.HasLogin() {
 		return nil
@@ -104,10 +105,6 @@ func (s *Setup) EnsureLogin(ctx context.Context) error {
 	s.setPhase(PhaseLoggingIn)
 	defer s.setPhase(PhaseIdle)
 
-	if runtime.GOOS != "darwin" {
-		return fmt.Errorf("auto-login is macOS-only (GOOS=%s); run `%s tunnel login` manually first",
-			runtime.GOOS, s.binPath)
-	}
 	if err := s.launchLoginTerminal(); err != nil {
 		return fmt.Errorf("launch login terminal: %w", err)
 	}
@@ -132,11 +129,12 @@ func (s *Setup) EnsureLogin(ctx context.Context) error {
 	}
 }
 
-// launchLoginTerminal opens Terminal.app running `cloudflared tunnel
-// login`. The script self-deletes after cloudflared exits so the user
-// doesn't end up with stale temp files. Pattern mirrors
-// internal/server/login.go's launchLoginTerminal for the claude-CLI
-// OAuth flow — keep these in sync if either side gets reworked.
+// launchLoginTerminal writes a one-shot bash script that runs
+// `cloudflared tunnel login` and opens it in a terminal window via
+// term.SpawnScript (Terminal.app on macOS; gnome-terminal / konsole /
+// xterm / etc. on Linux). The script self-deletes after cloudflared
+// exits so the user doesn't end up with stale temp files. Pattern
+// mirrors internal/server/login.go's launchLoginTerminal — keep in sync.
 func (s *Setup) launchLoginTerminal() error {
 	f, err := os.CreateTemp("", "claude-monitor-cf-login-*.sh")
 	if err != nil {
@@ -156,9 +154,12 @@ func (s *Setup) launchLoginTerminal() error {
 	if err := os.Chmod(f.Name(), 0o700); err != nil {
 		return fmt.Errorf("chmod: %w", err)
 	}
-	cmd := exec.Command("open", "-a", "Terminal", f.Name())
-	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("open Terminal: %w", err)
+	if err := term.SpawnScript(f.Name()); err != nil {
+		os.Remove(f.Name())
+		if errors.Is(err, term.ErrNoTerminal) {
+			return fmt.Errorf("no terminal emulator found on this host; run manually: %s tunnel login", s.binPath)
+		}
+		return fmt.Errorf("spawn terminal: %w", err)
 	}
 	return nil
 }
