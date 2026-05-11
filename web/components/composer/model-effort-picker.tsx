@@ -1,17 +1,27 @@
 "use client";
 
 import { useState } from "react";
-import { Check, ChevronDown, Router, Settings2 } from "lucide-react";
+import {
+  ArrowRight,
+  Check,
+  ChevronDown,
+  Router,
+  Settings2,
+  Sparkles,
+} from "lucide-react";
 import {
   Popover,
   PopoverContent,
   PopoverTrigger,
 } from "@/components/ui/popover";
 import {
+  CODEX_MODELS,
+  codexModelById,
   DEFAULT_MODEL_ID,
   EFFORT_LABELS,
   MODELS,
   modelById,
+  type CodexModelInfo,
   type ModelInfo,
 } from "@/lib/models";
 import { cn } from "@/lib/utils";
@@ -41,6 +51,18 @@ interface Props {
   // state). Skip in session-mode contexts where the user can edit
   // OR settings via the sidebar instead.
   onConfigureOpenRouter?: () => void;
+  // Fires when the user picks a Codex model from the popover. Two
+  // dispatches:
+  //   - session NOT yet routed through codex → parent opens the
+  //     HandoffDialog with the picked model preselected. The actual
+  //     PATCH happens after the handoff summary turn completes.
+  //   - session already codex → parent calls patchOptions({model})
+  //     directly; updateSessionOptions hot-swaps the codex driver's
+  //     model id for the next turn.
+  // Omit to hide the Codex section entirely (home mode pre-session;
+  // we can't seed a codex session without a claude transcript to
+  // summarize).
+  onPickCodexModel?: (id: string) => void;
 }
 
 // Trims `provider/model-name` → `model-name` for compact display in
@@ -55,13 +77,16 @@ function shortOrModel(id: string): string {
 // providerForModel infers which provider an id targets so the chip
 // styling and effort filtering Just Work without a separate provider
 // state. OR ids are vendor-prefixed ("openai/gpt-oss-120b"); native
-// Anthropic ids are flat ("claude-opus-4-7").
+// Anthropic ids are flat ("claude-opus-4-7"); codex ids start with
+// "gpt-" and have no slash.
 function providerForModel(
   id: string,
   orModels: string[],
 ): SessionProvider {
   if (orModels.includes(id)) return "openrouter";
   if (id.includes("/")) return "openrouter";
+  if (codexModelById(id)) return "codex";
+  if (/^gpt-/i.test(id)) return "codex";
   return "anthropic";
 }
 
@@ -96,9 +121,11 @@ export function ModelEffortPicker({
   provider,
   orModels = [],
   onConfigureOpenRouter,
+  onPickCodexModel,
 }: Props) {
   const [open, setOpen] = useState(false);
   const current = modelById(modelId);
+  const currentCodex = codexModelById(modelId);
   // Effective provider for the chip + effort filter. In session mode
   // it's whatever the parent told us; in home mode we infer from the
   // picked id so the chip recolors correctly when the user switches
@@ -106,22 +133,32 @@ export function ModelEffortPicker({
   const effectiveProvider =
     provider ?? providerForModel(modelId, orModels);
   const isOR = effectiveProvider === "openrouter";
+  const isCodex = effectiveProvider === "codex";
 
   // Both sections render in every mode. Chat sessions started against
   // Anthropic can switch to an OR favorite (and vice versa) — the
   // composer's onModelChange handler asks the server for a respawn
   // when that happens. Home mode also shows both so the new session
-  // can spawn against either provider.
+  // can spawn against either provider. Codex only renders when the
+  // parent wired onPickCodexModel: home mode hides it (codex needs a
+  // claude session to summarize from); session mode shows it so the
+  // user can trigger the handoff or hot-swap codex models.
   const showAnthropic = true;
   const showOR = true;
+  const showCodex = Boolean(onPickCodexModel);
 
   // Effort filter follows the active model: native looks up
-  // ModelInfo.supportedEffortLevels; OR uses our heuristic. We don't
-  // intersect across both sections — the picker offers all of one
-  // set, since the user has already committed to the picked model.
-  const supportedEfforts = isOR
-    ? effortsForOr(modelId)
-    : (current?.supportedEffortLevels ?? ["low", "medium", "high"]);
+  // ModelInfo.supportedEffortLevels; OR uses our heuristic; codex
+  // exposes 4 levels via OpenAI Responses API `reasoning.effort` —
+  // low / medium / high / xhigh — matching what the per-account
+  // models_cache.json advertises. We collapse our local "max" onto
+  // xhigh at the driver (effortToReasoning in codex-driver.ts), so
+  // the picker doesn't surface "max" here.
+  const supportedEfforts = isCodex
+    ? (["low", "medium", "high", "xhigh"] as Effort[])
+    : isOR
+      ? effortsForOr(modelId)
+      : (current?.supportedEffortLevels ?? ["low", "medium", "high"]);
 
   const alternatives = MODELS.filter((m) => m.id !== modelId);
 
@@ -150,6 +187,12 @@ export function ModelEffortPicker({
     setOpen(false);
   };
 
+  const pickCodex = (id: string) => {
+    if (!onPickCodexModel) return;
+    onPickCodexModel(id);
+    setOpen(false);
+  };
+
   return (
     <Popover open={open} onOpenChange={setOpen}>
       <PopoverTrigger
@@ -158,15 +201,22 @@ export function ModelEffortPicker({
             type="button"
             className={cn(
               "inline-flex items-center gap-1.5 rounded-md px-2 py-1 text-xs font-medium",
-              isOR
-                ? "bg-violet-500/10 text-violet-700 hover:bg-violet-500/15 dark:text-violet-300"
-                : "bg-muted/60 hover:bg-muted",
+              isCodex
+                ? "bg-emerald-500/10 text-emerald-700 hover:bg-emerald-500/15 dark:text-emerald-300"
+                : isOR
+                  ? "bg-violet-500/10 text-violet-700 hover:bg-violet-500/15 dark:text-violet-300"
+                  : "bg-muted/60 hover:bg-muted",
             )}
           />
         }
       >
+        {isCodex && <Sparkles className="size-3 opacity-80" />}
         {isOR && <Router className="size-3 opacity-80" />}
-        {isOR ? (
+        {isCodex ? (
+          <span className="font-medium">
+            {currentCodex?.label ?? modelId}
+          </span>
+        ) : isOR ? (
           <span className="font-mono text-[11px]">
             {orChipLabel ? shortOrModel(orChipLabel) : "(no models saved)"}
           </span>
@@ -263,6 +313,34 @@ export function ModelEffortPicker({
                 )}
               </div>
             )}
+          </>
+        )}
+
+        {showCodex && (
+          <>
+            <div className="mx-3 border-t" />
+            <div className="flex items-baseline justify-between px-3 pt-3 pb-1.5">
+              <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
+                <Sparkles className="size-3 text-emerald-500" />
+                Codex (ChatGPT subscription)
+              </div>
+              {!isCodex && (
+                <span className="text-[10px] text-muted-foreground">
+                  one-way handoff
+                </span>
+              )}
+            </div>
+            <ul className="px-1.5 pb-1.5">
+              {CODEX_MODELS.map((m) => (
+                <CodexModelRow
+                  key={m.id}
+                  model={m}
+                  selected={isCodex && m.id === modelId}
+                  needsHandoff={!isCodex}
+                  onPick={() => pickCodex(m.id)}
+                />
+              ))}
+            </ul>
           </>
         )}
 
@@ -363,6 +441,51 @@ function OrModelRow({
             <span className="text-muted-foreground">{vendor}/</span>
           )}
           <span className="font-medium">{name}</span>
+        </span>
+        {selected && <Check className="size-3.5 shrink-0" />}
+      </button>
+    </li>
+  );
+}
+
+function CodexModelRow({
+  model,
+  selected,
+  needsHandoff,
+  onPick,
+}: {
+  model: CodexModelInfo;
+  selected: boolean;
+  // True when the session is NOT yet codex-routed — picking the row
+  // opens HandoffDialog instead of hot-swapping. We surface a small
+  // ArrowRight hint so the click consequence is obvious.
+  needsHandoff: boolean;
+  onPick: () => void;
+}) {
+  return (
+    <li>
+      <button
+        type="button"
+        onClick={onPick}
+        className={cn(
+          "flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left hover:bg-muted",
+          selected && "bg-emerald-500/5",
+        )}
+      >
+        <span className="text-sm font-medium">{model.label}</span>
+        {model.badge && (
+          <span className="text-[10px] text-muted-foreground">
+            {model.badge}
+          </span>
+        )}
+        {model.description && (
+          <span className="truncate text-[11px] text-muted-foreground">
+            {model.description}
+          </span>
+        )}
+        <span className="ml-auto inline-flex items-center gap-1 text-[10px] text-muted-foreground">
+          {needsHandoff && <ArrowRight className="size-3" />}
+          {needsHandoff ? "hand off" : "codex"}
         </span>
         {selected && <Check className="size-3.5 shrink-0" />}
       </button>

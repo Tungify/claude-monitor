@@ -56,6 +56,13 @@ func decideSwap(rows []account.Row, activeDir string, prevUtil map[string]float6
 	candidates := make([]*account.Row, 0, len(rows))
 	for i := range rows {
 		r := &rows[i]
+		// Auto-swap is Anthropic-only in this slice. Codex rows don't
+		// expose a free usage probe, so there's no signal to drive the
+		// threshold cascade. The TUI's manual picker [m] still routes
+		// through Execute → executeOpenAI for explicit rotation.
+		if r.Provider == account.ProviderOpenAI {
+			continue
+		}
 		if r.ConfigDir == activeDir {
 			active = r
 			continue

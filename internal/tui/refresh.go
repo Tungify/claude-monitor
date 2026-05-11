@@ -45,6 +45,7 @@ func (m *model) refreshCmd(version uint64) tea.Cmd {
 		if res != nil {
 			msg.rows = res.Rows
 			msg.activeDir = res.ActiveDir
+			msg.codexActiveDir = res.CodexActiveDir
 			msg.swap = res.Swap
 			msg.swapErr = res.SwapErr
 		}
@@ -53,11 +54,20 @@ func (m *model) refreshCmd(version uint64) tea.Cmd {
 }
 
 // manualSwapCmd runs swap.Execute off the UI goroutine. We snapshot
-// the rows + activeDir so the keychain writes don't race with
+// the rows + activeDir so the credential writes don't race with
 // concurrent refreshes mutating m.rows.
+//
+// activeDir is picked per the target's provider: Anthropic targets
+// use m.activeDir (the plain-keychain owner); OpenAI targets use
+// m.codexActiveDir (the ~/.codex/auth.json owner). This keeps
+// swap.Execute's cross-provider rejection from misfiring when the
+// user has both kinds of account in the table.
 func (m *model) manualSwapCmd(target account.Row) tea.Cmd {
 	rows := append([]account.Row(nil), m.rows...)
 	activeDir := m.activeDir
+	if target.Provider == account.ProviderOpenAI {
+		activeDir = m.codexActiveDir
+	}
 	fromTag := "?"
 	if active := account.FindRow(rows, activeDir); active != nil {
 		fromTag = account.Label(*active)
@@ -101,6 +111,25 @@ func loginCmd(configDir, email, label string, fresh bool) tea.Cmd {
 	// appending our override is the documented pattern for scoping a
 	// child process to a different config dir.
 	c.Env = append(os.Environ(), "CLAUDE_CONFIG_DIR="+configDir)
+	return tea.ExecProcess(c, func(err error) tea.Msg {
+		return loginDoneMsg{
+			configDir: configDir,
+			label:     label,
+			fresh:     fresh,
+			err:       err,
+		}
+	})
+}
+
+// codexLoginCmd is the OpenAI counterpart to loginCmd: hands off the
+// terminal to `codex login` with $CODEX_HOME pinned to configDir so
+// the resulting auth.json lands in the right per-account directory.
+// Codex's login doesn't accept --email (its OAuth provider prompts
+// for the account interactively), so the email parameter from the
+// add-form is silently ignored here.
+func codexLoginCmd(configDir, label string, fresh bool) tea.Cmd {
+	c := exec.Command("codex", "login")
+	c.Env = append(os.Environ(), "CODEX_HOME="+configDir)
 	return tea.ExecProcess(c, func(err error) tea.Msg {
 		return loginDoneMsg{
 			configDir: configDir,

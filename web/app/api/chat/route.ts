@@ -1,6 +1,10 @@
 import path from "node:path";
 import { NextResponse } from "next/server";
-import { createSession, listSessions } from "@/lib/server/sessions";
+import {
+  createCodexSession,
+  createSession,
+  listSessions,
+} from "@/lib/server/sessions";
 import type { CreateSessionRequest } from "@/lib/chat-types";
 
 // SDK spawns a `claude` child process — Node runtime required.
@@ -32,6 +36,22 @@ export async function POST(req: Request) {
     );
   }
   try {
+    // Codex direct-start path. config_dir on the request body is the
+    // codex config dir (~/.codex*) and bypasses the claude SDK spawn
+    // entirely — createCodexSession validates auth and synthesizes
+    // the sentinel HandoffRecord the codex driver requires.
+    if (body.provider === "codex") {
+      const summary = await createCodexSession({
+        cwd: body.cwd?.trim() || DEFAULT_CWD,
+        codex_config_dir: body.config_dir,
+        codex_account_name: body.account_name,
+        codex_model: body.codex_model || body.model,
+        effort: body.effort,
+        planId: body.plan_id,
+        phaseSlug: body.phase_slug,
+      });
+      return NextResponse.json(summary, { status: 201 });
+    }
     const summary = createSession({
       cwd: body.cwd?.trim() || DEFAULT_CWD,
       configDir: body.config_dir,
@@ -45,9 +65,12 @@ export async function POST(req: Request) {
     });
     return NextResponse.json(summary, { status: 201 });
   } catch (err) {
-    return NextResponse.json(
-      { error: err instanceof Error ? err.message : String(err) },
-      { status: 500 },
-    );
+    const message = err instanceof Error ? err.message : String(err);
+    // Codex auth failures (missing refresh token, expired, rate-limited)
+    // surface as 422 — same convention as the /handoff route — so the
+    // UI can render a specific banner instead of a generic 500.
+    const status =
+      body.provider === "codex" && /codex/i.test(message) ? 422 : 500;
+    return NextResponse.json({ error: message }, { status });
   }
 }

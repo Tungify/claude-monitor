@@ -228,8 +228,9 @@ function AccountCard({
           {account.name.slice(0, 1).toUpperCase()}
         </div>
         <div className="min-w-0 flex-1 basis-[60%]">
-          <div className="flex items-center gap-2">
+          <div className="flex flex-wrap items-center gap-2">
             <span className="truncate text-sm font-medium">{account.name}</span>
+            <ProviderBadge a={account} />
             {!account.error && <ShortStatus a={account} />}
           </div>
           <div className="truncate text-xs text-muted-foreground">
@@ -291,13 +292,22 @@ function AddAccountForm({
 }) {
   const [name, setName] = useState("");
   const [email, setEmail] = useState("");
+  const [provider, setProvider] = useState<"anthropic" | "openai">("anthropic");
   const [submitting, setSubmitting] = useState(false);
 
   const submit = async () => {
     if (!name.trim()) return;
     setSubmitting(true);
     try {
-      await addAccount({ name: name.trim(), email: email.trim() || undefined });
+      await addAccount({
+        name: name.trim(),
+        // codex ignores --email (its OAuth provider picks the account
+        // interactively), but we still pass it so the Anthropic path
+        // behavior is unchanged when the user starts typing then flips
+        // provider.
+        email: email.trim() || undefined,
+        provider,
+      });
       onClose();
     } catch (e) {
       onError(e instanceof Error ? e.message : String(e));
@@ -306,11 +316,27 @@ function AddAccountForm({
     }
   };
 
+  // dirHint mirrors the per-provider provisioning paths the daemon's
+  // login.handleAccountAdd uses: ~/.claude-<name> for Anthropic vs
+  // ~/.codex-<name> for Codex. Surfacing the real path makes it obvious
+  // which terminal command to expect.
+  const dirHint =
+    provider === "openai"
+      ? `~/.codex-${name || "<name>"}`
+      : `~/.claude-${name || "<name>"}`;
+  const loginCmd =
+    provider === "openai" ? "codex login" : "claude auth login";
+
   return (
-    <div className="space-y-2 rounded-lg border bg-muted/30 p-3">
+    <div className="space-y-3 rounded-lg border bg-muted/30 p-3">
       <div className="text-[11px] font-semibold tracking-wider text-muted-foreground uppercase">
         New account
       </div>
+      {/* Provider tabs span the form width so the user sees both
+          choices as the first decision in the flow — earlier this was
+          a small segmented control in the header and people missed
+          that Codex was even an option. */}
+      <ProviderTabs value={provider} onChange={setProvider} />
       <div className="grid gap-2 sm:grid-cols-2">
         <input
           type="text"
@@ -328,18 +354,22 @@ function AddAccountForm({
           type="email"
           value={email}
           onChange={(e) => setEmail(e.target.value)}
-          placeholder="email (optional)"
-          className="rounded-md border bg-background px-2 py-1.5 text-xs outline-none focus:border-ring"
+          placeholder={
+            provider === "openai"
+              ? "email (ignored — codex picks interactively)"
+              : "email (optional)"
+          }
+          disabled={provider === "openai"}
+          className="rounded-md border bg-background px-2 py-1.5 text-xs outline-none focus:border-ring disabled:cursor-not-allowed disabled:opacity-50"
           onKeyDown={(e) => {
             if (e.key === "Enter") void submit();
             if (e.key === "Escape") onClose();
           }}
         />
       </div>
-      <div className="flex items-center justify-between gap-2">
+      <div className="flex flex-wrap items-center justify-between gap-2">
         <span className="text-[11px] text-muted-foreground">
-          Provisions ~/.claude-{name || "<name>"} and opens Terminal for `claude
-          auth login`.
+          Provisions {dirHint} and opens Terminal for `{loginCmd}`.
         </span>
         <div className="flex gap-1.5">
           <Button size="sm" variant="ghost" onClick={onClose}>
@@ -354,6 +384,66 @@ function AddAccountForm({
           </Button>
         </div>
       </div>
+    </div>
+  );
+}
+
+// ProviderTabs is the full-width segmented control at the top of the
+// add-account form. Two-tab layout — each tab gets equal width so the
+// inactive Codex option is just as visually weighty as Claude. The
+// active tab uses the primary fill so the choice is obvious, and a
+// small caption underneath each label clarifies the provisioning
+// behavior so users don't have to read the hint line to know what
+// they're picking.
+function ProviderTabs({
+  value,
+  onChange,
+}: {
+  value: "anthropic" | "openai";
+  onChange: (v: "anthropic" | "openai") => void;
+}) {
+  const tabs: Array<{
+    id: "anthropic" | "openai";
+    label: string;
+    caption: string;
+  }> = [
+    {
+      id: "anthropic",
+      label: "Claude",
+      caption: "Anthropic · claude auth login",
+    },
+    {
+      id: "openai",
+      label: "Codex",
+      caption: "ChatGPT · codex login",
+    },
+  ];
+  return (
+    <div
+      role="tablist"
+      aria-label="Account provider"
+      className="grid grid-cols-2 gap-1.5"
+    >
+      {tabs.map((t) => {
+        const active = value === t.id;
+        return (
+          <button
+            key={t.id}
+            type="button"
+            role="tab"
+            aria-selected={active}
+            onClick={() => onChange(t.id)}
+            className={`rounded-md border px-3 py-2 text-left transition-colors ${
+              active
+                ? "border-primary bg-primary/10 text-foreground"
+                : "border-border bg-background text-muted-foreground hover:bg-muted/60"
+            }`}
+          >
+            <div className="text-xs font-medium">{t.label}</div>
+            <div className="text-[10px] text-muted-foreground">{t.caption}</div>
+          </button>
+        );
+      })}
     </div>
   );
 }
@@ -410,6 +500,32 @@ function ShortStatus({ a }: { a: AccountState }) {
   if (a.kicked) return <Badge variant="outline">kicked</Badge>;
   if (a.active) return <Badge>active</Badge>;
   return <Badge variant="secondary">idle</Badge>;
+}
+
+// ProviderBadge labels each row with its backend so users can tell
+// Claude rows from Codex rows at a glance. Anthropic rows get a
+// minimal "claude" tag; Codex rows fold in the ChatGPT plan tier
+// (`codex:pro`, `codex:team`, …) because the plan is the user's
+// primary mental model — "is this my Pro account or my Plus one?".
+// The provider field on AccountState is optional/empty for older
+// daemons; we treat missing as Anthropic per the AccountProvider doc.
+function ProviderBadge({ a }: { a: AccountState }) {
+  if (a.provider === "openai") {
+    const label = a.plan_type ? `codex:${a.plan_type}` : "codex";
+    return (
+      <Badge
+        variant="outline"
+        className="border-emerald-500/40 bg-emerald-500/10 text-[10px] text-emerald-700 dark:text-emerald-300"
+      >
+        {label}
+      </Badge>
+    );
+  }
+  return (
+    <Badge variant="outline" className="text-[10px]">
+      claude
+    </Badge>
+  );
 }
 
 function ConnectionPill({

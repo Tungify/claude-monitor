@@ -22,13 +22,14 @@ type secondTickMsg struct{}
 // the refresh was launched so that stale results from a superseded
 // refresh can be dropped silently.
 type refreshMsg struct {
-	rows      []account.Row
-	activeDir string
-	swap      *swap.Event
-	swapErr   error
-	err       error
-	at        time.Time
-	version   uint64
+	rows           []account.Row
+	activeDir      string
+	codexActiveDir string
+	swap           *swap.Event
+	swapErr        error
+	err            error
+	at             time.Time
+	version        uint64
 }
 
 // flashClearMsg clears a transient status banner (used for "config

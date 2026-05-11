@@ -39,6 +39,13 @@ export async function GET(req: Request, { params }: Ctx) {
       for (const msg of snap.history) {
         writeEvent({ type: "message", data: msg });
       }
+      // Replay any handoff records so the chat panel can drop boundary
+      // cards at the right indices on a fresh subscribe. Fired BEFORE
+      // history_replayed so the reducer's handoff state is populated
+      // by the time items array recomputes.
+      for (const handoff of snap.summary.handoffs ?? []) {
+        writeEvent({ type: "handoff", data: handoff });
+      }
       // Sentinel marker: history replay is done. The client uses this
       // to know when it's safe to mount the virtualized list with the
       // correct bottom-anchor — heuristic timers (idle-window) fail

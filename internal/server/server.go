@@ -18,6 +18,7 @@ import (
 	"sync"
 	"time"
 
+	"claude-monitor/internal/account"
 	"claude-monitor/internal/api"
 	"claude-monitor/internal/config"
 	"claude-monitor/internal/swap"
@@ -64,21 +65,32 @@ type Server struct {
 // embedded from internal types) so the wire format is decoupled from
 // the swap/account internals — safe to evolve those without breaking
 // clients.
+//
+// ActiveDir tracks the Anthropic active config dir; CodexActiveDir
+// tracks the OpenAI one. Both are present so a client can render the
+// active marker per provider independently.
 type Snapshot struct {
-	Accounts  []AccountState `json:"accounts"`
-	ActiveDir string         `json:"active_dir"`
-	FetchedAt time.Time      `json:"fetched_at"`
+	Accounts       []AccountState `json:"accounts"`
+	ActiveDir      string         `json:"active_dir"`
+	CodexActiveDir string         `json:"codex_active_dir,omitempty"`
+	FetchedAt      time.Time      `json:"fetched_at"`
 }
 
 // AccountState is one account's public-safe view. Tokens are
 // intentionally omitted — the daemon never serves OAuth credentials
 // over HTTP. Clients that need to drive `claude` themselves use
 // CLAUDE_CONFIG_DIR + the OS keychain, same path Claude Code uses.
+//
+// Provider distinguishes Anthropic rows (the original shape: FiveHour
+// / Weekly bars from /api/oauth/usage) from OpenAI rows (PlanType +
+// TokenExpiresAt from the id_token JWT, no usage bars — Codex has no
+// free quota endpoint).
 type AccountState struct {
 	Name         string      `json:"name"`
 	ConfigDir    string      `json:"config_dir"`
 	Email        string      `json:"email,omitempty"`
 	AccountUUID  string      `json:"account_uuid,omitempty"`
+	Provider     string      `json:"provider,omitempty"`
 	Active       bool        `json:"active"`
 	FiveHour     *api.Window `json:"five_hour,omitempty"`
 	Weekly       *api.Window `json:"weekly,omitempty"`
@@ -87,6 +99,13 @@ type AccountState struct {
 	Kicked       bool        `json:"kicked,omitempty"`
 	KickError    string      `json:"kick_error,omitempty"`
 	Error        string      `json:"error,omitempty"`
+
+	// OpenAI-only fields. PlanType is the chatgpt_plan_type claim
+	// (free/plus/pro/business/enterprise/edu); TokenExpiresAt is the
+	// id_token JWT exp claim (RFC3339). Empty / zero for Anthropic
+	// rows so clients can use field presence as a provider check too.
+	PlanType       string    `json:"plan_type,omitempty"`
+	TokenExpiresAt time.Time `json:"token_expires_at,omitempty"`
 }
 
 // SwapEvent mirrors the swap.Event shape but in JSON-friendly form
@@ -303,15 +322,23 @@ func (s *Server) handleCORSPreflight(w http.ResponseWriter, r *http.Request) {
 // snapshotFromResult flattens swap.FetchResult into the wire shape.
 // Errors on individual rows surface as the row's Error string; rows
 // that errored have nil Usage and so omit the window fields entirely.
+// OpenAI rows populate PlanType + TokenExpiresAt instead of Usage
+// bars, and their Active flag is computed against CodexActiveDir
+// rather than ActiveDir.
 func snapshotFromResult(res *swap.FetchResult) Snapshot {
 	accs := make([]AccountState, 0, len(res.Rows))
 	for _, r := range res.Rows {
+		active := r.ConfigDir == res.ActiveDir
+		if r.Provider == account.ProviderOpenAI {
+			active = r.ConfigDir == res.CodexActiveDir
+		}
 		a := AccountState{
 			Name:        r.Name,
 			ConfigDir:   r.ConfigDir,
 			Email:       r.Email,
 			AccountUUID: r.AccountUUID,
-			Active:      r.ConfigDir == res.ActiveDir,
+			Provider:    string(r.Provider),
+			Active:      active,
 			Kicked:      r.Kicked,
 		}
 		if r.Err != nil {
@@ -326,12 +353,17 @@ func snapshotFromResult(res *swap.FetchResult) Snapshot {
 			a.WeeklySonnet = r.Usage.SevenDaySonnet
 			a.WeeklyOpus = r.Usage.SevenDayOpus
 		}
+		if r.Provider == account.ProviderOpenAI {
+			a.PlanType = r.PlanType
+			a.TokenExpiresAt = r.TokenExpiresAt
+		}
 		accs = append(accs, a)
 	}
 	return Snapshot{
-		Accounts:  accs,
-		ActiveDir: res.ActiveDir,
-		FetchedAt: time.Now().UTC(),
+		Accounts:       accs,
+		ActiveDir:      res.ActiveDir,
+		CodexActiveDir: res.CodexActiveDir,
+		FetchedAt:      time.Now().UTC(),
 	}
 }
 

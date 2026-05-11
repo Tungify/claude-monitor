@@ -7,11 +7,19 @@ export interface Window {
   resets_at: string | null;
 }
 
+// Provider matches the Go `account.Provider` enum. Codex/ChatGPT
+// subscription accounts are tagged "openai"; Anthropic-side accounts
+// either tag "anthropic" or leave provider empty (the zero value
+// pre-dates the multi-provider rewrite). Treat empty as Anthropic.
+export type AccountProvider = "anthropic" | "openai" | "";
+
 export interface AccountState {
   name: string;
   config_dir: string;
   email?: string;
   account_uuid?: string;
+  /** Empty / missing means Anthropic — see AccountProvider comment. */
+  provider?: AccountProvider;
   active: boolean;
   five_hour?: Window;
   weekly?: Window;
@@ -20,6 +28,18 @@ export interface AccountState {
   kicked?: boolean;
   kick_error?: string;
   error?: string;
+  /**
+   * OpenAI-only. `chatgpt_plan_type` claim from the Codex id_token
+   * (plus/pro/team/business/enterprise/edu). Empty for Anthropic rows
+   * — clients can use field presence as a provider check too.
+   */
+  plan_type?: string;
+  /**
+   * OpenAI-only. JWT `exp` claim of the id_token as RFC3339. Used to
+   * show "refresh in Nd" badges; the daemon also drives proactive
+   * refresh from this same value.
+   */
+  token_expires_at?: string;
 }
 
 export interface Snapshot {
@@ -107,11 +127,17 @@ export async function reloginAccount(
   return jsonOrThrow(res);
 }
 
-// addAccount provisions ~/.claude-<name> on the daemon side and
-// kicks off the same terminal-based login flow. `email` is optional
-// and forwarded as `--email` so the OAuth browser pre-fills.
+// addAccount provisions a fresh per-provider config dir on the daemon
+// side and kicks off the matching terminal-based login flow:
+//
+//   - provider="anthropic" (default) → ~/.claude-<name> + `claude auth login`.
+//     `email` is forwarded as `--email` so the OAuth browser pre-fills.
+//   - provider="openai" → ~/.codex-<name> + `codex login`. `email` is
+//     accepted for UI symmetry but ignored — codex's OAuth provider
+//     prompts the user to pick the ChatGPT account interactively, so
+//     pre-fill is impossible.
 export async function addAccount(
-  payload: { name: string; email?: string },
+  payload: { name: string; email?: string; provider?: "anthropic" | "openai" },
   signal?: AbortSignal,
 ): Promise<{ ok: boolean; config_dir: string; name: string }> {
   const res = await fetch(`${DAEMON_URL}/api/account/add`, {

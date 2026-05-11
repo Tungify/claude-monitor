@@ -6,6 +6,7 @@ import type {
   AskUserQuestionAnswers,
   AskUserQuestionRequest,
   ContextUsageBreakdown,
+  HandoffRecord,
   PermissionDecision,
   PermissionRequest,
   SessionStatus,
@@ -39,6 +40,10 @@ interface State {
   // Lets ChatPanel gate Virtuoso mount until items.length is final,
   // so `initialTopMostItemIndex` lands on the actual last message.
   hydrated: boolean;
+  // Provider-handoff records, replayed on connect and appended live
+  // when a fresh handoff fires. Used by chat-panel to drop boundary
+  // cards at the right history indices.
+  handoffs: HandoffRecord[];
 }
 
 type Action =
@@ -55,6 +60,7 @@ type Action =
   // queued (not yet processing) user message via the queue route.
   | { kind: "queue_edited"; msg: SDKMessage }
   | { kind: "queue_cancelled"; uuid: string }
+  | { kind: "handoff"; record: HandoffRecord }
   | { kind: "hydrated" }
   // Wipe state back to the initial shape. Dispatched whenever the
   // hook's `sessionId` argument changes — defensive against the page-
@@ -226,6 +232,21 @@ function reducer(state: State, action: Action): State {
           (m) => (m as { uuid?: string }).uuid !== action.uuid,
         ),
       };
+    case "handoff": {
+      // Replays during SSE history catch-up may re-deliver an existing
+      // handoff record; dedupe by (at, to_provider) so the boundary
+      // card doesn't render twice. Each handoff also has a unique
+      // at_message_index, but a fresh handoff that happens to land on
+      // the same index as a stale replayed one would collide — the
+      // wall-clock `at` is the cleaner key.
+      const exists = state.handoffs.some(
+        (h) =>
+          h.at === action.record.at &&
+          h.to_provider === action.record.to_provider,
+      );
+      if (exists) return state;
+      return { ...state, handoffs: [...state.handoffs, action.record] };
+    }
     case "hydrated":
       // Idempotent — repeated history_replayed events (shouldn't
       // happen, but guards reconnects) keep state stable.
@@ -250,6 +271,7 @@ const initial: State = {
   streamingBlocks: [],
   contextUsage: null,
   hydrated: false,
+  handoffs: [],
 };
 
 export interface UseChatSession extends State {
@@ -367,6 +389,20 @@ export function useChatSession(sessionId: string): UseChatSession {
     es.addEventListener("queue_cancelled", (e) => {
       const { uuid } = JSON.parse((e as MessageEvent).data) as { uuid: string };
       dispatch({ kind: "queue_cancelled", uuid });
+    });
+    es.addEventListener("handoff", (e) => {
+      const record = JSON.parse((e as MessageEvent).data) as HandoffRecord;
+      dispatch({ kind: "handoff", record });
+      // Nudge the sidebar to refetch so the row's provider chip flips
+      // from claude/openrouter to codex right after handoff fires
+      // without waiting on the 5s background poll.
+      if (typeof window !== "undefined") {
+        window.dispatchEvent(
+          new CustomEvent("cm:session-subagents", {
+            detail: { sessionId, reason: "handoff" },
+          }),
+        );
+      }
     });
     es.addEventListener("history_replayed", () => {
       dispatch({ kind: "hydrated" });

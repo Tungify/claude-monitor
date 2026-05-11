@@ -104,28 +104,48 @@ func ListAccounts(rootSpec string) error {
 			maxEmail = n
 		}
 	}
-	fmt.Printf("%-*s  %-*s  %6s  %s\n",
-		maxName, "NAME", maxEmail, "EMAIL", "5H", "STATUS")
+	fmt.Printf("%-*s  %-*s  %-9s  %6s  %s\n",
+		maxName, "NAME", maxEmail, "EMAIL", "PROVIDER", "5H", "STATUS")
 	for _, r := range res.Rows {
 		util := "—"
 		status := ""
+		provider := "anthropic"
+		if r.Provider == account.ProviderOpenAI {
+			provider = "openai"
+		}
 		switch {
 		case r.RefreshToken == "" && r.Err == nil:
 			status = "not authenticated"
 		case r.Err != nil:
 			status = format.Truncate(r.Err.Error(), 60)
+		case r.Provider == account.ProviderOpenAI:
+			// Codex rows have no usage probe — show plan instead in
+			// the util column so the CLI snapshot is useful for
+			// scripts that want to filter by plan type.
+			if r.PlanType != "" {
+				util = r.PlanType
+			} else {
+				util = "chatgpt"
+			}
 		case r.Usage != nil:
 			util = fmt.Sprintf("%3.0f%%", account.FiveHourUtil(r.Usage))
 		}
-		if r.ConfigDir == res.ActiveDir {
+		// Provider-aware active comparison: an Anthropic row is
+		// active when its dir owns the plain keychain slot; an
+		// OpenAI row is active when its dir owns ~/.codex/auth.json.
+		isActive := r.ConfigDir == res.ActiveDir
+		if r.Provider == account.ProviderOpenAI {
+			isActive = r.ConfigDir == res.CodexActiveDir
+		}
+		if isActive {
 			if status != "" {
 				status = "active — " + status
 			} else {
 				status = "active"
 			}
 		}
-		fmt.Printf("%-*s  %-*s  %6s  %s\n",
-			maxName, r.Name, maxEmail, r.Email, util, status)
+		fmt.Printf("%-*s  %-*s  %-9s  %6s  %s\n",
+			maxName, r.Name, maxEmail, r.Email, provider, util, status)
 	}
 	return nil
 }

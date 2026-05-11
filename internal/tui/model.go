@@ -27,9 +27,10 @@ type model struct {
 	// — the hotkey shows a flash instead of trying to open nothing.
 	webURL string
 
-	rows        []account.Row
-	activeDir   string
-	lastSwap    *swap.Event
+	rows           []account.Row
+	activeDir      string
+	codexActiveDir string
+	lastSwap       *swap.Event
 	swapErr     error
 	prevUtil    map[string]float64
 	err         error

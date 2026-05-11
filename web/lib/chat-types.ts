@@ -13,9 +13,43 @@ export type Effort = EffortLevel;
 // using whatever account is active in claude-monitor. "openrouter"
 // reroutes the SDK's HTTP traffic through OpenRouter using the global
 // OR config (~/.claude-monitor/config.json) — same SDK, same MCPs,
-// just a different model on the other end. Defaults to "anthropic"
-// when omitted.
-export type SessionProvider = "anthropic" | "openrouter";
+// just a different model on the other end. "codex" routes outbound
+// turns through OpenAI's ChatGPT-subscription Responses API
+// (chatgpt.com/backend-api/codex/responses) using tokens from
+// ~/.codex*/auth.json; reached only via a one-way mid-session handoff
+// (claude → codex) — see HandoffRecord. Defaults to "anthropic" when
+// omitted.
+export type SessionProvider = "anthropic" | "openrouter" | "codex";
+
+// HandoffRecord marks a one-way provider switch inside a session's
+// transcript. We snapshot the destination provider plus a summary the
+// outgoing provider wrote so the incoming provider has a self-contained
+// brief instead of having to ingest the full Anthropic-format jsonl
+// transcript it can't natively read. atMessageIndex points into
+// SessionSnapshot.history at the message JUST BEFORE the handoff fired
+// — the UI renders a boundary card after that index. codexAccount /
+// codexModel record the chosen target so a daemon restart resumes
+// codex turns against the same auth slot + model.
+export interface HandoffRecord {
+  at_message_index: number;
+  from_provider: SessionProvider;
+  to_provider: SessionProvider;
+  summary: string;
+  // Wall-clock for the boundary card timestamp.
+  at: string;
+  // Set when to_provider === "codex": the codex config dir
+  // (~/.codex* or absolute) whose auth.json drives subsequent turns,
+  // plus the chosen model id.
+  codex_config_dir?: string;
+  codex_account_name?: string;
+  codex_model?: string;
+  // Populated by the codex driver after the first turn's `thread.started`
+  // event arrives. Persisted so a daemon restart can `codex resume <id>`
+  // back into the same on-disk session (codex stores per-thread state in
+  // <CODEX_HOME>/sessions/<id>.jsonl). Empty/missing means the next turn
+  // will start a fresh codex thread.
+  codex_thread_id?: string;
+}
 
 // PermissionMode mirrors the SDK PermissionMode union but is duplicated
 // here so client modules (which can only import types from the SDK)
@@ -117,6 +151,12 @@ export interface SessionSummary {
   // the UI distinguish "rate-limited an hour ago" from "currently
   // rate-limited" without parsing Unix seconds in resetsAt.
   rate_limit_observed_at?: string;
+  // Provider handoffs that have fired on this session (chronological).
+  // Empty/omitted on un-handed-off sessions. Currently only claude →
+  // codex is supported; the field is plural to leave room for codex →
+  // codex (different account) or reverse handoffs later without a
+  // schema bump.
+  handoffs?: HandoffRecord[];
 }
 
 // SubagentSummary describes one Task tool_use spawn. The Task tool's
@@ -277,6 +317,11 @@ export type ChatEvent =
   // user message via PATCH /api/chat/<id>/queue/<uuid>.
   | { type: "queue_edited"; data: SDKMessage }
   | { type: "queue_cancelled"; data: { uuid: string } }
+  // Fired once when a mid-session provider handoff completes. The
+  // boundary card in chat-panel keys off this record so the user sees
+  // a "→ codex" divider between the last Claude assistant turn and
+  // the first codex turn.
+  | { type: "handoff"; data: HandoffRecord }
   // Sentinel emitted by the SSE route AFTER it finishes replaying
   // history. The client uses this to know when items.length is final
   // (no more historical messages will arrive in this burst), so the
@@ -304,14 +349,19 @@ export type SubagentNavTarget = {
 
 export interface CreateSessionRequest {
   cwd: string;
+  // For codex direct-start (provider==="codex" + no claude account)
+  // config_dir is the codex config dir (~/.codex*) since there's no
+  // anthropic account to bind. For other providers it's the
+  // anthropic-account config dir.
   config_dir: string;
   account_name?: string;
   model?: string;
   effort?: Effort;
   // When set to "openrouter" the spawn injects ANTHROPIC_BASE_URL +
   // ANTHROPIC_AUTH_TOKEN from the saved OR config so all SDK traffic
-  // routes through OpenRouter. account_name is then effectively
-  // ignored — OR auth replaces the account's Anthropic credentials.
+  // routes through OpenRouter. When set to "codex" the request bypasses
+  // claude entirely — codex_config_dir + codex_model drive the session
+  // from turn 1 against chatgpt.com/backend-api/codex/responses.
   provider?: SessionProvider;
   // Active permission mode. Drives auto-allow behavior server-side
   // and the mode chip in the composer toolbar client-side.
@@ -320,6 +370,13 @@ export interface CreateSessionRequest {
   // Sidebar uses these to group phase sessions under their owning plan.
   plan_id?: string;
   phase_slug?: string;
+  // Codex direct-start fields. Required when provider==="codex" and
+  // ignored otherwise. config_dir + account_name on the top-level
+  // CreateSessionRequest carry codex values when provider==="codex"
+  // (we don't duplicate them here), but the explicit codex_model
+  // here lets the UI pick a slug independently of any anthropic
+  // model field semantics.
+  codex_model?: string;
 }
 
 // Inline image attachment for the input route. Source is a data URL the

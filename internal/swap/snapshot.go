@@ -48,11 +48,19 @@ func (e *Event) String() string {
 // FetchResult bundles the per-snapshot data the TUI needs from a single
 // refresh: the rows, plus auto-swap outcome (which account is currently
 // behind the plain `claude` slot, and whether a rotation just happened).
+//
+// ActiveDir is the Anthropic active config dir — i.e. whichever
+// discovered ~/.claude* account currently owns the plain
+// "Claude Code-credentials" keychain entry. CodexActiveDir is the
+// OpenAI analog — whichever discovered ~/.codex* account currently
+// owns ~/.codex/auth.json. The two are independent: the TUI marks ★
+// on each provider's active row separately.
 type FetchResult struct {
-	Rows      []account.Row
-	ActiveDir string
-	Swap      *Event
-	SwapErr   error
+	Rows           []account.Row
+	ActiveDir      string
+	CodexActiveDir string
+	Swap           *Event
+	SwapErr        error
 }
 
 // FetchAll resolves accounts according to rootSpec, queries
@@ -98,6 +106,7 @@ func FetchAll(ctx context.Context, rootSpec string, cfg config.Config, skipUntil
 				ConfigDir:   a.ConfigDir,
 				Email:       a.Email,
 				AccountUUID: a.AccountUUID,
+				Provider:    a.Provider,
 				Err:         fmt.Errorf("rate limited (retry in %s)", time.Until(t).Round(time.Second)),
 			}
 			// Populate RefreshToken from the per-dir hashed keychain
@@ -129,6 +138,7 @@ func FetchAll(ctx context.Context, rootSpec string, cfg config.Config, skipUntil
 
 	result := &FetchResult{Rows: rows}
 	result.ActiveDir = detectActiveDir(rows)
+	result.CodexActiveDir = detectActiveCodexDir(rows)
 	if cfg.AutoSwap {
 		if target, reason := decideSwap(rows, result.ActiveDir, prevUtil, manualPickDir, manualPickUtil, cfg); target != nil {
 			active := account.FindRow(rows, result.ActiveDir)
@@ -153,8 +163,16 @@ func FetchAll(ctx context.Context, rootSpec string, cfg config.Config, skipUntil
 // fetchOne loads creds and fetches /api/oauth/usage for a single
 // account. Returns a Row with Err populated on any failure path so
 // the caller can render it inline.
+//
+// Branches on a.Provider: Anthropic rows go through the keychain +
+// /api/oauth/usage path; OpenAI rows go through the codex auth.json +
+// refresh path and skip usage probing entirely (Codex has no free
+// quota endpoint — see fetchOneOpenAI).
 func fetchOne(ctx context.Context, a account.Account, autoSwap bool) account.Row {
-	row := account.Row{Name: a.Name, ConfigDir: a.ConfigDir, Email: a.Email, AccountUUID: a.AccountUUID}
+	if a.Provider == account.ProviderOpenAI {
+		return fetchOneOpenAI(ctx, a)
+	}
+	row := account.Row{Name: a.Name, ConfigDir: a.ConfigDir, Email: a.Email, AccountUUID: a.AccountUUID, Provider: a.Provider}
 	// When auto-swap is on, prefer the per-dir hashed entry so the
 	// dashboard still shows each account's real usage even after the
 	// plain slot has been rotated to impersonate a different account.

@@ -20,6 +20,7 @@ import type {
   AskUserQuestionAnswers,
   AskUserQuestionRequest,
   Effort,
+  HandoffRecord,
   PermissionMode,
   SessionProvider,
   SessionSummary,
@@ -45,6 +46,9 @@ import { PluginsDialog } from "./plugins-dialog";
 import { RewindPicker } from "./rewind-picker";
 import { AskQuestionCard } from "./ask-question-card";
 import { ToolRunCard } from "./tool-run-card";
+import { HandoffBoundary } from "./handoff-boundary";
+import { HandoffBackDialog } from "./handoff-back-dialog";
+import { HandoffDialog } from "./handoff-dialog";
 import { SubagentProvider } from "./subagent-context";
 import {
   TurnEndMetaProvider,
@@ -177,7 +181,11 @@ type ChatItem =
   // only tool_use/thinking blocks, user echoes only tool_result) into
   // one collapsible block. runId is the first message's uuid so the
   // virtuoso key is stable across re-renders.
-  | { kind: "tool_run"; runId: string; messages: SDKMessage[] };
+  | { kind: "tool_run"; runId: string; messages: SDKMessage[] }
+  // Provider-handoff divider, inserted RIGHT AFTER the history entry
+  // at handoff.at_message_index. Carries the full record so the
+  // boundary card can render its summary expandable inline.
+  | { kind: "handoff"; record: HandoffRecord };
 
 interface CommandLog {
   id: string;
@@ -214,6 +222,26 @@ export function ChatPanel({ session }: Props) {
   const [rewindOpen, setRewindOpen] = useState(false);
   const [pluginsOpen, setPluginsOpen] = useState(false);
   const [mcpOpen, setMcpOpen] = useState(false);
+  // Codex handoff dialog — triggered from the composer model picker
+  // (selecting a GPT row stashes its slug in handoffPreselectModel
+  // then opens the dialog). Disabled once the session has already
+  // been routed through codex; the reverse direction uses
+  // HandoffBackDialog below.
+  const [handoffOpen, setHandoffOpen] = useState(false);
+  const [handoffPreselectModel, setHandoffPreselectModel] = useState<
+    string | undefined
+  >(undefined);
+  // Reverse-handoff dialog — fires when the user picks a Claude (or
+  // OR) model on a codex-routed session. The model+provider chosen in
+  // the picker are stashed here; on confirm we POST /handoff/back.
+  const [handoffBackOpen, setHandoffBackOpen] = useState(false);
+  const [handoffBackTarget, setHandoffBackTarget] = useState<
+    { model: string; provider: SessionProvider } | undefined
+  >(undefined);
+  // Treat an unset provider as "anthropic" — pre-handoff sessions
+  // recorded before the codex provider existed don't have the field.
+  const isCodexSession =
+    activeProvider === "codex" || session.provider === "codex";
   // OR favorites list for the composer's model chip. Only fetched when
   // this session is OR-routed; native sessions skip the request. Picker
   // selections call patchOptions({model}) which goes through the SDK's
@@ -413,7 +441,24 @@ export function ChatPanel({ session }: Props) {
         cmdIdx++;
       }
     };
+    // Handoff records are inserted as their own items right after the
+    // history index they reference. We sort once and walk a pointer
+    // alongside the history loop — same pattern as commandLog above.
+    const sortedHandoffs = [...chat.handoffs].sort(
+      (a, b) => a.at_message_index - b.at_message_index,
+    );
+    let handoffIdx = 0;
+    const flushHandoffsUpTo = (boundary: number) => {
+      while (
+        handoffIdx < sortedHandoffs.length &&
+        sortedHandoffs[handoffIdx].at_message_index < boundary
+      ) {
+        out.push({ kind: "handoff", record: sortedHandoffs[handoffIdx] });
+        handoffIdx++;
+      }
+    };
     flushCmdsUpTo(0);
+    flushHandoffsUpTo(0);
     // visibleClass marks each history index by what role it'd play in
     // a tool-run: tool_assistant (assistant turn that's pure tool_use,
     // optionally with thinking), tool_user_result (user message that
@@ -498,15 +543,18 @@ export function ChatPanel({ session }: Props) {
             messages: slice,
           });
           flushCmdsUpTo(end);
+          flushHandoffsUpTo(end);
           i = end;
           continue;
         }
       }
       out.push({ kind: "message", msg });
       flushCmdsUpTo(i + 1);
+      flushHandoffsUpTo(i + 1);
       i++;
     }
     flushCmdsUpTo(Number.MAX_SAFE_INTEGER);
+    flushHandoffsUpTo(Number.MAX_SAFE_INTEGER);
     if (chat.streamingBlocks.length > 0) {
       out.push({ kind: "streaming", blocks: chat.streamingBlocks });
     } else if (
@@ -532,6 +580,7 @@ export function ChatPanel({ session }: Props) {
     return out;
   }, [
     chat.history,
+    chat.handoffs,
     chat.streamingBlocks,
     chat.pendingQuestion,
     chat.latestPlan,
@@ -942,6 +991,23 @@ export function ChatPanel({ session }: Props) {
                 // implicit default.
                 const currentProvider: SessionProvider =
                   activeProvider ?? "anthropic";
+                // Codex → claude/OR is a reverse handoff: codex needs
+                // to write a summary turn first, then the session
+                // respawns under the claude SDK. The dedicated
+                // /handoff/back endpoint drives that; patchOptions on
+                // a codex session would (correctly) reject the
+                // provider switch outright. Open the confirm dialog
+                // instead so the user knows a summary turn is about
+                // to run.
+                if (currentProvider === "codex") {
+                  // nextProvider is narrowed to anthropic | openrouter
+                  // by the ternary above (a non-codex id can't infer
+                  // back to codex), so any pick here is a reverse
+                  // handoff.
+                  setHandoffBackTarget({ model: id, provider: nextProvider });
+                  setHandoffBackOpen(true);
+                  return;
+                }
                 const patch: Parameters<typeof patchOptions>[0] = { model: id };
                 if (nextProvider !== currentProvider) {
                   patch.provider = nextProvider;
@@ -952,6 +1018,21 @@ export function ChatPanel({ session }: Props) {
               onEffortChange={(e) => void patchOptions({ effort: e })}
               activeProvider={activeProvider}
               orModels={orModels}
+              onPickCodexModel={(id) => {
+                // Two dispatches based on session state. Pre-handoff:
+                // open HandoffDialog with the picked model preselected
+                // — the user still needs to pick a codex account.
+                // Post-handoff: hot-swap the codex driver's model id
+                // via the regular options patch; updateSessionOptions
+                // skips the respawn path for codex→codex model
+                // changes.
+                if (isCodexSession) {
+                  void patchOptions({ model: id });
+                } else {
+                  setHandoffPreselectModel(id);
+                  setHandoffOpen(true);
+                }
+              }}
               permMode={permissionMode}
               onPermModeChange={(m) => patchOptions({ permission_mode: m })}
               onSubmit={onSubmit}
@@ -973,6 +1054,32 @@ export function ChatPanel({ session }: Props) {
         </footer>
 
         <PermissionDialog request={chat.pendingPermission} onDecide={chat.decide} />
+        <HandoffDialog
+          open={handoffOpen}
+          onOpenChange={(o) => {
+            setHandoffOpen(o);
+            if (!o) setHandoffPreselectModel(undefined);
+          }}
+          sessionId={session.id}
+          fromAccountLabel={session.account_name}
+          initialModel={handoffPreselectModel}
+        />
+        {handoffBackTarget && (
+          <HandoffBackDialog
+            open={handoffBackOpen}
+            onOpenChange={(o) => {
+              setHandoffBackOpen(o);
+              if (!o) setHandoffBackTarget(undefined);
+            }}
+            sessionId={session.id}
+            targetModel={handoffBackTarget.model}
+            targetProvider={handoffBackTarget.provider}
+            fromAccountLabel={
+              chat.handoffs[chat.handoffs.length - 1]?.codex_account_name
+            }
+            fromCodexModel={model}
+          />
+        )}
         <PluginsDialog
           open={pluginsOpen}
           onOpenChange={setPluginsOpen}
@@ -1033,6 +1140,7 @@ function isCardItem(item: ChatItem): boolean {
   if (item.kind === "tool_run") return true;
   if (item.kind === "plan") return true;
   if (item.kind === "ask_question") return true;
+  if (item.kind === "handoff") return true;
   if (item.kind === "message" && item.msg.type === "assistant") {
     const content = item.msg.message.content;
     for (const block of content) {
@@ -1122,6 +1230,7 @@ function ItemRow({
             outputTokens={liveOutputTokens}
           />
         )}
+        {item.kind === "handoff" && <HandoffBoundary record={item.record} />}
       </div>
     </div>
   );
@@ -1150,6 +1259,8 @@ function itemKey(_: number, item: ChatItem): string {
       return `cmd:${item.id}`;
     case "thinking":
       return "thinking";
+    case "handoff":
+      return `handoff:${item.record.at}`;
   }
 }
 

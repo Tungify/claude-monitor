@@ -3,6 +3,7 @@ package account
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	"claude-monitor/internal/api"
 )
@@ -21,10 +22,18 @@ type Row struct {
 	ConfigDir string
 	Email     string
 
+	// Provider identifies which subscription backend this row belongs
+	// to. Defaults to ProviderAnthropic when zero so pre-existing test
+	// helpers that build Row literals continue to render as Claude
+	// rows.
+	Provider Provider
+
 	// AccountUUID is read once at ResolveDirs time from the in-dir
-	// <configDir>/.claude.json's oauthAccount.accountUuid. Stable
-	// across token rotations, so it's the primary signal for the
-	// active-marker logic in detectActiveDir.
+	// <configDir>/.claude.json's oauthAccount.accountUuid (for
+	// Anthropic) or the id_token JWT's chatgpt_account_id (for
+	// OpenAI). Stable across token rotations, so it's the primary
+	// signal for the active-marker logic in detectActiveDir /
+	// detectActiveCodexDir.
 	AccountUUID string
 
 	Usage *api.Usage // nil when fetch failed
@@ -32,12 +41,23 @@ type Row struct {
 
 	// Auto-kick state. Populated only when AutoKick is on and the row
 	// was eligible (5h window at 0% utilization at the moment of
-	// refresh).
+	// refresh). Always empty for OpenAI rows — Codex has no analog of
+	// Anthropic's "send a 1-token message to start the 5h window"
+	// trick.
 	Kicked  bool
 	KickErr error
 
 	AccessToken  string
 	RefreshToken string
+
+	// OpenAI-specific. PlanType holds the chatgpt_plan_type claim from
+	// the id_token JWT (free/plus/pro/business/enterprise/edu);
+	// TokenExpiresAt is the JWT exp claim, used both for the
+	// "refresh in X" status line and to drive NeedsRefresh.
+	//
+	// Empty/zero for Anthropic rows.
+	PlanType       string
+	TokenExpiresAt time.Time
 }
 
 // Label is the human-friendly identifier used in TUI cells, log lines,

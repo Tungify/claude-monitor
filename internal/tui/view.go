@@ -129,6 +129,44 @@ func (m model) table(st styles) string {
 			b.WriteString("\n")
 			continue
 		}
+		if r.Provider == account.ProviderOpenAI && r.Usage == nil {
+			// Fallback path: token is valid but /wham/usage hasn't
+			// produced a snapshot yet (fresh login on the previous
+			// tick, transient network blip, etc.). Surface plan +
+			// token-expiry so the row still answers the secondary
+			// question — "which account is this and when does its
+			// token refresh?" — even when quota bars aren't available.
+			label := m.decorateLabel(st, i, r, account.Label(r))
+			plan := r.PlanType
+			if plan == "" {
+				plan = "chatgpt"
+			} else {
+				plan = "chatgpt:" + plan
+			}
+			expStr := "refresh: —"
+			if !r.TokenExpiresAt.IsZero() {
+				delta := time.Until(r.TokenExpiresAt).Round(time.Minute)
+				switch {
+				case delta < 0:
+					expStr = st.warn.Render("token expired")
+				case delta < time.Minute:
+					expStr = "refresh soon"
+				case delta < time.Hour:
+					expStr = fmt.Sprintf("refresh in %dm", int(delta.Minutes()))
+				case delta < 24*time.Hour:
+					expStr = fmt.Sprintf("refresh in %dh%02dm", int(delta.Hours()), int(delta.Minutes())%60)
+				default:
+					days := int(delta.Hours()) / 24
+					expStr = fmt.Sprintf("refresh in %dd", days)
+				}
+			}
+			line := padRight(st.colHeader.Render(label), widths[0]) +
+				"  " + padRight(st.account.Render(plan), 14) +
+				"  " + st.dim.Render(expStr)
+			b.WriteString(line)
+			b.WriteString("\n")
+			continue
+		}
 		u := r.Usage
 		cells := []string{
 			st.account.Render(m.decorateLabel(st, i, r, account.Label(r))),
@@ -231,14 +269,17 @@ func (m model) helpBar(st styles) string {
 
 // decorateLabel prefixes a marker to the label of whichever row is
 // noteworthy: ▶ for the [m] picker cursor, ★ for the row that owns
-// the plain keychain slot. When the active row is also a manual pin,
-// ★ is rendered in the accent color instead of the kicked color so
-// the user can see at a glance that auto-rebalance is suppressed.
+// the active credential slot (per provider — Anthropic's plain
+// keychain entry, or Codex's ~/.codex/auth.json file). When the
+// active row is also a manual pin, ★ is rendered in the accent color
+// instead of the kicked color so the user can see at a glance that
+// auto-rebalance is suppressed.
 func (m model) decorateLabel(st styles, idx int, r account.Row, label string) string {
 	if m.picking && idx == m.pickCursor {
 		return st.accent.Render("▶ ") + label
 	}
-	if r.ConfigDir != "" && r.ConfigDir == m.activeDir {
+	isActive := r.ConfigDir != "" && (r.ConfigDir == m.activeDir || r.ConfigDir == m.codexActiveDir)
+	if isActive {
 		marker := st.kicked.Render("★ ")
 		if r.ConfigDir == m.manualPickDir {
 			marker = st.accent.Render("★ ")

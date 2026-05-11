@@ -75,6 +75,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.rows = msg.rows
 		m.activeDir = msg.activeDir
+		m.codexActiveDir = msg.codexActiveDir
 		m.err = msg.err
 		m.lastRefresh = msg.at
 		var swapCmd tea.Cmd
@@ -302,7 +303,11 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.addingAccount = true
-		m.addState = addState{}
+		// Start with the cursor on Name (the most-edited field). Users
+		// who want to switch provider tab up once or press 'o'/'a'
+		// while on this row. Without this, the form opens on the
+		// provider toggle which is rarely what the user wants.
+		m.addState = addState{cursor: addFieldName}
 		return m, nil
 
 	case "L":

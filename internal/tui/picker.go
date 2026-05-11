@@ -62,6 +62,13 @@ func (m model) handlePickKey(msg tea.KeyMsg) (model, tea.Cmd, bool) {
 			m.loggingIn = true
 			m.flash = "relogin: " + account.Label(target) + "…"
 			m.flashExpiry = time.Now().Add(24 * time.Hour)
+			// Provider-aware relogin: an OpenAI row reauths via
+			// `codex login`, an Anthropic row via `claude auth login`.
+			// loginCmd / codexLoginCmd share the loginDoneMsg shape so
+			// the post-completion refresh hook fires uniformly.
+			if target.Provider == account.ProviderOpenAI {
+				return m, codexLoginCmd(target.ConfigDir, account.Label(target), false), true
+			}
 			return m, loginCmd(target.ConfigDir, target.Email, account.Label(target), false), true
 		}
 		// Don't gate on row.RefreshToken here — a row may have an
@@ -70,7 +77,15 @@ func (m model) handlePickKey(msg tea.KeyMsg) (model, tea.Cmd, bool) {
 		// underlying keychain entry is fine. swap.Execute reads the
 		// target's creds fresh from the keychain at swap time and
 		// will return a real error if they're genuinely missing.
-		if target.ConfigDir == m.activeDir {
+		//
+		// Provider-aware active comparison: an Anthropic row is "the
+		// active one" when its dir owns the plain keychain slot; an
+		// OpenAI row is active when its dir owns ~/.codex/auth.json.
+		activeForTarget := m.activeDir
+		if target.Provider == account.ProviderOpenAI {
+			activeForTarget = m.codexActiveDir
+		}
+		if target.ConfigDir == activeForTarget {
 			// Picking the row that's already active is a no-op but
 			// also the natural "set this as my pin" gesture — record
 			// it so rebalance-on-reset is suppressed going forward.

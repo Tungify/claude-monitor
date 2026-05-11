@@ -55,6 +55,11 @@ interface CommonProps {
   // GET.
   activeProvider?: SessionProvider;
   orModels?: string[];
+  // Optional: parent provides this to expose the Codex model section
+  // in the picker. The composer doesn't need to know about handoffs —
+  // it just forwards picked codex ids. Pre-handoff sessions take the
+  // model + open the HandoffDialog; post-handoff sessions hot-swap.
+  onPickCodexModel?: (id: string) => void;
   onSubmit: (payload: ComposerSubmit) => Promise<void> | void;
   busy?: boolean;
   disabled?: boolean;
@@ -560,6 +565,7 @@ export function Composer(props: Props) {
                 ? props.onConfigureOpenRouter
                 : undefined
             }
+            onPickCodexModel={props.onPickCodexModel}
           />
 
           <Button

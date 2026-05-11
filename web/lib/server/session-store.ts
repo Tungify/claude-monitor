@@ -8,6 +8,7 @@ import type { SDKMessage, EffortLevel } from "@anthropic-ai/claude-agent-sdk";
 
 import type {
   ContextUsageBreakdown,
+  HandoffRecord,
   PermissionMode,
   RateLimitInfo,
   SessionProvider,
@@ -52,6 +53,10 @@ export interface StoredSession {
   // the badge / countdown after the daemon comes back.
   rate_limit?: RateLimitInfo;
   rate_limit_observed_at?: string;
+  // Provider handoffs that have fired on this session (chronological).
+  // Persisted so a daemon restart resumes codex turns against the
+  // recorded auth slot + model without losing the summary preamble.
+  handoffs?: HandoffRecord[];
 }
 
 // One JSON file per session keeps writes scoped (a 5MB conversation

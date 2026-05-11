@@ -23,3 +23,7 @@ go.work.sum
 # Env
 .env
 .env.local
+
+# Claude Code local state (per-user settings + /loop runtime lock)
+.claude/settings.local.json
+.claude/scheduled_tasks.lock

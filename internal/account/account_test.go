@@ -282,6 +282,45 @@ func TestResolveDirsSkipsOwnStateDir(t *testing.T) {
 	}
 }
 
+// TestResolveDirsAutoDiscoverCodex makes sure ~/.codex* dirs surface
+// alongside ~/.claude* and are tagged with ProviderOpenAI. This is the
+// foundation of the OpenAI Codex integration — without it the rest of
+// the per-provider branching never runs.
+func TestResolveDirsAutoDiscoverCodex(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+
+	// One Claude account + one Codex account side by side.
+	if err := os.MkdirAll(filepath.Join(tmp, ".claude", "projects"), 0o755); err != nil {
+		t.Fatalf("mkdir claude: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(tmp, ".codex-acc1"), 0o755); err != nil {
+		t.Fatalf("mkdir codex: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(tmp, ".codex-acc1", "auth.json"), []byte(`{"tokens":{}}`), 0o600); err != nil {
+		t.Fatalf("write auth.json: %v", err)
+	}
+
+	got, err := ResolveDirs("")
+	if err != nil {
+		t.Fatalf("ResolveDirs: %v", err)
+	}
+	byName := map[string]Account{}
+	for _, a := range got {
+		byName[a.Name] = a
+	}
+	if a, ok := byName["claude"]; !ok {
+		t.Errorf("claude account missing; got %+v", got)
+	} else if a.Provider != ProviderAnthropic {
+		t.Errorf("claude account Provider = %q, want anthropic", a.Provider)
+	}
+	if a, ok := byName["codex-acc1"]; !ok {
+		t.Errorf("codex-acc1 account missing; got %+v", got)
+	} else if a.Provider != ProviderOpenAI {
+		t.Errorf("codex-acc1 Provider = %q, want openai", a.Provider)
+	}
+}
+
 func TestDefaultDir(t *testing.T) {
 	tmp := t.TempDir()
 	t.Setenv("HOME", tmp)

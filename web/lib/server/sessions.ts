@@ -57,6 +57,7 @@ import type {
   Attachment,
   ChatEvent,
   ContextUsageBreakdown,
+  HandoffRecord,
   PermissionDecision,
   PermissionMode,
   PermissionRequest,
@@ -67,6 +68,8 @@ import type {
   SessionSummary,
   SessionUsage,
 } from "@/lib/chat-types";
+import { driveCodexSession } from "./codex-driver";
+import { listCodexConfigDirs, resolveCodexAuth } from "./codex-auth";
 import { loadOpenRouterConfigSync, openRouterEnv } from "./openrouter-config";
 import {
   listSnapshots as fhListSnapshots,
@@ -159,6 +162,14 @@ interface ChatSession {
   // and the field survives restart via session-store.
   rateLimit?: RateLimitInfo;
   rateLimitObservedAt?: string;
+  // Provider handoffs that have fired on this session (chronological).
+  // When non-empty, the last entry's to_provider matches session.provider
+  // and the driver loop is driveCodexSession instead of driveSession.
+  handoffs?: HandoffRecord[];
+  // True while a handoff is in progress (claude turn for the summary
+  // is in flight, or codex respawn is queued). Guards re-entry: a
+  // user can't fire two handoffs simultaneously.
+  handoffInFlight?: boolean;
 }
 
 // InterruptedSession is the on-restart shadow of a ChatSession: just
@@ -185,6 +196,9 @@ interface InterruptedSession {
   phaseSlug?: string;
   rateLimit?: RateLimitInfo;
   rateLimitObservedAt?: string;
+  // Handoffs survive a restart so a session that was already routed
+  // through codex resumes through codex (not back through claude).
+  handoffs?: HandoffRecord[];
 }
 
 // Stash the registries on globalThis so they survive Next.js dev module
@@ -251,6 +265,7 @@ async function initFromDisk(): Promise<void> {
         phaseSlug: s.phase_slug,
         rateLimit: s.rate_limit,
         rateLimitObservedAt: s.rate_limit_observed_at,
+        handoffs: s.handoffs,
       });
     }
     if (stored.length > 0) {
@@ -382,6 +397,7 @@ async function persistNow(id: string): Promise<void> {
       phase_slug: s.phaseSlug,
       rate_limit: s.rateLimit,
       rate_limit_observed_at: s.rateLimitObservedAt,
+      handoffs: s.handoffs,
     };
     await persistStoredSession(stored);
   } catch (err) {
@@ -434,6 +450,9 @@ function summarize(session: ChatSession): SessionSummary {
     phase_slug: session.phaseSlug,
     rate_limit: session.rateLimit,
     rate_limit_observed_at: session.rateLimitObservedAt,
+    handoffs: session.handoffs && session.handoffs.length > 0
+      ? session.handoffs
+      : undefined,
   };
 }
 
@@ -909,6 +928,7 @@ interface BuildLiveInit {
   phaseSlug?: string;
   rateLimit?: RateLimitInfo;
   rateLimitObservedAt?: string;
+  handoffs?: HandoffRecord[];
   // isResume → query() is launched with `resume` instead of
   // `sessionId`, telling the claude binary to load the session's
   // transcript from ~/.claude/projects/<dir>/<id>.jsonl and continue
@@ -953,14 +973,114 @@ function buildLiveSession(init: BuildLiveInit): ChatSession {
     alwaysAllowRules: [],
     rateLimit: init.rateLimit,
     rateLimitObservedAt: init.rateLimitObservedAt,
+    handoffs: init.handoffs,
     query: undefined as unknown as Query, // assigned below
   };
+
+  // Provider branch: a session that's already been handed off to
+  // codex (provider==="codex" + at least one handoff record) doesn't
+  // get a Claude SDK Query. Instead, install a stub query (close()
+  // no-op so updateSessionOptions / shutdown paths don't crash) and
+  // drive turns via the codex driver.
+  if (
+    init.provider === "codex" &&
+    init.handoffs &&
+    init.handoffs.length > 0
+  ) {
+    session.query = codexStubQuery();
+    sessions.set(init.id, session);
+    void driveCodexFromSession(session);
+    return session;
+  }
 
   attachSDKQuery(session, init.isResume);
 
   sessions.set(init.id, session);
   void driveSession(session);
   return session;
+}
+
+// codexStubQuery is the sentinel "I'm not a real SDK Query" object we
+// install on codex-routed sessions. None of its methods should be
+// called for a codex session in normal flow (driveCodexSession owns
+// the loop; updateSessionOptions is gated; refreshContextUsage is
+// also gated). Defensive no-ops here mean a stray call surfaces as a
+// log line rather than a TypeError that takes the session down.
+function codexStubQuery(): Query {
+  const stub = {
+    close: () => Promise.resolve(),
+    interrupt: () => Promise.resolve(),
+    setModel: () => Promise.resolve(),
+    applyFlagSettings: () => Promise.resolve(),
+    setPermissionMode: () => Promise.resolve(),
+    // Intentionally undefined — refreshContextUsage's `typeof
+    // q.getContextUsage !== "function"` guard then skips the call,
+    // no error log noise from the stub being prodded.
+    getContextUsage: undefined,
+    [Symbol.asyncIterator]() {
+      return {
+        next: () =>
+          Promise.resolve({ value: undefined as never, done: true as const }),
+      };
+    },
+  };
+  return stub as unknown as Query;
+}
+
+// driveCodexFromSession adapts the live ChatSession to the
+// driveCodexSession contract. The bridges (pushHistory / emit /
+// setStatus / recordUsage / isStillCurrent) keep the driver oblivious
+// to ChatSession internals while still mutating the right object —
+// schedulePersist fires on each history push so a daemon restart in
+// the middle of a codex turn doesn't lose the latest delta.
+function driveCodexFromSession(session: ChatSession): Promise<void> {
+  const handoff = session.handoffs?.[session.handoffs.length - 1];
+  if (!handoff) {
+    setStatus(session, "errored");
+    emit(session, {
+      type: "error",
+      data: { message: "codex session has no handoff record" },
+    });
+    return Promise.resolve();
+  }
+  const ownAbort = session.abortController;
+  return driveCodexSession({
+    id: session.id,
+    cwd: session.cwd,
+    history: session.history,
+    handoff,
+    // resolveModel is read fresh on EVERY turn so a mid-session
+    // model hot-swap (composer picker on a codex session) takes
+    // effect on the very next user message without a respawn.
+    // Priority: session.model (live, mutable) → handoff record
+    // (initial pick) → hardcoded fallback.
+    resolveModel: () =>
+      session.model || handoff.codex_model || "gpt-5.5",
+    resolveEffort: () => session.effort,
+    inputQueue: session.inputQueue,
+    abortSignal: session.abortController.signal,
+    pushHistory: (msg) => {
+      if (session.history.length >= HISTORY_CAP) session.history.shift();
+      session.history.push(msg);
+      schedulePersist(session.id);
+    },
+    emit: (event) => emit(session, event),
+    setStatus: (status) => setStatus(session, status),
+    recordUsage: (usage) => {
+      session.latestUsage = usage;
+    },
+    // Driver mutates handoff.codex_thread_id in place when codex emits
+    // thread.started. We force a snapshot write so the id lands on disk
+    // immediately — without this the persistence only happens on the
+    // next history push, which is after the first turn's worth of
+    // events. A daemon restart between thread.started and the first
+    // pushHistory would otherwise lose the resume handle.
+    recordThreadId: () => schedulePersist(session.id),
+    // The session's still ours as long as nobody re-pointed its abort
+    // controller. A future codex→codex respawn would mint a new
+    // controller, the same way respawnQuery does on the claude side.
+    isStillCurrent: () => session.abortController === ownAbort,
+  });
 }
 
 // attachSDKQuery wires a fresh SDK Query onto an existing ChatSession.
@@ -1016,11 +1136,16 @@ function attachSDKQuery(session: ChatSession, isResume: boolean): void {
       // model offers the user an explicit single-vs-multi-phase choice
       // before doing work. Phase sessions get a curated kickoff prompt
       // and shouldn't see this.
-      systemPrompt: {
-        type: "preset",
-        preset: "claude_code",
-        ...(session.phaseSlug ? {} : { append: OWNER_TRIAGE_APPEND }),
-      },
+      systemPrompt: ((): { type: "preset"; preset: "claude_code"; append?: string } => {
+        const parts: string[] = [];
+        if (!session.phaseSlug) parts.push(OWNER_TRIAGE_APPEND);
+        const postHandoff = computePostHandoffPreamble(session);
+        if (postHandoff) parts.push(postHandoff);
+        const append = parts.join("\n\n");
+        return append
+          ? { type: "preset", preset: "claude_code", append }
+          : { type: "preset", preset: "claude_code" };
+      })(),
       permissionMode: session.permissionMode,
       // bypassPermissions ("Auto / Yolo" in the UI) requires the
       // session to be launched with this opt-in. Without it the SDK
@@ -1132,6 +1257,64 @@ export function createSession(opts: {
   return summarize(session);
 }
 
+// createCodexSession spawns a brand-new chat that talks directly to
+// OpenAI Codex (ChatGPT-subscription) from the very first user
+// message — bypasses the claude→codex handoff entirely. The codex
+// driver requires at least one HandoffRecord per session (it reads
+// codex_config_dir + codex_model off it), so we synthesize a sentinel
+// record with empty summary + at_message_index = -1; buildInstructions
+// detects that pair and switches to a "fresh codex chat" preamble
+// instead of the "handed off from claude" one.
+//
+// Validates auth before creating the session so a missing/expired
+// refresh token surfaces as a 422 from the caller route, not as a
+// dead session in the sidebar.
+export async function createCodexSession(opts: {
+  cwd: string;
+  codex_config_dir: string;
+  codex_account_name?: string;
+  codex_model?: string;
+  effort?: EffortLevel;
+  planId?: string;
+  phaseSlug?: string;
+}): Promise<SessionSummary> {
+  await resolveCodexAuth(opts.codex_config_dir);
+  const id = randomUUID();
+  const model = opts.codex_model || "gpt-5.5";
+  const handoff: HandoffRecord = {
+    at_message_index: -1,
+    from_provider: "anthropic",
+    to_provider: "codex",
+    summary: "",
+    at: new Date().toISOString(),
+    codex_config_dir: opts.codex_config_dir,
+    codex_account_name: opts.codex_account_name,
+    codex_model: model,
+  };
+  const session = buildLiveSession({
+    id,
+    cwd: opts.cwd,
+    // Codex sessions don't bind to a claude account, but ChatSession
+    // typing requires configDir. We use the codex config dir as a
+    // best-effort tag; the SDK Query never instantiates here so the
+    // value is never read for routing.
+    configDir: opts.codex_config_dir,
+    accountName: opts.codex_account_name,
+    createdAt: new Date(),
+    model,
+    effort: opts.effort,
+    provider: "codex",
+    permissionMode: "default",
+    planId: opts.planId,
+    phaseSlug: opts.phaseSlug,
+    history: [],
+    handoffs: [handoff],
+    isResume: false,
+  });
+  schedulePersist(id);
+  return summarize(session);
+}
+
 // registerImportedSession slots a session built outside the orchestrator
 // (e.g. parsed from a Claude Code CLI jsonl by cli-import.ts) into the
 // interrupted-shadow map without spawning a Query. The session is
@@ -1195,6 +1378,7 @@ function resumeSession(stored: InterruptedSession): ChatSession {
     latestPlan: stored.latestPlan,
     rateLimit: stored.rateLimit,
     rateLimitObservedAt: stored.rateLimitObservedAt,
+    handoffs: stored.handoffs,
     isResume: true,
   });
   interruptedSessions.delete(stored.id);
@@ -1354,6 +1538,7 @@ function summarizeInterrupted(s: InterruptedSession): SessionSummary {
     phase_slug: s.phaseSlug,
     rate_limit: s.rateLimit,
     rate_limit_observed_at: s.rateLimitObservedAt,
+    handoffs: s.handoffs && s.handoffs.length > 0 ? s.handoffs : undefined,
   };
 }
 
@@ -1696,6 +1881,41 @@ export async function updateSessionOptions(
   if (s.status === "closed" || s.status === "errored") {
     throw new Error(`session is ${s.status}`);
   }
+  // Codex isn't reachable via the generic provider-switch path because
+  // it needs a handoff summary turn first. Route the caller to
+  // handoffToCodex instead.
+  if (opts.provider === "codex") {
+    throw new Error(
+      "switching to codex requires POST /api/chat/<id>/handoff (handoff summary turn)",
+    );
+  }
+  // Codex sessions hot-swap models in place — the next turn picks up
+  // the new id when codex-driver reads session.model. Other knobs
+  // (effort, permission_mode, provider) aren't honored on codex
+  // sessions: codex doesn't expose effort the same way, codex turns
+  // can't call tools so permission_mode is moot, and switching
+  // provider away from codex needs a reverse handoff (out of scope).
+  if (s.provider === "codex") {
+    // opts.provider === "codex" was rejected above; anything else
+    // here (anthropic / openrouter) is a reverse-handoff request.
+    if (opts.provider) {
+      throw new Error(
+        "reverse handoff (codex → claude) is not supported yet",
+      );
+    }
+    if (opts.model && opts.model !== s.model) {
+      s.model = opts.model;
+      // No respawn needed — codex-driver re-reads session.model at
+      // the top of every turn. Persist so a daemon restart resumes
+      // with the new model.
+      schedulePersist(s.id);
+    }
+    if (opts.effort && opts.effort !== s.effort) {
+      s.effort = opts.effort;
+      schedulePersist(s.id);
+    }
+    return summarize(s);
+  }
   // Provider change first — it respawns the SDK Query, after which the
   // new query takes the rest of the patch (model/effort/permissionMode)
   // straight via attachSDKQuery's options. Subsequent setModel /
@@ -1739,6 +1959,357 @@ export async function updateSessionOptions(
     s.permissionMode = opts.permissionMode;
   }
   return summarize(s);
+}
+
+// HANDOFF_PROMPT is the magic user message we feed claude to elicit
+// a self-contained brief codex can pick up from. We deliberately
+// don't hide it from the transcript — the user should see what was
+// handed over, and the boundary card rendered AFTER this turn marks
+// the divide. Length cap is empirical: under ~600 words covers most
+// in-progress coding sessions while staying well under codex's
+// instructions ceiling.
+const HANDOFF_PROMPT = `[Orchestrator: handoff to codex]
+
+A different model (OpenAI Codex via ChatGPT subscription) will continue this conversation after your next response. Codex will see ONLY your reply, not the prior transcript — it can't read Anthropic-format messages or replay tool calls. Write a self-contained brief so codex picks up seamlessly.
+
+Wrap the brief in <handoff-summary>...</handoff-summary> tags. Cover:
+1. What the user is trying to accomplish (the overarching task).
+2. What you've already done — files touched, decisions made, findings, important code locations (with file:line refs where useful).
+3. Current state — where the work sits right this moment.
+4. Next step — what should happen on the next user message.
+5. Open questions or constraints codex needs to know.
+
+Keep the brief under 600 words. After the closing tag, write a single line confirming the handoff is ready. Do not call any tools in this turn — text only.`;
+
+// REVERSE_HANDOFF_PROMPT is the symmetric prompt we feed CODEX when
+// the user wants to hand control back to Claude. Same shape as
+// HANDOFF_PROMPT — codex writes a self-contained <handoff-summary>
+// — but framed for the opposite direction: codex narrates what it
+// did during its turn(s) so claude can resume with full context.
+const REVERSE_HANDOFF_PROMPT = `[Orchestrator: handoff back to claude]
+
+The user wants Anthropic Claude to continue this conversation after your next reply. Claude will see ONLY your summary, not the codex-side transcript — it can't replay the codex thread on its own. Write a self-contained brief so claude resumes seamlessly.
+
+Wrap the brief in <handoff-summary>...</handoff-summary> tags. Cover:
+1. What you (codex) worked on during this segment — files touched, commands run, findings, decisions made (with file:line refs where useful).
+2. Current state — where the work sits right this moment.
+3. Next step — what should happen on the next user message.
+4. Open questions or constraints claude needs to know.
+
+Keep the brief under 600 words. After the closing tag, write a single line confirming the handoff is ready. Do not call any tools in this turn — text only.`;
+
+// computePostHandoffPreamble returns the system-prompt append text we
+// layer onto claude when the most recent handoff record routed the
+// session from codex back to anthropic (or openrouter). Claude's own
+// jsonl transcript is frozen at the original claude→codex moment, so
+// without this preamble the resumed claude session is unaware of
+// anything codex did. We inject the summary as part of the system
+// prompt every time attachSDKQuery fires — the codex segment is
+// permanently missing from claude's disk transcript, so the summary
+// has to ride along on every claude respawn for as long as the
+// session lives.
+function computePostHandoffPreamble(session: ChatSession): string | undefined {
+  const handoffs = session.handoffs ?? [];
+  if (handoffs.length === 0) return undefined;
+  const last = handoffs[handoffs.length - 1];
+  if (last.from_provider !== "codex") return undefined;
+  if (last.to_provider === "codex") return undefined;
+  const summary = (last.summary || "").trim();
+  if (!summary) return undefined;
+  return `## Resumed after a Codex handoff
+
+You're picking this chat back up from OpenAI Codex, who was driving it for a stretch. Codex doesn't share an Anthropic-format transcript, so your on-disk jsonl skips the codex segment entirely — treat the brief below as a /resume preamble for everything that happened while you were paused.
+
+${summary}`;
+}
+
+// handoffToCodex is the entry point the /api/chat/<id>/handoff route
+// hits. Flow:
+//
+//  1. Validate the codex slot (auth.json present, refresh works).
+//  2. Push HANDOFF_PROMPT through the live claude session so the
+//     model writes a self-contained brief in-transcript.
+//  3. Wait for the matching `result` SDK message via the emitter.
+//     Extract the <handoff-summary> body — fall back to the full
+//     result text if the model forgot the tag.
+//  4. Append a HandoffRecord, flip provider to "codex", model to
+//     opts.codex_model (default gpt-5.5), persist, tear down
+//     the claude Query, and respawn under driveCodexFromSession.
+//  5. Emit a `handoff` ChatEvent so the chat panel can drop a
+//     boundary card.
+//
+// On failure between (1) and (4), the session stays on claude — the
+// only side effect is the visible summary turn in the transcript.
+// We surface the error to the caller (route returns 422) and leave
+// it to the user to retry.
+export async function handoffToCodex(
+  sessionId: string,
+  opts: {
+    codex_config_dir: string;
+    codex_account_name?: string;
+    codex_model?: string;
+  },
+): Promise<HandoffRecord> {
+  const s = getOrResume(sessionId);
+  if (!s) throw new Error("session not found");
+  if (s.status === "closed" || s.status === "errored") {
+    throw new Error(`session is ${s.status}`);
+  }
+  if (s.provider === "codex") {
+    throw new Error("session is already routed through codex");
+  }
+  if (s.handoffInFlight) {
+    throw new Error("handoff already in flight");
+  }
+  // Probe codex auth FIRST so a missing/expired refresh token surfaces
+  // before we spend a claude turn on the summary. resolveCodexAuth
+  // refreshes proactively, so a successful probe means the very next
+  // codex turn will have a valid bearer.
+  await resolveCodexAuth(opts.codex_config_dir);
+
+  s.handoffInFlight = true;
+
+  // Listen for the next `result` SDK message so we know when claude
+  // finishes the summary turn. We snapshot the response text from
+  // either the assistant message content (preferred — preserves
+  // formatting) or the result.result string (fallback).
+  const summaryPromise = waitForNextResult(s);
+  sendMessage(sessionId, HANDOFF_PROMPT);
+
+  let summaryText: string;
+  try {
+    summaryText = await summaryPromise;
+  } finally {
+    s.handoffInFlight = false;
+  }
+
+  // Extract <handoff-summary>...</handoff-summary> body when present.
+  // Some models drop the tags on shorter contexts; in that case we
+  // keep the full text — codex gets slightly more noise but doesn't
+  // lose information.
+  const tagMatch = summaryText.match(
+    /<handoff-summary>([\s\S]*?)<\/handoff-summary>/i,
+  );
+  const summary = (tagMatch ? tagMatch[1] : summaryText).trim();
+
+  const handoff: HandoffRecord = {
+    at_message_index: Math.max(s.history.length - 1, 0),
+    from_provider: s.provider ?? "anthropic",
+    to_provider: "codex",
+    summary,
+    at: new Date().toISOString(),
+    codex_config_dir: opts.codex_config_dir,
+    codex_account_name: opts.codex_account_name,
+    codex_model: opts.codex_model || "gpt-5.5",
+  };
+  s.handoffs = [...(s.handoffs ?? []), handoff];
+  s.provider = "codex";
+  s.model = handoff.codex_model;
+  schedulePersist(s.id);
+
+  respawnAsCodex(s);
+  emit(s, { type: "handoff", data: handoff });
+  return handoff;
+}
+
+// waitForNextResult subscribes to the session's emitter and resolves
+// on the first `result` SDK message that arrives. Used by handoff to
+// know when the summary turn settled. We extract text in order:
+//
+//  1. The assistant message immediately preceding the result (richer
+//     content — multiple text blocks, etc.).
+//  2. result.result string (fallback when the SDK consolidates the
+//     turn's text there).
+function waitForNextResult(s: ChatSession): Promise<string> {
+  return new Promise<string>((resolve, reject) => {
+    let lastAssistantText = "";
+    const onEvent = (event: ChatEvent) => {
+      if (event.type === "error") {
+        s.emitter.off("event", onEvent);
+        reject(
+          new Error(
+            (event.data as { message?: string }).message ?? "unknown error",
+          ),
+        );
+        return;
+      }
+      if (event.type !== "message") return;
+      const msg = event.data as SDKMessage & {
+        message?: { content?: Array<{ type: string; text?: string }> };
+        result?: string;
+        parent_tool_use_id?: string | null;
+      };
+      if (msg.type === "assistant" && !msg.parent_tool_use_id) {
+        const blocks = msg.message?.content as
+          | Array<{ type: string; text?: string }>
+          | undefined;
+        if (Array.isArray(blocks)) {
+          const text = blocks
+            .filter(
+              (b): b is { type: "text"; text: string } =>
+                b.type === "text" && typeof b.text === "string",
+            )
+            .map((b) => b.text)
+            .join("\n")
+            .trim();
+          if (text) lastAssistantText = text;
+        }
+      } else if (msg.type === "result") {
+        s.emitter.off("event", onEvent);
+        const fallback = typeof msg.result === "string" ? msg.result : "";
+        resolve(lastAssistantText || fallback);
+      }
+    };
+    s.emitter.on("event", onEvent);
+  });
+}
+
+// respawnAsCodex tears down the SDK Query and stands up the codex
+// driver on the same ChatSession. Parallel to respawnQuery (claude
+// side) — same lifecycle, different driver. The history array is
+// preserved verbatim so the user keeps the full pre-handoff
+// transcript.
+function respawnAsCodex(session: ChatSession): void {
+  try {
+    session.abortController.abort();
+  } catch {
+    // already-aborted controller — swallow.
+  }
+  try {
+    session.inputQueue.end();
+  } catch {
+    // already-ended queue — swallow.
+  }
+  try {
+    session.query.close();
+  } catch {
+    // claude binary may already be exiting — ignore.
+  }
+  session.inputQueue = new AsyncQueue<SDKUserMessage>();
+  session.abortController = new AbortController();
+  session.query = codexStubQuery();
+  setStatus(session, "starting");
+  void driveCodexFromSession(session);
+}
+
+// handoffFromCodex is the inverse of handoffToCodex: the user has a
+// codex-routed session and wants claude (native or via OpenRouter) to
+// take over again. We drive codex once more to produce a self-contained
+// summary, then tear down the codex driver and respawn under the
+// claude SDK Query. claude's own jsonl is still frozen at the original
+// claude→codex moment, so attachSDKQuery layers the new summary into
+// claude's systemPrompt.append via computePostHandoffPreamble — that
+// keeps claude aware of what codex did despite the disk transcript
+// gap.
+//
+// Flow mirrors handoffToCodex:
+//   1. Validate session is codex-routed and not mid-handoff.
+//   2. Subscribe to next `result` SDK message via waitForNextResult.
+//   3. Push REVERSE_HANDOFF_PROMPT through the live codex session so
+//      codex writes the brief in-transcript.
+//   4. Extract <handoff-summary> body (fallback: full text).
+//   5. Append a reverse HandoffRecord, flip provider/model, persist.
+//   6. Tear down codex driver and respawn under driveSession.
+//   7. Emit `handoff` ChatEvent so the chat panel can drop a boundary
+//      card on the codex→claude divide.
+export async function handoffFromCodex(
+  sessionId: string,
+  opts: {
+    // Target claude model id (e.g. "claude-opus-4-7[1m]"). Required so
+    // the resumed claude session knows what to spawn against.
+    model: string;
+    // Target provider — defaults to "anthropic". "openrouter" routes
+    // through the saved OR config (ANTHROPIC_BASE_URL/AUTH_TOKEN env)
+    // exactly like a regular OR session.
+    provider?: SessionProvider;
+  },
+): Promise<HandoffRecord> {
+  const s = getOrResume(sessionId);
+  if (!s) throw new Error("session not found");
+  if (s.status === "closed" || s.status === "errored") {
+    throw new Error(`session is ${s.status}`);
+  }
+  if (s.provider !== "codex") {
+    throw new Error("session is not routed through codex");
+  }
+  if (s.handoffInFlight) {
+    throw new Error("handoff already in flight");
+  }
+  if (!opts.model || typeof opts.model !== "string") {
+    throw new Error("target claude model is required");
+  }
+  const targetProvider: SessionProvider = opts.provider ?? "anthropic";
+  if (targetProvider === "codex") {
+    throw new Error("reverse handoff target must be anthropic or openrouter");
+  }
+
+  s.handoffInFlight = true;
+
+  const summaryPromise = waitForNextResult(s);
+  sendMessage(sessionId, REVERSE_HANDOFF_PROMPT);
+
+  let summaryText: string;
+  try {
+    summaryText = await summaryPromise;
+  } finally {
+    s.handoffInFlight = false;
+  }
+
+  const tagMatch = summaryText.match(
+    /<handoff-summary>([\s\S]*?)<\/handoff-summary>/i,
+  );
+  const summary = (tagMatch ? tagMatch[1] : summaryText).trim();
+
+  // Carry forward the source codex slot's identity (config dir / account
+  // / model / thread id) so the boundary card can show "left codex
+  // (acct/model)" and so a future forward handoff back to codex could
+  // reuse the same thread. The destination claude model lives on
+  // session.model post-flip.
+  const priorForward = [...(s.handoffs ?? [])]
+    .reverse()
+    .find((h) => h.to_provider === "codex");
+  const handoff: HandoffRecord = {
+    at_message_index: Math.max(s.history.length - 1, 0),
+    from_provider: "codex",
+    to_provider: targetProvider,
+    summary,
+    at: new Date().toISOString(),
+    codex_config_dir: priorForward?.codex_config_dir,
+    codex_account_name: priorForward?.codex_account_name,
+    codex_model: s.model ?? priorForward?.codex_model,
+    codex_thread_id: priorForward?.codex_thread_id,
+  };
+  s.handoffs = [...(s.handoffs ?? []), handoff];
+  s.provider = targetProvider;
+  s.model = opts.model;
+  schedulePersist(s.id);
+
+  respawnQuery(s);
+  emit(s, { type: "handoff", data: handoff });
+  return handoff;
+}
+
+// listAvailableCodexSlots is the read API the UI hits when opening the
+// "Hand off to Codex" picker. Returns the authenticated codex
+// directories on disk with display labels + the per-account model
+// catalog when present. Empty list → UI surfaces "no codex accounts
+// authenticated; run `codex login` first".
+export async function listAvailableCodexSlots(): Promise<
+  Array<{
+    config_dir: string;
+    name: string;
+    email?: string;
+    plan_type?: string;
+    models?: Array<{
+      slug: string;
+      display_name: string;
+      description?: string;
+      default_reasoning_level?: string;
+      supported_reasoning_levels?: string[];
+    }>;
+  }>
+> {
+  return listCodexConfigDirs();
 }
 
 // listFileSnapshots is the public read API for /rewind. Returns the
