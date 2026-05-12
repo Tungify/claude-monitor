@@ -192,19 +192,23 @@
 .code-syntax {
   --syntax-keyword: #0369a1;
   --syntax-string: #b45309;
-  --syntax-number: #6d28d9;
+  --syntax-number: #047857; /* emerald-700 — VSCode-ish "numeric = green" */
+  --syntax-literal: #be123c; /* rose-700 — split from number so true/false/null pop */
   --syntax-comment: var(--muted-foreground);
-  --syntax-function: #4338ca;
-  --syntax-attr: #0f766e;
+  --syntax-function: #6d28d9; /* violet-700 */
+  --syntax-attr: #4338ca; /* indigo-700 — keys are the prominent JSON anchor */
   --syntax-tag: #0e7490;
+  --syntax-punct: #64748b; /* slate-500 — visible but doesn't fight the tokens */
 }
 .dark .code-syntax {
   --syntax-keyword: #7dd3fc;
   --syntax-string: #fcd34d;
-  --syntax-number: #c4b5fd;
-  --syntax-function: #a5b4fc;
-  --syntax-attr: #5eead4;
+  --syntax-number: #6ee7b7; /* emerald-300 */
+  --syntax-literal: #fda4af; /* rose-300 */
+  --syntax-function: #c4b5fd; /* violet-300 */
+  --syntax-attr: #a5b4fc; /* indigo-300 */
   --syntax-tag: #67e8f9;
+  --syntax-punct: #94a3b8; /* slate-400 */
 }
 .code-syntax .hljs-keyword,
 .code-syntax .hljs-built_in,
@@ -221,9 +225,20 @@
 .code-syntax .hljs-link {
   color: var(--syntax-string);
 }
-.code-syntax .hljs-number,
-.code-syntax .hljs-literal {
+.code-syntax .hljs-number {
   color: var(--syntax-number);
+}
+.code-syntax .hljs-literal {
+  color: var(--syntax-literal);
+  font-style: italic;
+}
+/* Punctuation isn't a hljs-emitted class — the JSON highlighter
+   post-processes brackets/braces/commas/colons to wrap them in this
+   class. Without this rule those characters render in foreground
+   colour, which makes a JSON dump look like a wall of black/white
+   text with a few coloured tokens. */
+.code-syntax .hljs-punctuation {
+  color: var(--syntax-punct);
 }
 .code-syntax .hljs-comment,
 .code-syntax .hljs-quote {
