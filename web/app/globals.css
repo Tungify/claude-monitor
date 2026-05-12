@@ -182,6 +182,87 @@
 }
 /* highlight.js theme is loaded inside the component import; we just keep
    the pre/code base unchanged so token colors win against any reset. */
+
+/* Code syntax highlighting scope shared by the diff viewer and the
+   SQL playground. The Markdown code block forces a dark wrapper so
+   github-dark.css reads, but these surfaces render on the page
+   background where github-dark's pale strings/numbers/builtins
+   vanish. Rules are scoped to `.code-syntax` so they don't leak into
+   Markdown code blocks (which keep github-dark). */
+.code-syntax {
+  --syntax-keyword: #0369a1;
+  --syntax-string: #b45309;
+  --syntax-number: #6d28d9;
+  --syntax-comment: var(--muted-foreground);
+  --syntax-function: #4338ca;
+  --syntax-attr: #0f766e;
+  --syntax-tag: #0e7490;
+}
+.dark .code-syntax {
+  --syntax-keyword: #7dd3fc;
+  --syntax-string: #fcd34d;
+  --syntax-number: #c4b5fd;
+  --syntax-function: #a5b4fc;
+  --syntax-attr: #5eead4;
+  --syntax-tag: #67e8f9;
+}
+.code-syntax .hljs-keyword,
+.code-syntax .hljs-built_in,
+.code-syntax .hljs-builtin-name,
+.code-syntax .hljs-type,
+.code-syntax .hljs-selector-tag,
+.code-syntax .hljs-doctag {
+  color: var(--syntax-keyword);
+}
+.code-syntax .hljs-string,
+.code-syntax .hljs-template-string,
+.code-syntax .hljs-meta-string,
+.code-syntax .hljs-regexp,
+.code-syntax .hljs-link {
+  color: var(--syntax-string);
+}
+.code-syntax .hljs-number,
+.code-syntax .hljs-literal {
+  color: var(--syntax-number);
+}
+.code-syntax .hljs-comment,
+.code-syntax .hljs-quote {
+  color: var(--syntax-comment);
+  font-style: italic;
+}
+.code-syntax .hljs-title,
+.code-syntax .hljs-title.function_,
+.code-syntax .hljs-title.class_,
+.code-syntax .hljs-section {
+  color: var(--syntax-function);
+  font-weight: 600;
+}
+.code-syntax .hljs-attr,
+.code-syntax .hljs-attribute,
+.code-syntax .hljs-property,
+.code-syntax .hljs-params {
+  color: var(--syntax-attr);
+}
+.code-syntax .hljs-tag,
+.code-syntax .hljs-name,
+.code-syntax .hljs-symbol,
+.code-syntax .hljs-template-tag,
+.code-syntax .hljs-template-variable,
+.code-syntax .hljs-variable.language_ {
+  color: var(--syntax-tag);
+}
+.code-syntax .hljs-meta,
+.code-syntax .hljs-meta .hljs-keyword {
+  color: var(--syntax-comment);
+}
+/* hljs's diff plugin (and a few others) emit addition/deletion
+   tokens with their own background. Our row tint already conveys
+   that signal, so neutralise here to avoid double-painting. */
+.code-syntax .hljs-addition,
+.code-syntax .hljs-deletion {
+  color: inherit;
+  background: transparent;
+}
 /* Thinking-indicator dot animation. Three dots offset their delays to
    chase one another across the row; the keyframe pulses opacity + scale
    so the row looks alive without bouncing the surrounding layout. */

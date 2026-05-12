@@ -9,7 +9,7 @@ import {
   type DragEvent,
   type KeyboardEvent,
 } from "react";
-import { ArrowUp, GitBranch, Mic, Paperclip, Square } from "lucide-react";
+import { ArrowUp, Mic, Paperclip, Square } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import type {
@@ -27,13 +27,13 @@ import {
 } from "@/lib/slash-commands";
 import { fileToAttachment } from "./attachments";
 import { AttachmentChip } from "./attachment-chip";
+import { BranchChip } from "./branch-chip";
 import { ContextMeter } from "./context-meter";
 import { FolderPicker } from "./folder-picker";
 import { ModelEffortPicker } from "./model-effort-picker";
 import { ModePicker, type PermissionMode } from "./mode-picker";
 import { ModeBanner } from "./mode-banner";
 import { MultiPhaseToggle, hintForMultiPhase } from "./intent-picker";
-import { useGitBranch } from "@/hooks/use-git-branch";
 import { SlashCommandMenu } from "./slash-command-menu";
 
 export interface ComposerSubmit {
@@ -404,7 +404,6 @@ export function Composer(props: Props) {
 
   const model = modelById(props.model);
   const contextWindow = model?.contextWindow ?? 200_000;
-  const branchInfo = useGitBranch(props.cwd);
 
   return (
     <div
@@ -439,14 +438,14 @@ export function Composer(props: Props) {
               onChange={props.onCwdChange}
               recents={props.recentCwds}
             />
-            <BranchChip info={branchInfo} />
+            <BranchChip cwd={props.cwd} />
           </>
         ) : (
           <>
             <span className="inline-flex items-center gap-1.5 rounded-md border border-dashed px-2 py-1 font-mono text-[11px] text-muted-foreground">
               {shorten(props.cwd)}
             </span>
-            <BranchChip info={branchInfo} />
+            <BranchChip cwd={props.cwd} />
           </>
         )}
       </div>
@@ -607,29 +606,6 @@ export function Composer(props: Props) {
         </div>
       )}
     </div>
-  );
-}
-
-// BranchChip renders next to the folder label so the user can tell at
-// a glance which branch their working folder is on. Hides itself when
-// the path isn't a git repo (BranchInfo carries branch=null), so
-// non-git folders don't get a sad "—" chip.
-function BranchChip({
-  info,
-}: {
-  info: ReturnType<typeof useGitBranch>;
-}) {
-  if (info.loading) return null;
-  if (!info.branch && !info.detached) return null;
-  const text = info.branch ?? `det@${info.detached}`;
-  return (
-    <span
-      title={info.branch ?? `Detached HEAD at ${info.detached}`}
-      className="inline-flex items-center gap-1 rounded-md border border-dashed px-2 py-1 font-mono text-[11px] text-muted-foreground"
-    >
-      <GitBranch className="size-3 shrink-0 opacity-70" aria-hidden />
-      <span className="max-w-[160px] truncate">{text}</span>
-    </span>
   );
 }
 

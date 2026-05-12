@@ -15,6 +15,7 @@ import {
   RotateCcw,
   Table2,
 } from "lucide-react";
+import hljs from "highlight.js/lib/common";
 import { cn } from "@/lib/utils";
 
 // SqlExecutionCard renders one SQL execution as a compact playground
@@ -299,29 +300,12 @@ export function SqlExecutionCard({
         </span>
       </div>
 
-      <div className="max-h-56 overflow-auto bg-muted/10">
-        <div className="flex font-mono text-xs leading-5">
-          <div
-            aria-hidden
-            className="sticky left-0 z-10 select-none border-r bg-muted/30 py-2 pr-2 pl-3 text-right text-muted-foreground/60"
-          >
-            {lines.map((_, i) => (
-              <div key={i}>{i + 1}</div>
-            ))}
-          </div>
-          <textarea
-            value={sqlText}
-            onChange={(e) => setSqlText(e.target.value)}
-            onKeyDown={onEditorKeyDown}
-            rows={Math.max(lines.length, 1)}
-            wrap="off"
-            spellCheck={false}
-            autoCorrect="off"
-            autoCapitalize="off"
-            className="block flex-1 resize-none border-0 bg-transparent px-3 py-2 font-mono text-xs leading-5 outline-none focus:bg-background/40"
-          />
-        </div>
-      </div>
+      <SqlEditor
+        value={sqlText}
+        onChange={setSqlText}
+        onKeyDown={onEditorKeyDown}
+        lines={lines}
+      />
 
         <ResultPane
           run={run}
@@ -332,6 +316,100 @@ export function SqlExecutionCard({
       </div>
     </>
   );
+}
+
+// SqlEditor overlays a transparent <textarea> on top of a highlighted
+// <pre>: the user types into the form control, but reads the
+// highlight layer underneath. Typography on the two elements must
+// match character-for-character — same font, padding, line-height,
+// whitespace handling — or glyphs drift away from their highlighted
+// background. The pre defines the box's intrinsic size; the textarea
+// inset-0 fills it, so a long line grows both layers in lockstep
+// and the outer overflow-auto handles horizontal scroll.
+function SqlEditor({
+  value,
+  onChange,
+  onKeyDown,
+  lines,
+}: {
+  value: string;
+  onChange: (v: string) => void;
+  onKeyDown: (e: React.KeyboardEvent<HTMLTextAreaElement>) => void;
+  lines: string[];
+}) {
+  const highlighted = useMemo(() => {
+    try {
+      const html = hljs.highlight(value, {
+        language: "sql",
+        ignoreIllegals: true,
+      }).value;
+      // Trailing newline guarantees the pre keeps a final empty
+      // line so the caret has somewhere to sit when the user lands
+      // at end-of-document and starts typing.
+      return html + (html.endsWith("\n") ? "\n" : "\n");
+    } catch {
+      return escapeHtml(value) + "\n";
+    }
+  }, [value]);
+
+  return (
+    <div className="code-syntax max-h-56 overflow-auto bg-muted/10">
+      <div className="flex font-mono text-xs leading-5">
+        <div
+          aria-hidden
+          className="sticky left-0 z-10 select-none border-r bg-muted/30 py-2 pr-2 pl-3 text-right text-muted-foreground/60"
+        >
+          {lines.map((_, i) => (
+            <div key={i}>{i + 1}</div>
+          ))}
+        </div>
+        <div className="relative">
+          <pre
+            aria-hidden
+            className="m-0 whitespace-pre px-3 py-2 font-mono text-xs leading-5"
+            dangerouslySetInnerHTML={{ __html: highlighted }}
+          />
+          <textarea
+            value={value}
+            onChange={(e) => onChange(e.target.value)}
+            onKeyDown={onKeyDown}
+            wrap="off"
+            spellCheck={false}
+            autoCorrect="off"
+            autoCapitalize="off"
+            className="absolute inset-0 block w-full resize-none whitespace-pre border-0 bg-transparent px-3 py-2 font-mono text-xs leading-5 text-transparent caret-foreground outline-none selection:bg-primary/30 selection:text-foreground focus:bg-background/40"
+          />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function escapeHtml(s: string): string {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+// jsonHighlight returns HTML safe to drop into `dangerouslySetInnerHTML`.
+// hljs always HTML-escapes its input, so the highlighted branch is
+// safe; the fallback path escapes manually because raw user text is
+// not safe by default. Only treats {…}/[…] input as JSON so plain
+// status strings like "ok" don't get mis-tokenised.
+function jsonHighlight(text: string): { __html: string } {
+  if (!text) return { __html: "" };
+  const trimmed = text.trim();
+  if (!trimmed.startsWith("{") && !trimmed.startsWith("[")) {
+    return { __html: escapeHtml(text) };
+  }
+  try {
+    return {
+      __html: hljs.highlight(text, {
+        language: "json",
+        ignoreIllegals: true,
+      }).value,
+    };
+  } catch {
+    return { __html: escapeHtml(text) };
+  }
 }
 
 function CopyButton({ text }: { text: string }) {
@@ -529,12 +607,11 @@ function ResultBody({
       {!open ? null : view === "raw" || !parsed ? (
         <pre
           className={cn(
-            "overflow-auto px-3 py-2 font-mono text-[11px] whitespace-pre-wrap break-all",
+            "code-syntax overflow-auto px-3 py-2 font-mono text-[11px] whitespace-pre-wrap break-all",
             fullscreen ? "min-h-0 flex-1" : "max-h-96",
           )}
-        >
-          {text}
-        </pre>
+          dangerouslySetInnerHTML={jsonHighlight(text)}
+        />
       ) : parsed.rows.length === 0 ? (
         <div className="px-3 py-2 text-xs text-muted-foreground">(0 rows)</div>
       ) : (
@@ -898,9 +975,12 @@ function RowItem({
             colSpan={columns.length + 1}
             className="border-b bg-muted/20 px-3 py-2"
           >
-            <pre className="max-h-72 overflow-auto whitespace-pre-wrap font-mono text-[11px]">
-              {JSON.stringify(rowToObject(columns, row), null, 2)}
-            </pre>
+            <pre
+              className="code-syntax max-h-72 overflow-auto whitespace-pre-wrap font-mono text-[11px]"
+              dangerouslySetInnerHTML={jsonHighlight(
+                JSON.stringify(rowToObject(columns, row), null, 2),
+              )}
+            />
           </td>
         </tr>
       )}
