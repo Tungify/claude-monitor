@@ -10,6 +10,7 @@ import type {
   PermissionDecision,
   PermissionRequest,
   SessionStatus,
+  SessionUsage,
   StreamingBlock,
   SubagentSummary,
 } from "@/lib/chat-types";
@@ -30,6 +31,14 @@ interface State {
   // when the full `assistant` SDKMessage arrives (history takes over) or
   // a fresh turn begins. Indexed by Anthropic's content_block_index.
   streamingBlocks: StreamingBlock[];
+  // Running usage for the in-flight API call, captured from Anthropic's
+  // message_start (initial input + cache fields) and message_delta
+  // (output_tokens ticks up as text streams). Cleared when the full
+  // assistant SDKMessage lands so latestUsage(history) takes over for
+  // the gap between tool round-trips. Powers the realtime "↑/↓ tokens"
+  // chip under the thinking indicator — without this it only refreshes
+  // once per assistant message, looking frozen during a long generation.
+  streamingUsage: SessionUsage | null;
   // Authoritative context-window breakdown from the SDK's
   // get_context_usage control request. Server pushes a fresh one
   // after every `result` (end-of-turn). Drives the meter directly so
@@ -77,6 +86,13 @@ const ERROR_CAP = 10;
 // Anthropic streaming-event envelope as forwarded by the SDK's
 // SDKPartialAssistantMessage. Only the fields we actually read are typed;
 // the SDK validates the rest upstream.
+interface StreamUsage {
+  input_tokens?: number;
+  output_tokens?: number;
+  cache_read_input_tokens?: number;
+  cache_creation_input_tokens?: number;
+}
+
 interface StreamEnvelope {
   event?: {
     type: string;
@@ -93,6 +109,30 @@ interface StreamEnvelope {
       thinking?: string;
       partial_json?: string;
     };
+    // message_start carries the initial usage for the API call here.
+    // input_tokens / cache_* land at this point; output_tokens starts
+    // at a small seed (the SDK reports the model's first token).
+    message?: {
+      usage?: StreamUsage;
+    };
+    // message_delta carries the running output_tokens (cumulative,
+    // not a per-chunk delta — Anthropic's wire format ships the
+    // monotonically-growing total on every message_delta event).
+    usage?: StreamUsage;
+  };
+}
+
+function mergeStreamUsage(
+  base: SessionUsage | null,
+  u: StreamUsage,
+): SessionUsage {
+  return {
+    input_tokens: u.input_tokens ?? base?.input_tokens ?? 0,
+    output_tokens: u.output_tokens ?? base?.output_tokens ?? 0,
+    cache_read_input_tokens:
+      u.cache_read_input_tokens ?? base?.cache_read_input_tokens ?? 0,
+    cache_creation_input_tokens:
+      u.cache_creation_input_tokens ?? base?.cache_creation_input_tokens ?? 0,
   };
 }
 
@@ -119,9 +159,36 @@ function patchBlock(
 function reduceStreamEvent(state: State, msg: SDKMessage): State {
   const ev = (msg as unknown as StreamEnvelope).event;
   if (!ev) return state;
-  // message_start opens a fresh turn — drop any leftover preview blocks.
+  // Subagent (Task) stream events live in their own context window —
+  // their usage figures don't belong on the parent turn's chip and
+  // would corrupt the running totals if folded in. The full assistant
+  // message reducer already filters subagents out of latestUsage; do
+  // the same here so streaming preview stays consistent.
+  const isSubagent =
+    (msg as { parent_tool_use_id?: string | null }).parent_tool_use_id != null;
+  // message_start opens a fresh turn — drop any leftover preview blocks
+  // and seed streamingUsage from the API's initial usage envelope so the
+  // ↑ tokens chip jumps to the real number immediately (output_tokens
+  // will tick up via subsequent message_delta events).
   if (ev.type === "message_start") {
-    return { ...state, streamingBlocks: [] };
+    if (isSubagent) return state;
+    const u = ev.message?.usage;
+    return {
+      ...state,
+      streamingBlocks: [],
+      streamingUsage: u ? mergeStreamUsage(null, u) : null,
+    };
+  }
+  // message_delta updates running output_tokens (and occasionally
+  // adjusts other usage fields). Merge into the existing streamingUsage
+  // so the ↓ tokens counter ticks live without waiting for the full
+  // assistant message to land.
+  if (ev.type === "message_delta" && ev.usage) {
+    if (isSubagent) return state;
+    return {
+      ...state,
+      streamingUsage: mergeStreamUsage(state.streamingUsage, ev.usage),
+    };
   }
   if (ev.type === "content_block_start" && typeof ev.index === "number" && ev.content_block) {
     const cb = ev.content_block;
@@ -194,12 +261,16 @@ function reducer(state: State, action: Action): State {
         return reduceStreamEvent(state, action.msg);
       }
       // Full assistant reply arrived — drop streaming preview so the real
-      // bubble (rendered from history) takes over without overlap.
+      // bubble (rendered from history) takes over without overlap. Also
+      // clear streamingUsage; latestUsage(history) now reads the same
+      // numbers off the just-landed assistant message, and a fresh
+      // message_start will reseed for the next API call in the turn.
       if (action.msg.type === "assistant") {
         return {
           ...state,
           history: [...state.history, action.msg],
           streamingBlocks: [],
+          streamingUsage: null,
         };
       }
       return { ...state, history: [...state.history, action.msg] };
@@ -249,7 +320,7 @@ function reducer(state: State, action: Action): State {
       return { ...state, handoffs: [...state.handoffs, action.record] };
     }
     case "turn_interrupted":
-      return { ...state, streamingBlocks: [] };
+      return { ...state, streamingBlocks: [], streamingUsage: null };
     case "hydrated":
       // Idempotent — repeated history_replayed events (shouldn't
       // happen, but guards reconnects) keep state stable.
@@ -272,6 +343,7 @@ const initial: State = {
   errors: [],
   connection: "connecting",
   streamingBlocks: [],
+  streamingUsage: null,
   contextUsage: null,
   hydrated: false,
   handoffs: [],

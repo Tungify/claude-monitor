@@ -847,12 +847,18 @@ export function ChatPanel({ session }: Props) {
   // New prompt content for this turn (raw input + cache writes).
   // Mirrors the turnEndMeta math above — cache reads stay out so the
   // live counter doesn't claim a small user message cost 26k tokens
-  // just because the system prompt is cached behind it.
-  const liveInputTokens: number | undefined = liveUsage
-    ? liveUsage.input_tokens +
-      (liveUsage.cache_creation_input_tokens ?? 0)
+  // just because the system prompt is cached behind it. Prefer
+  // chat.streamingUsage while a turn is mid-stream: it carries the
+  // running output_tokens from Anthropic's message_delta events, so
+  // the ↓ chip ticks up in real time instead of only refreshing once
+  // per completed assistant message (which can be many seconds apart
+  // on a tool-heavy turn).
+  const liveTurnUsage = chat.streamingUsage ?? liveUsage;
+  const liveInputTokens: number | undefined = liveTurnUsage
+    ? liveTurnUsage.input_tokens +
+      (liveTurnUsage.cache_creation_input_tokens ?? 0)
     : undefined;
-  const liveOutputTokens: number | undefined = liveUsage?.output_tokens;
+  const liveOutputTokens: number | undefined = liveTurnUsage?.output_tokens;
 
   return (
     <SubagentProvider

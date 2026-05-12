@@ -1755,16 +1755,22 @@ export function sendMessage(
   // The SDK consumes user messages from the input queue but does NOT
   // echo them back through the Query iterator (verified empirically),
   // so we synthesize a history entry here. uuid + emit make the wire
-  // shape indistinguishable from an SDK-emitted message.
+  // shape indistinguishable from an SDK-emitted message. We also stamp
+  // the message with an ISO `timestamp` (extra field the SDK ignores
+  // and the API doesn't see — it just rides in our persisted snapshot)
+  // so the client's "turn started Xs ago" chip survives a page reload:
+  // without this, seenStarts falls back to Date.now() on rebuild and
+  // the elapsed counter resets to 0 every refresh.
   const uuid = randomUUID();
   const content = buildUserContent(text, attachments);
-  const msg: SDKUserMessage = {
+  const msg = {
     type: "user",
     uuid,
     session_id: sessionId,
     message: { role: "user", content },
     parent_tool_use_id: null,
-  };
+    timestamp: new Date().toISOString(),
+  } as SDKUserMessage;
   s.inputQueue.push(msg);
   if (s.history.length >= HISTORY_CAP) s.history.shift();
   s.history.push(msg);
@@ -1799,13 +1805,27 @@ export function editQueuedMessage(
   // the boundary. The runtime check above (idx >= 0) confirms the
   // uuid actually identifies a real message, so the value is well-
   // formed in practice.
-  const next: SDKUserMessage = {
+  // Preserve the original message's timestamp when editing — editing a
+  // queued draft shouldn't reset the "turn started Xs ago" wall-clock.
+  // The history snapshot has the previous version under the same uuid;
+  // pull the timestamp off it. Falls back to now() for messages that
+  // predate the timestamp field.
+  let prevTs: string | undefined;
+  for (let i = s.history.length - 1; i >= 0; i--) {
+    const m = s.history[i];
+    if ((m as { uuid?: string }).uuid === uuid) {
+      prevTs = (m as unknown as { timestamp?: string }).timestamp;
+      break;
+    }
+  }
+  const next = {
     type: "user",
     uuid: uuid as SDKUserMessage["uuid"],
     session_id: sessionId,
     message: { role: "user", content: buildUserContent(text, attachments) },
     parent_tool_use_id: null,
-  };
+    timestamp: prevTs ?? new Date().toISOString(),
+  } as SDKUserMessage;
   s.inputQueue.replaceAt(idx, next);
   // Mirror the change in history. Walk from the end since queued
   // messages are always near the tail; cheaper than scanning the full
