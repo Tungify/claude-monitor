@@ -60,6 +60,13 @@ type Connection struct {
 	Name   string `json:"name"`
 	Driver Driver `json:"driver"`
 
+	// Disabled lets the user park a connection without deleting it
+	// — keeps the URI/password on disk for re-enable while stripping
+	// the stanza from every account's .claude.json and skipping it
+	// in SDK-spawned sessions. omitempty so legacy records load as
+	// enabled by default.
+	Disabled bool `json:"disabled,omitempty"`
+
 	// Postgres
 	URI string `json:"uri,omitempty"`
 
@@ -538,9 +545,14 @@ func ApplyAllToAccounts(rootSpec string, previousNames []string) error {
 			errs = append(errs, err)
 		}
 	}
-	// Add/refresh current.
+	// Add/refresh current. Disabled = strip from every account; the
+	// record stays on disk so re-enable doesn't require re-entering
+	// the password / URI.
 	for _, c := range all {
-		stanza := c.Stanza()
+		var stanza map[string]any
+		if !c.Disabled {
+			stanza = c.Stanza()
+		}
 		if err := store.ApplyStanzaToAllAccounts(rootSpec, c.Name, stanza); err != nil {
 			errs = append(errs, err)
 		}
@@ -651,6 +663,36 @@ func DeleteAndApply(rootSpec, id string) (removed Connection, ok bool, applyErr 
 		return c, true, applyLocked(rootSpec, namesOf(prev)), nil
 	}
 	return Connection{}, false, nil, nil
+}
+
+// ToggleAndApply flips the Disabled flag on the connection with the
+// given id and re-applies the full set to every managed account.
+// Same lock + non-fatal applyErr semantics as the other *AndApply
+// helpers.
+func ToggleAndApply(rootSpec, id string) (saved Connection, applyErr error, mutateErr error) {
+	mu.Lock()
+	defer mu.Unlock()
+	prev, err := loadAllLocked()
+	if err != nil {
+		return Connection{}, nil, err
+	}
+	idx := -1
+	for i, existing := range prev {
+		if existing.ID == id {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		return Connection{}, nil, fmt.Errorf("connection %q not found", id)
+	}
+	next := make([]Connection, len(prev))
+	copy(next, prev)
+	next[idx].Disabled = !next[idx].Disabled
+	if err := store.Write(driverKey, envelope{Connections: next}); err != nil {
+		return Connection{}, nil, fmt.Errorf("write connections: %w", err)
+	}
+	return next[idx], applyLocked(rootSpec, namesOf(prev)), nil
 }
 
 // loadAllLocked is the mutex-naive read used by *AndApply helpers

@@ -42,6 +42,7 @@ import {
   RUN_INTEGRATION_REVIEW_FQN,
 } from "./leader-mcp";
 import { getDbMcpEntries } from "./postgres-mcp";
+import { getIntegrationsMcpEntries, hasEnabledService } from "./integrations-mcp";
 import { MCP_DB_TOOL_RE } from "@/lib/mcp-db-tools";
 import {
   deleteStoredSession,
@@ -405,6 +406,24 @@ When you call \`mcp__<conn>__execute_sql\` (postgres) or \`mcp__<conn>__run_quer
 Applies ONLY to the immediate reply following a query tool call. Markdown tables for analytical summaries, plan breakdowns, comparison matrices, schema overviews, etc. are unaffected.
 
 If you find yourself about to write \`| col1 | col2 |\` directly after a SQL tool result — stop, delete it, and write prose instead.`;
+
+// CLICKUP_LINK_APPEND is injected only when the session has at least
+// one enabled ClickUp integration. The MCP tool results from ClickUp
+// always include a per-task \`url\` field (e.g.
+// "https://app.clickup.com/t/<id>"); the chat UI auto-links http(s)
+// URLs in the rendered text. Without this rule the model often
+// summarises tasks as "Task abc123 — Title" with no URL, which leaves
+// the id inert. With the rule the user can click straight through to
+// the task in ClickUp.
+const CLICKUP_LINK_APPEND = `## OUTPUT RULE: ClickUp task links
+
+When you summarise ClickUp tasks returned by \`mcp__<name>__get_task\` / \`list_tasks\` / similar, you MUST include each task's \`url\` field next to its id or wrap the task title as a markdown link to that url. The chat UI auto-links http(s) URLs, so the id becomes clickable — without the url the user can't open the task.
+
+✅ Good: \`- [Bug in login](https://app.clickup.com/t/abc123) — assigned to Alice\`
+✅ Good: \`Task abc123 (https://app.clickup.com/t/abc123) is blocked on review.\`
+❌ Bad:  \`Task abc123 — Bug in login\` (id is dead text)
+
+Applies whenever you mention a ClickUp task by id in chat. Cross-task analytical summaries that don't reference specific tasks are unaffected.`;
 
 // schedulePersist coalesces rapid changes (token deltas + history pushes
 // + status flips during a single turn) into one write. The first
@@ -1171,6 +1190,7 @@ function attachSDKQuery(session: ChatSession, isResume: boolean): void {
   // (e.g. a connection added mid-construction would appear in one
   // place but not the other).
   const dbMcpEntries = getDbMcpEntries();
+  const integrationsMcpEntries = getIntegrationsMcpEntries();
 
   session.query = query({
     prompt: session.inputQueue,
@@ -1200,6 +1220,9 @@ function attachSDKQuery(session: ChatSession, isResume: boolean): void {
         // longer narrative blocks below.
         if (Object.keys(dbMcpEntries).length > 0) {
           parts.push(DB_MCP_PRESENTATION_APPEND);
+        }
+        if (hasEnabledService("clickup")) {
+          parts.push(CLICKUP_LINK_APPEND);
         }
         if (!session.phaseSlug) parts.push(OWNER_TRIAGE_APPEND);
         const postHandoff = computePostHandoffPreamble(session);
@@ -1239,6 +1262,13 @@ function attachSDKQuery(session: ChatSession, isResume: boolean): void {
         // their presence reflects the same view. The helper returns {}
         // when no driver is configured or uvx is missing on this host.
         ...dbMcpEntries,
+        // Per-service integrations (Slack, …). Spread AFTER
+        // dbMcpEntries — if a user happens to name an integration
+        // the same as a DB connection, the integration wins. The
+        // two registries are independent in mcp.json (different
+        // top-level keys), so this is the only place collisions
+        // resolve.
+        ...integrationsMcpEntries,
       },
       abortController: session.abortController,
       // Resume vs fresh: `resume` loads the session's transcript via

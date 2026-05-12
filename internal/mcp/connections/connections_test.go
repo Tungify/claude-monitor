@@ -246,6 +246,39 @@ func TestCreate_DuplicateName(t *testing.T) {
 	}
 }
 
+func TestToggle_FlipsDisabledFlag(t *testing.T) {
+	setupHome(t)
+	saved, applyErr, mErr := CreateAndApply("", Connection{
+		Name:   "p",
+		Driver: DriverPostgres,
+		URI:    "postgres://u:p@h:5432/db",
+	})
+	if mErr != nil {
+		t.Fatalf("create: %v", mErr)
+	}
+	_ = applyErr
+	if saved.Disabled {
+		t.Fatalf("new connection should not start disabled")
+	}
+	flipped, _, mErr := ToggleAndApply("", saved.ID)
+	if mErr != nil {
+		t.Fatalf("toggle: %v", mErr)
+	}
+	if !flipped.Disabled {
+		t.Fatalf("expected disabled=true after first toggle")
+	}
+	if flipped.URI != "postgres://u:p@h:5432/db" {
+		t.Fatalf("toggle clobbered secret URI: %q", flipped.URI)
+	}
+	flippedBack, _, mErr := ToggleAndApply("", saved.ID)
+	if mErr != nil {
+		t.Fatalf("toggle back: %v", mErr)
+	}
+	if flippedBack.Disabled {
+		t.Fatalf("expected disabled=false after second toggle")
+	}
+}
+
 func TestLoadAllMissingFile(t *testing.T) {
 	setupHome(t)
 	all, err := LoadAll()

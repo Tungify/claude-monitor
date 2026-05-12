@@ -9,6 +9,7 @@ import {
   Loader2,
   Pencil,
   Plus,
+  Power,
   Trash2,
   XCircle,
 } from "lucide-react";
@@ -39,6 +40,9 @@ interface Connection {
   id: string;
   name: string;
   driver: Driver;
+  // disabled = parked; daemon strips its stanza from every account
+  // so the LLM doesn't see the tool surface.
+  disabled?: boolean;
   // Postgres
   uri?: string; // redacted on the wire
   // ClickHouse + Redis
@@ -197,12 +201,12 @@ function ConnectionRow({
   onDone: () => void;
   onError: (msg: string) => void;
 }) {
-  const [busy, setBusy] = useState(false);
+  const [busy, setBusy] = useState<"toggle" | "delete" | null>(null);
   const summary = summarise(conn);
 
   const remove = async () => {
     if (!confirm(`Delete connection "${conn.name}"?`)) return;
-    setBusy(true);
+    setBusy("delete");
     try {
       const res = await fetch(
         `/daemon/api/mcp/connections/${encodeURIComponent(conn.id)}`,
@@ -219,22 +223,76 @@ function ConnectionRow({
     } catch (err) {
       onError((err as Error).message);
     } finally {
-      setBusy(false);
+      setBusy(null);
     }
   };
 
+  const toggle = async () => {
+    setBusy("toggle");
+    try {
+      const res = await fetch(
+        `/daemon/api/mcp/connections/${encodeURIComponent(conn.id)}/toggle`,
+        { method: "POST" },
+      );
+      if (!res.ok) {
+        const body = (await res.json().catch(() => ({}))) as { error?: string };
+        onError(body.error ?? `HTTP ${res.status}`);
+        return;
+      }
+      const body = (await res.json()) as { warning?: string };
+      if (body.warning) onError(`toggled with warning: ${body.warning}`);
+      onDone();
+    } catch (err) {
+      onError((err as Error).message);
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const disabled = conn.disabled ?? false;
+
   return (
-    <div className="rounded border bg-background px-2.5 py-2">
+    <div
+      className={cn(
+        "rounded border bg-background px-2.5 py-2",
+        disabled && "opacity-60",
+      )}
+    >
       <div className="flex items-center gap-2 text-sm">
         <DriverBadge driver={conn.driver} />
-        <span className="font-medium">{conn.name}</span>
+        <span
+          className={cn(
+            "font-medium",
+            disabled && "line-through decoration-muted-foreground/60",
+          )}
+        >
+          {conn.name}
+        </span>
         <span className="truncate font-mono text-xs text-muted-foreground">
-          {summary}
+          {disabled ? "disabled" : summary}
         </span>
         <button
           type="button"
+          onClick={toggle}
+          disabled={busy !== null}
+          title={disabled ? "Enable connection" : "Disable connection"}
+          className={cn(
+            "ml-auto inline-flex items-center gap-1 rounded-md border px-2 py-0.5 text-xs hover:bg-muted disabled:opacity-50",
+            disabled
+              ? "text-muted-foreground"
+              : "text-emerald-600 dark:text-emerald-400",
+          )}
+        >
+          {busy === "toggle" ? (
+            <Loader2 className="size-3 animate-spin" />
+          ) : (
+            <Power className="size-3" />
+          )}
+        </button>
+        <button
+          type="button"
           onClick={onToggleEdit}
-          className="ml-auto inline-flex items-center gap-1 rounded-md border px-2 py-0.5 text-xs hover:bg-muted"
+          className="inline-flex items-center gap-1 rounded-md border px-2 py-0.5 text-xs hover:bg-muted"
         >
           {editing ? (
             "Close"
@@ -247,10 +305,10 @@ function ConnectionRow({
         <button
           type="button"
           onClick={remove}
-          disabled={busy}
+          disabled={busy !== null}
           className="inline-flex items-center gap-1 rounded-md border px-2 py-0.5 text-xs text-destructive hover:bg-destructive/10 disabled:opacity-50"
         >
-          {busy ? (
+          {busy === "delete" ? (
             <Loader2 className="size-3 animate-spin" />
           ) : (
             <Trash2 className="size-3" />

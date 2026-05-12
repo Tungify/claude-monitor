@@ -24,6 +24,7 @@ import {
 } from "@/components/ui/dialog";
 import { cn } from "@/lib/utils";
 import { DbMcpSection } from "./db-mcp-section";
+import { IntegrationsSection } from "./integrations-section";
 
 // MCPServer mirrors the /cli-info?topic=mcp shape. We don't import from
 // the server-only module — the type is small enough to duplicate.
@@ -305,6 +306,12 @@ export function McpDialog({
             list because they're the most common reason a user opens
             this dialog from a query session. */}
         <DbMcpSection />
+
+        {/* Service integrations (Slack, …) sit below DB because most
+            sessions in this app are code/DB work — putting service
+            connectors above would push the more common surface below
+            the fold on small dialogs. */}
+        <IntegrationsSection />
 
         {/* Add-server toggle. Collapsed by default so the list isn't
             pushed below the fold on small dialogs. */}

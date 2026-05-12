@@ -108,6 +108,35 @@ func (s *Server) handleMcpConnectionsUpdate(w http.ResponseWriter, r *http.Reque
 	})
 }
 
+// handleMcpConnectionsToggle flips the connection's Disabled flag
+// and re-applies the full set. UI uses this to park a connection
+// (strip from all accounts) without losing the configured URI/pwd.
+func (s *Server) handleMcpConnectionsToggle(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "id is required"})
+		return
+	}
+	saved, applyErr, mutateErr := connections.ToggleAndApply(s.rootSpec, id)
+	if mutateErr != nil {
+		if strings.Contains(mutateErr.Error(), "not found") {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": mutateErr.Error()})
+			return
+		}
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": mutateErr.Error()})
+		return
+	}
+	var warning string
+	if applyErr != nil {
+		s.logger.Warn("connections toggle apply failed", "err", applyErr)
+		warning = applyErr.Error()
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"connection": saved.Redacted(),
+		"warning":    warning,
+	})
+}
+
 func (s *Server) handleMcpConnectionsDelete(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	if id == "" {

@@ -31,6 +31,9 @@ type ConnectionDisk = {
   id?: string;
   name?: string;
   driver?: "postgres" | "clickhouse" | "redis";
+  // Disabled = parked. Stripped from the spawn map but kept on
+  // disk so re-enable doesn't require re-entering secrets.
+  disabled?: boolean;
   // Postgres
   uri?: string;
   // ClickHouse + Redis (overlapping field set — both protocols carry
@@ -183,6 +186,11 @@ export function getDbMcpEntries(): Record<string, StdioStanza> {
   const out: Record<string, StdioStanza> = {};
   for (const c of conns) {
     if (!c.name) continue;
+    // Parked entry — see integrations-mcp.ts for the symmetric
+    // handling. Disabled connections still answer findConnectionByName
+    // lookups (so the chat re-run / SQL playground UIs can show an
+    // informative error) but never spawn into a live session.
+    if (c.disabled) continue;
     const stanza = stanzaFor(c);
     if (stanza) out[c.name] = stanza;
   }
