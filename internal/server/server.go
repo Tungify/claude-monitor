@@ -156,6 +156,21 @@ func (s *Server) Routes() *http.ServeMux {
 	// stays inside the daemon; only the parsed server names/URLs cross
 	// to the orchestrator UI.
 	mux.HandleFunc("GET /api/account/mcp-servers", s.handleAccountMcpServers)
+	// DB MCP connection registry. Each entry is a named, driver-typed
+	// (postgres / clickhouse) connection persisted in chmod 0600
+	// ~/.claude-monitor/mcp.json. On every mutation we splice the
+	// full set into each managed account's .claude.json so the
+	// interactive `claude` CLI and the orchestrator's SDK sessions
+	// see the same servers.
+	//
+	// Read-only is enforced by the upstream MCP servers — postgres-mcp
+	// with --access-mode=restricted and mcp-clickhouse defaulting
+	// CLICKHOUSE_ALLOW_WRITE_ACCESS=false.
+	mux.HandleFunc("GET /api/mcp/connections", s.handleMcpConnectionsList)
+	mux.HandleFunc("POST /api/mcp/connections", s.handleMcpConnectionsCreate)
+	mux.HandleFunc("PUT /api/mcp/connections/{id}", s.handleMcpConnectionsUpdate)
+	mux.HandleFunc("DELETE /api/mcp/connections/{id}", s.handleMcpConnectionsDelete)
+	mux.HandleFunc("POST /api/mcp/connections/test", s.handleMcpConnectionsTest)
 	mux.HandleFunc("GET /api/events", s.handleEvents)
 	mux.HandleFunc("POST /api/worktrees", s.handleCreateWorktrees)
 	mux.HandleFunc("POST /api/phases/assign", s.handleAssignPhases)

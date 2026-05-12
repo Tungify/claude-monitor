@@ -23,6 +23,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { cn } from "@/lib/utils";
+import { DbMcpSection } from "./db-mcp-section";
 
 // MCPServer mirrors the /cli-info?topic=mcp shape. We don't import from
 // the server-only module — the type is small enough to duplicate.
@@ -49,11 +50,13 @@ interface Props {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   sessionId: string;
-  // Identifier (name or email) of the account the session is bound to,
-  // used for the "Re-login account" gesture in the claudeAiNeedsAuth
-  // banner. Undefined when no account is bound (rare; render the
-  // banner read-only in that case).
+  // Display name of the account (for the banner heading) and an
+  // unambiguous identifier the daemon can resolve. We prefer
+  // configDirIdent because `account_name` can be "default" (Codex's
+  // ~/.codex shorthand) or otherwise non-matchable by the daemon's
+  // snapshot lookup — config_dir is always unique.
   accountName?: string;
+  configDirIdent?: string;
 }
 
 type Scope = "local" | "user" | "project";
@@ -91,7 +94,13 @@ const SCOPE_LABEL: Record<string, string> = {
 // streamable HTTP with optional auth headers). Anything more exotic
 // — OAuth-registered clients, JSON import — keeps the user on a
 // terminal.
-export function McpDialog({ open, onOpenChange, sessionId, accountName }: Props) {
+export function McpDialog({
+  open,
+  onOpenChange,
+  sessionId,
+  accountName,
+  configDirIdent,
+}: Props) {
   const [data, setData] = useState<McpResponse | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -281,7 +290,7 @@ export function McpDialog({ open, onOpenChange, sessionId, accountName }: Props)
 
         {data?.claudeAiNeedsAuth && (
           <ReloginBanner
-            accountName={accountName}
+            ident={configDirIdent ?? accountName}
             onError={(msg) => setToast({ kind: "err", text: msg })}
             onLaunched={() =>
               setToast({
@@ -291,6 +300,11 @@ export function McpDialog({ open, onOpenChange, sessionId, accountName }: Props)
             }
           />
         )}
+
+        {/* Database integrations live above the generic MCP server
+            list because they're the most common reason a user opens
+            this dialog from a query session. */}
+        <DbMcpSection />
 
         {/* Add-server toggle. Collapsed by default so the list isn't
             pushed below the fold on small dialogs. */}
@@ -378,17 +392,23 @@ export function McpDialog({ open, onOpenChange, sessionId, accountName }: Props)
 }
 
 function ReloginBanner({
-  accountName,
+  ident,
   onError,
   onLaunched,
 }: {
-  accountName?: string;
+  // Anything the daemon can resolve against snapshot.Accounts: either
+  // the account.Name (stripped-dot dir basename) or the absolute
+  // config_dir. We prefer config_dir at the call site because
+  // account_name can collide ("default" for Codex's ~/.codex slot)
+  // and Anthropic's default ~/.claude resolves to name="claude", not
+  // "default" — the daemon would 404 on either.
+  ident?: string;
   onError: (msg: string) => void;
   onLaunched: () => void;
 }) {
   const [busy, setBusy] = useState(false);
   const relogin = async () => {
-    if (!accountName) {
+    if (!ident) {
       onError("No account bound to this session.");
       return;
     }
@@ -397,7 +417,7 @@ function ReloginBanner({
       // Daemon spawns Terminal.app running `claude auth login` for
       // this account. The OAuth dance happens in the terminal/browser;
       // the orchestrator's next refresh picks up the new creds.
-      const res = await reloginAccount(accountName);
+      const res = await reloginAccount(ident);
       if (!res.ok) throw new Error("daemon returned ok=false");
       onLaunched();
     } catch (err) {
@@ -425,7 +445,7 @@ function ReloginBanner({
       <button
         type="button"
         onClick={() => void relogin()}
-        disabled={busy || !accountName}
+        disabled={busy || !ident}
         className="inline-flex shrink-0 items-center gap-1 rounded-md border border-amber-500/40 bg-amber-500/15 px-2 py-1 text-[11px] font-medium text-amber-700 transition-colors hover:bg-amber-500/25 disabled:opacity-50 dark:text-amber-300"
       >
         {busy ? (
@@ -433,7 +453,7 @@ function ReloginBanner({
         ) : (
           <KeyRound className="size-3" />
         )}
-        Re-login{accountName ? ` ${accountName}` : ""}
+        Re-login{ident ? " account" : ""}
       </button>
     </div>
   );

@@ -35,6 +35,7 @@ import {
   type ParsedCommand,
 } from "@/lib/slash-commands";
 import { nextPermissionMode } from "@/lib/permission-mode";
+import { MCP_DB_TOOL_RE } from "@/lib/mcp-db-tools";
 import { SidebarTrigger } from "@/components/sidebar/sidebar-trigger";
 import { MessageBubble, StreamingTurn } from "./message-bubble";
 import { ThinkingIndicator, TurnMetaLine } from "./thinking-indicator";
@@ -167,6 +168,25 @@ function classifyForRun(
   // timeline (or render as trivial chrome), so they shouldn't break
   // a streak. Skip them.
   return "skip";
+}
+
+function streakContainsSqlTool(
+  history: SDKMessage[],
+  klass: Array<"tool_asst" | "tool_user" | "skip" | "other">,
+  start: number,
+  end: number,
+): boolean {
+  for (let j = start; j < end; j++) {
+    if (klass[j] !== "tool_asst") continue;
+    const msg = history[j];
+    if (msg.type !== "assistant") continue;
+    for (const b of msg.message.content) {
+      if (b.type === "tool_use" && MCP_DB_TOOL_RE.test(b.name)) {
+        return true;
+      }
+    }
+  }
+  return false;
 }
 
 type ChatItem =
@@ -529,8 +549,18 @@ export function ChatPanel({ session }: Props) {
         }
         // ≥2 tool-only assistant turns is the threshold for grouping —
         // a single tool call doesn't benefit from being wrapped in a
-        // collapsible (it's already one short bubble).
-        if (toolTurns >= 2) {
+        // collapsible (it's already one short bubble). One exception:
+        // any DB MCP query (`mcp__<conn>__execute_sql|run_query`) gets
+        // routed through tool_run regardless of count so ToolRunCard
+        // can lift it into a SqlExecutionCard playground — even a
+        // standalone SELECT deserves the editable/re-run surface.
+        const streakHasSqlTool = streakContainsSqlTool(
+          chat.history,
+          klass,
+          i,
+          end,
+        );
+        if (toolTurns >= 2 || streakHasSqlTool) {
           const slice: SDKMessage[] = [];
           for (let j = i; j < end; j++) {
             if (klass[j] === "skip") continue;
@@ -1092,6 +1122,7 @@ export function ChatPanel({ session }: Props) {
           onOpenChange={setMcpOpen}
           sessionId={session.id}
           accountName={session.account_name ?? undefined}
+          configDirIdent={session.config_dir ?? undefined}
         />
         <RewindPicker
           open={rewindOpen}

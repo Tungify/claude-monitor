@@ -41,6 +41,8 @@ import {
   RECORD_SHARED_CONTEXT_FQN,
   RUN_INTEGRATION_REVIEW_FQN,
 } from "./leader-mcp";
+import { getDbMcpEntries } from "./postgres-mcp";
+import { MCP_DB_TOOL_RE } from "@/lib/mcp-db-tools";
 import {
   deleteStoredSession,
   loadAllStoredSessions,
@@ -355,6 +357,54 @@ const OWNER_TRIAGE_APPEND = `## Orchestrator: multi-phase directive
 This chat runs inside the claude-monitor orchestrator. By default behave as a normal Claude Code single-session agent — plan, edit, and run tools in this chat as usual.
 
 If a user message arrives with a leading \`<orchestrator-intent>multi-phase</orchestrator-intent>\` directive, the chat has already been flipped into Plan mode (\`permissionMode: "plan"\`) by the composer — Edit / Write / Bash file-modifying tools are blocked. Use the read-only window to research the codebase (Read, Grep, Glob), then draft the phases and call the \`mcp__plans__submit_plan\` MCP tool with them. \`submit_plan\` is auto-approved past Plan mode's read-only gate; it serves as your plan-mode exit and writes the structured plan into the orchestrator. After it returns, the user reviews and approves the plan in the chat panel; phase agents then spawn into their own git worktrees and this chat becomes the leader (\`mcp__leader__*\` tools). Without the directive, do NOT volunteer the multi-phase path or call \`submit_plan\`.`;
+
+// DB_MCP_PRESENTATION_APPEND is injected only when the session has at
+// least one DB MCP connection configured. The chat UI lifts every
+// \`mcp__<conn>__execute_sql\` / \`mcp__<conn>__run_query\` call into a
+// SQL playground card (header + editable SQL + interactive result
+// table with row-click JSON expansion). If you ALSO re-render the
+// rows as a markdown table the user sees the same data twice — exactly
+// the duplication this directive prevents.
+//
+// Placed FIRST in the system-prompt append list (before owner-triage
+// / post-handoff) because it's a strict output rule — putting it after
+// other long blocks let the model treat it as a "general tip" and
+// continue mirroring tables. Concrete examples are required: prior
+// versions used only "DO NOT" prose and the model still produced
+// markdown tables in ~every reply.
+const DB_MCP_PRESENTATION_APPEND = `## CRITICAL OUTPUT RULE: DB MCP query results
+
+When you call \`mcp__<conn>__execute_sql\` (postgres) or \`mcp__<conn>__run_query\` (clickhouse), the chat UI ALREADY renders the full result as an interactive sortable table directly inside the user's view. Your reply MUST NOT contain a markdown table that restates the same rows. This is a hard rule — the user flagged the duplication explicitly.
+
+### What "duplicate" means here
+
+❌ Forbidden — reproducing the SQL result as a markdown table:
+
+\`\`\`
+| id  | name    | status |
+| --- | ------- | ------ |
+| 1   | Tungify | active |
+| 2   | Alice   | active |
+\`\`\`
+
+❌ Also forbidden — same rows reformatted as a numbered list, bullet list, JSON code block, or "key: value" pairs. The format doesn't matter; restating the rows is what's banned.
+
+### What to do instead
+
+✅ Reference specific cells inline in prose:
+"The \`Tungify\` row (id=1) is the only one with \`status=active\` — Alice was archived last week."
+
+✅ Summarize what the data means, what's surprising, or the next step.
+
+✅ If the user explicitly asks "show me the table" or "format as a table" — comply (their direct request overrides this rule).
+
+✅ A DIFFERENT cut (aggregation, grouping, filtered subset, a join across two earlier queries) is fine as a table — that's NEW information, not a mirror of the playground.
+
+### Scope
+
+Applies ONLY to the immediate reply following a query tool call. Markdown tables for analytical summaries, plan breakdowns, comparison matrices, schema overviews, etc. are unaffected.
+
+If you find yourself about to write \`| col1 | col2 |\` directly after a SQL tool result — stop, delete it, and write prose instead.`;
 
 // schedulePersist coalesces rapid changes (token deltas + history pushes
 // + status flips during a single turn) into one write. The first
@@ -1115,6 +1165,13 @@ function attachSDKQuery(session: ChatSession, isResume: boolean): void {
   // path (rare but real).
   const providerEnv = orConfig ? openRouterEnv(orConfig, session.model) : {};
 
+  // Snapshot DB MCP servers once — used both for the mcpServers spread
+  // below AND for the DB_MCP_PRESENTATION_APPEND directive gating.
+  // Re-reading from disk per use would risk drift between the two
+  // (e.g. a connection added mid-construction would appear in one
+  // place but not the other).
+  const dbMcpEntries = getDbMcpEntries();
+
   session.query = query({
     prompt: session.inputQueue,
     options: {
@@ -1138,6 +1195,12 @@ function attachSDKQuery(session: ChatSession, isResume: boolean): void {
       // and shouldn't see this.
       systemPrompt: ((): { type: "preset"; preset: "claude_code"; append?: string } => {
         const parts: string[] = [];
+        // DB rendering rule goes FIRST. The model gives strict
+        // output rules better adherence when they appear before the
+        // longer narrative blocks below.
+        if (Object.keys(dbMcpEntries).length > 0) {
+          parts.push(DB_MCP_PRESENTATION_APPEND);
+        }
         if (!session.phaseSlug) parts.push(OWNER_TRIAGE_APPEND);
         const postHandoff = computePostHandoffPreamble(session);
         if (postHandoff) parts.push(postHandoff);
@@ -1171,6 +1234,11 @@ function attachSDKQuery(session: ChatSession, isResume: boolean): void {
         ...(session.phaseSlug
           ? {}
           : { [LEADER_MCP_SERVER_NAME]: makeLeaderMcp(session) }),
+        // Postgres / ClickHouse read-only stanzas. Snapshot taken
+        // once above (dbMcpEntries) so the directive that depends on
+        // their presence reflects the same view. The helper returns {}
+        // when no driver is configured or uvx is missing on this host.
+        ...dbMcpEntries,
       },
       abortController: session.abortController,
       // Resume vs fresh: `resume` loads the session's transcript via
@@ -2536,6 +2604,23 @@ function synthesizeSuggestions(
       },
     ];
   }
+  // MCP DB tools (`mcp__<conn>__execute_sql` / `__run_query`) — every
+  // call carries a different SQL string, so a content-aware rule like
+  // Bash's `<cmd>:*` would never match. Authorize the whole tool name
+  // instead; the upstream postgres-mcp/mcp-clickhouse servers already
+  // enforce read-only at the SQL parser level, so granting the tool
+  // is no broader than what the user opted into when registering the
+  // connection.
+  if (MCP_DB_TOOL_RE.test(toolName)) {
+    return [
+      {
+        type: "addRules",
+        rules: [{ toolName, ruleContent: "" }],
+        behavior: "allow",
+        destination: "session",
+      },
+    ];
+  }
   // Read/Glob/Grep/WebFetch/etc. could be added here as we learn the
   // canonical rule shape per tool. For now leave them to the SDK.
   return [];
@@ -2565,7 +2650,14 @@ function matchSingleRule(
   input: Record<string, unknown>,
 ): boolean {
   const content = (rule.ruleContent ?? "").trim();
-  if (!content) return false;
+  if (!content) {
+    // Empty ruleContent = wildcard on input. Matches the CLI's
+    // settings.json convention where `permissions.allow: ["mcp__pg__execute_sql"]`
+    // (no parens) authorizes every invocation of that tool. We
+    // synthesize this shape for MCP DB tools; the SDK may also ship it
+    // for other tool families.
+    return true;
+  }
   if (toolName === "Bash" && typeof input.command === "string") {
     const cmd = input.command.trim();
     if (!cmd) return false;

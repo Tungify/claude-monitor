@@ -1,6 +1,7 @@
 package account
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -205,6 +206,79 @@ func PatchOAuthInFile(path string, block json.RawMessage) error {
 		return fmt.Errorf("decode %s: %w", path, err)
 	}
 	data["oauthAccount"] = block
+	out, err := json.MarshalIndent(data, "", "  ")
+	if err != nil {
+		return fmt.Errorf("encode %s: %w", path, err)
+	}
+	perm := os.FileMode(0o600)
+	if info, statErr := os.Stat(path); statErr == nil {
+		perm = info.Mode().Perm()
+	}
+	return writeFileAtomic(path, out, perm)
+}
+
+// PatchMCPServerInFile splices a single named entry into the
+// top-level `mcpServers` map of the given .claude.json. Pass a nil
+// `entry` to delete the key. Other entries in mcpServers (and all
+// other top-level fields) are preserved.
+//
+// No-op when the destination doesn't exist — we don't conjure a
+// .claude.json from scratch; that's Claude Code's responsibility on
+// first login. Treat a missing file as "this account hasn't logged
+// in yet" and skip silently.
+//
+// Atomic via writeFileAtomic so a concurrent Claude Code reader
+// never sees a half-written file.
+func PatchMCPServerInFile(path, name string, entry map[string]any) error {
+	b, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("read %s: %w", path, err)
+	}
+	var data map[string]json.RawMessage
+	if err := json.Unmarshal(b, &data); err != nil {
+		return fmt.Errorf("decode %s: %w", path, err)
+	}
+
+	servers := map[string]json.RawMessage{}
+	if raw, ok := data["mcpServers"]; ok && len(raw) > 0 && string(raw) != "null" {
+		if err := json.Unmarshal(raw, &servers); err != nil {
+			return fmt.Errorf("decode mcpServers in %s: %w", path, err)
+		}
+	}
+
+	if entry == nil {
+		if _, present := servers[name]; !present {
+			// Nothing to do — avoid rewriting the file (and bumping
+			// mtime) when the stanza was already absent.
+			return nil
+		}
+		delete(servers, name)
+	} else {
+		encoded, err := json.Marshal(entry)
+		if err != nil {
+			return fmt.Errorf("encode entry: %w", err)
+		}
+		if existing, present := servers[name]; present && bytes.Equal(existing, encoded) {
+			// Already the exact stanza we'd write — skip the atomic
+			// rewrite so we don't churn .claude.json on every save.
+			return nil
+		}
+		servers[name] = encoded
+	}
+
+	if len(servers) == 0 {
+		delete(data, "mcpServers")
+	} else {
+		raw, err := json.Marshal(servers)
+		if err != nil {
+			return fmt.Errorf("encode mcpServers: %w", err)
+		}
+		data["mcpServers"] = raw
+	}
+
 	out, err := json.MarshalIndent(data, "", "  ")
 	if err != nil {
 		return fmt.Errorf("encode %s: %w", path, err)
