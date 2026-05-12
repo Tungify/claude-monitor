@@ -42,6 +42,7 @@ import {
   RUN_INTEGRATION_REVIEW_FQN,
 } from "./leader-mcp";
 import { getDbMcpEntries } from "./postgres-mcp";
+import { getIntegrationsMcpEntries } from "./integrations-mcp";
 import { MCP_DB_TOOL_RE } from "@/lib/mcp-db-tools";
 import {
   deleteStoredSession,
@@ -1171,6 +1172,7 @@ function attachSDKQuery(session: ChatSession, isResume: boolean): void {
   // (e.g. a connection added mid-construction would appear in one
   // place but not the other).
   const dbMcpEntries = getDbMcpEntries();
+  const integrationsMcpEntries = getIntegrationsMcpEntries();
 
   session.query = query({
     prompt: session.inputQueue,
@@ -1239,6 +1241,13 @@ function attachSDKQuery(session: ChatSession, isResume: boolean): void {
         // their presence reflects the same view. The helper returns {}
         // when no driver is configured or uvx is missing on this host.
         ...dbMcpEntries,
+        // Per-service integrations (Slack, …). Spread AFTER
+        // dbMcpEntries — if a user happens to name an integration
+        // the same as a DB connection, the integration wins. The
+        // two registries are independent in mcp.json (different
+        // top-level keys), so this is the only place collisions
+        // resolve.
+        ...integrationsMcpEntries,
       },
       abortController: session.abortController,
       // Resume vs fresh: `resume` loads the session's transcript via
