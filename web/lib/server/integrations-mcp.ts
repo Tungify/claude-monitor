@@ -26,7 +26,7 @@ type StdioStanza = {
 type IntegrationDisk = {
   id?: string;
   name?: string;
-  service?: "slack" | "clickup";
+  service?: "slack" | "clickup" | "github";
   // Disabled = parked. Stripped from the spawn map but kept on
   // disk so re-enable doesn't require re-entering secrets.
   disabled?: boolean;
@@ -39,6 +39,11 @@ type IntegrationDisk = {
   // ClickUp — opt-in writes. Default (undefined/false) means
   // CLICKUP_MCP_PERSONA=auditor → read-only tool surface.
   clickup_allow_write?: boolean;
+  // GitHub
+  github_token?: string;
+  // GitHub — opt-in writes. Default (undefined/false) means
+  // GITHUB_READ_ONLY=1 → upstream filters out write tools.
+  github_allow_write?: boolean;
 };
 
 type Envelope = {
@@ -122,15 +127,60 @@ function clickupStanza(i: IntegrationDisk): StdioStanza | null {
   };
 }
 
+// githubStanza must produce a byte-identical shape to the Go side's
+// githubStanza in internal/mcp/integrations/integrations.go. The
+// official GitHub MCP server ships as a docker image — we pass `-e
+// KEY` without a value so docker reads from the inherited env rather
+// than echoing the PAT into `ps`. The orchestrator's spawn machinery
+// merges StdioStanza.env into the child process env, which docker
+// then forwards into the container via the `-e` flags.
+function githubStanza(i: IntegrationDisk): StdioStanza | null {
+  const tok = i.github_token?.trim();
+  if (!tok) return null;
+  const args: string[] = ["run", "-i", "--rm", "-e", "GITHUB_PERSONAL_ACCESS_TOKEN"];
+  const env: Record<string, string> = {
+    GITHUB_PERSONAL_ACCESS_TOKEN: tok,
+  };
+  // Read-only is the default — must produce byte-identical env to
+  // the Go side so the daemon-injected stanza and the SDK-spawned
+  // stanza both narrow to the read-only tool surface.
+  if (!i.github_allow_write) {
+    args.push("-e", "GITHUB_READ_ONLY");
+    env.GITHUB_READ_ONLY = "1";
+  }
+  args.push("ghcr.io/github/github-mcp-server");
+  return {
+    type: "stdio",
+    command: "docker",
+    args,
+    env,
+  };
+}
+
 function stanzaFor(i: IntegrationDisk): StdioStanza | null {
   switch (i.service) {
     case "slack":
       return slackStanza(i);
     case "clickup":
       return clickupStanza(i);
+    case "github":
+      return githubStanza(i);
     default:
       return null;
   }
+}
+
+// hasEnabledService returns true when at least one *enabled*
+// integration of the given service is configured. Used by sessions.ts
+// to decide whether to inject service-specific system-prompt
+// directives — we shouldn't tell the LLM "include ClickUp task URLs"
+// if there's no ClickUp integration spawning into the session.
+export function hasEnabledService(
+  service: IntegrationDisk["service"],
+): boolean {
+  return readIntegrations().some(
+    (i) => i.service === service && !i.disabled && Boolean(i.name),
+  );
 }
 
 // getIntegrationsMcpEntries returns every configured integration's

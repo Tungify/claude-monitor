@@ -5,6 +5,7 @@ import { Check, CircleDashed, GitBranch, Loader2 } from "lucide-react";
 import { Markdown } from "@/components/markdown/markdown";
 import type { StreamingBlock } from "@/lib/chat-types";
 import { parseCliEnvelope } from "@/lib/cli-envelope";
+import { linkifyUrls } from "@/lib/linkify-urls";
 import { isSubagentDispatchTool } from "@/lib/subagents";
 import { cn } from "@/lib/utils";
 import { SubagentCard } from "./subagent-card";
@@ -542,7 +543,12 @@ export function ToolResultLine({ content, isError }: ToolResultLineProps) {
         <span className="truncate font-mono">{summary}</span>
       </summary>
       <pre className="mx-2 mt-1 max-h-72 overflow-auto whitespace-pre-wrap break-all rounded bg-muted/40 p-2 text-[11px]">
-        {full || "(empty)"}
+        {/* Linkify so ClickUp task URLs / GitHub html_url / Slack
+            permalinks embedded in the JSON dump become click-to-open
+            anchors. Preserves the surrounding monospace + whitespace
+            because the anchors are just inline nodes inside the same
+            <pre>. */}
+        {full ? linkifyUrls(full) : "(empty)"}
       </pre>
     </details>
   );

@@ -324,6 +324,150 @@ func TestUpdate_PreservesClickUpKey(t *testing.T) {
 	}
 }
 
+func TestValidate_Github(t *testing.T) {
+	t.Run("requires token", func(t *testing.T) {
+		if err := (Integration{Name: "gh", Service: ServiceGithub}).Validate(); err == nil {
+			t.Fatalf("expected error for missing token")
+		}
+	})
+	t.Run("rejects bad prefix", func(t *testing.T) {
+		if err := (Integration{Name: "gh", Service: ServiceGithub, GithubToken: "sk-1234567890ab"}).Validate(); err == nil {
+			t.Fatalf("expected error for non-github prefix")
+		}
+	})
+	t.Run("accepts classic ghp_", func(t *testing.T) {
+		if err := (Integration{Name: "gh", Service: ServiceGithub, GithubToken: "ghp_1234567890ABCDEF"}).Validate(); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+	t.Run("accepts fine-grained github_pat_", func(t *testing.T) {
+		if err := (Integration{Name: "gh", Service: ServiceGithub, GithubToken: "github_pat_1234ABCDEF"}).Validate(); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+	t.Run("accepts oauth gho_/ghu_/ghs_", func(t *testing.T) {
+		for _, tok := range []string{"gho_1234567890AB", "ghu_1234567890AB", "ghs_1234567890AB"} {
+			if err := (Integration{Name: "gh", Service: ServiceGithub, GithubToken: tok}).Validate(); err != nil {
+				t.Fatalf("unexpected error for %q: %v", tok, err)
+			}
+		}
+	})
+	t.Run("rejects too short", func(t *testing.T) {
+		if err := (Integration{Name: "gh", Service: ServiceGithub, GithubToken: "ghp_"}).Validate(); err == nil {
+			t.Fatalf("expected error for short token")
+		}
+	})
+}
+
+func TestStanza_Github(t *testing.T) {
+	in := Integration{
+		Name:        "gh",
+		Service:     ServiceGithub,
+		GithubToken: "ghp_1234567890ABCDEF",
+	}
+	s := in.Stanza()
+	if s == nil {
+		t.Fatal("expected non-nil stanza")
+	}
+	if s["command"] != "docker" {
+		t.Fatalf("command: %v (want docker)", s["command"])
+	}
+	args, _ := s["args"].([]string)
+	// Read-only is default → the GITHUB_READ_ONLY -e flag must be
+	// present and the image must be the last positional arg.
+	want := []string{
+		"run", "-i", "--rm",
+		"-e", "GITHUB_PERSONAL_ACCESS_TOKEN",
+		"-e", "GITHUB_READ_ONLY",
+		"ghcr.io/github/github-mcp-server",
+	}
+	if len(args) != len(want) {
+		t.Fatalf("args length mismatch: got %v want %v", args, want)
+	}
+	for i, a := range want {
+		if args[i] != a {
+			t.Fatalf("args[%d]=%q want %q", i, args[i], a)
+		}
+	}
+	env, _ := s["env"].(map[string]string)
+	if env["GITHUB_PERSONAL_ACCESS_TOKEN"] != "ghp_1234567890ABCDEF" {
+		t.Fatalf("token env not set: %#v", env)
+	}
+	if env["GITHUB_READ_ONLY"] != "1" {
+		t.Fatalf("expected GITHUB_READ_ONLY=1 by default, got %#v", env)
+	}
+}
+
+func TestStanza_Github_AllowWriteOmitsReadOnly(t *testing.T) {
+	in := Integration{
+		Name:             "gh",
+		Service:          ServiceGithub,
+		GithubToken:      "ghp_x_______________",
+		GithubAllowWrite: true,
+	}
+	s := in.Stanza()
+	env, _ := s["env"].(map[string]string)
+	if _, has := env["GITHUB_READ_ONLY"]; has {
+		t.Fatalf("expected no GITHUB_READ_ONLY when allow_write=true, got %#v", env)
+	}
+	args, _ := s["args"].([]string)
+	for _, a := range args {
+		if a == "GITHUB_READ_ONLY" {
+			t.Fatalf("expected no GITHUB_READ_ONLY -e flag when allow_write=true, got args %v", args)
+		}
+	}
+}
+
+func TestStanza_Github_EmptyTokenYieldsNil(t *testing.T) {
+	in := Integration{Name: "gh", Service: ServiceGithub}
+	if s := in.Stanza(); s != nil {
+		t.Fatalf("expected nil stanza for empty token, got %#v", s)
+	}
+}
+
+func TestRedacted_Github(t *testing.T) {
+	in := Integration{
+		Name:        "gh",
+		Service:     ServiceGithub,
+		GithubToken: "ghp_secretbody",
+	}
+	r := in.Redacted()
+	if r.GithubToken == in.GithubToken {
+		t.Fatalf("token should be redacted")
+	}
+	if !strings.Contains(r.GithubToken, "***") {
+		t.Fatalf("redaction should contain ***: %q", r.GithubToken)
+	}
+}
+
+func TestUpdate_PreservesGithubToken(t *testing.T) {
+	setupHome(t)
+	saved, _, mErr := CreateAndApply("", Integration{
+		Name:        "gh",
+		Service:     ServiceGithub,
+		GithubToken: "ghp_1234567890ABCDEF",
+	})
+	if mErr != nil {
+		t.Fatalf("create: %v", mErr)
+	}
+	// Empty token in update body = "keep existing". Flip allow_write
+	// only; verify token persists.
+	updated, _, mErr := UpdateAndApply("", saved.ID, Integration{
+		Name:             "gh",
+		Service:          ServiceGithub,
+		GithubAllowWrite: true,
+	})
+	if mErr != nil {
+		t.Fatalf("update: %v", mErr)
+	}
+	if updated.GithubToken != "ghp_1234567890ABCDEF" {
+		t.Fatalf("token not preserved: %q", updated.GithubToken)
+	}
+	if !updated.GithubAllowWrite {
+		t.Fatalf("allow_write not applied")
+	}
+}
+
 func TestRedacted_Slack(t *testing.T) {
 	in := Integration{Name: "team", Service: ServiceSlack, SlackToken: "xoxp-1-2-secret"}
 	r := in.Redacted()

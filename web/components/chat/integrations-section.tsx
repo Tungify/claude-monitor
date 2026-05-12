@@ -6,6 +6,7 @@ import {
   CheckSquare,
   ChevronDown,
   ChevronRight,
+  GitFork,
   Hash,
   Loader2,
   Pencil,
@@ -28,7 +29,7 @@ import { cn } from "@/lib/utils";
 // add a new service, extend the Service union, the renderer in
 // ServiceForm, and the Stanza branch on the Go side.
 
-type Service = "slack" | "clickup";
+type Service = "slack" | "clickup" | "github";
 
 interface Integration {
   id: string;
@@ -47,6 +48,11 @@ interface Integration {
   clickup_team_id?: string;
   // ClickUp — opt-in writes. Default = read-only (auditor persona).
   clickup_allow_write?: boolean;
+  // GitHub — token is redacted on the wire (prefix + ***); the form
+  // shows "token is set" without exposing the PAT body.
+  github_token?: string;
+  // GitHub — opt-in writes. Default = read-only (GITHUB_READ_ONLY=1).
+  github_allow_write?: boolean;
 }
 
 interface ListResponse {
@@ -108,7 +114,7 @@ export function IntegrationsSection() {
             <div className="rounded border bg-background px-2.5 py-2 text-xs text-muted-foreground">
               No integrations yet. Use{" "}
               <span className="font-mono">Add integration</span> below to wire
-              up Slack or ClickUp (more services soon).
+              up Slack, ClickUp, or GitHub (more services soon).
             </div>
           )}
 
@@ -324,6 +330,20 @@ function summarise(i: Integration): string {
     const mode = i.clickup_allow_write ? " · write: on" : " · read-only";
     return `${team}${key}${mode}`;
   }
+  if (i.service === "github") {
+    const tok = i.github_token ?? "";
+    const kind = tok.startsWith("github_pat_")
+      ? "fine-grained PAT"
+      : tok.startsWith("ghp_")
+        ? "classic PAT"
+        : tok.startsWith("gho_") || tok.startsWith("ghu_") || tok.startsWith("ghs_")
+          ? "OAuth token"
+          : tok
+            ? "token"
+            : "no token";
+    const mode = i.github_allow_write ? " · write: on" : " · read-only";
+    return `${kind}${mode}`;
+  }
   return "";
 }
 
@@ -341,6 +361,13 @@ const SERVICE_BADGE: Record<Service, { label: string; cls: string; Icon: typeof 
     // No ClickUp glyph in lucide either; CheckSquare matches the
     // task-management mental model the user already has for ClickUp.
     Icon: CheckSquare,
+  },
+  github: {
+    label: "github",
+    cls: "bg-zinc-500/15 text-zinc-700 dark:text-zinc-300",
+    // Lucide dropped the GitHub brand glyph — GitFork is the closest
+    // git-native icon that still reads as "GitHub-ish" at 12px.
+    Icon: GitFork,
   },
 };
 
@@ -395,6 +422,10 @@ function IntegrationForm({
   const [clickupAllowWrite, setClickupAllowWrite] = useState(
     initial?.clickup_allow_write ?? false,
   );
+  const [githubToken, setGithubToken] = useState("");
+  const [githubAllowWrite, setGithubAllowWrite] = useState(
+    initial?.github_allow_write ?? false,
+  );
   const [busy, setBusy] = useState<"save" | "test" | null>(null);
   const [test, setTest] = useState<TestState>({ status: "idle" });
 
@@ -417,6 +448,13 @@ function IntegrationForm({
         clickup_api_key: clickupKey,
         clickup_team_id: clickupTeam.trim(),
         clickup_allow_write: clickupAllowWrite,
+      };
+    }
+    if (service === "github") {
+      return {
+        ...base,
+        github_token: githubToken,
+        github_allow_write: githubAllowWrite,
       };
     }
     return base;
@@ -503,8 +541,20 @@ function IntegrationForm({
   const clickupTeamValid = /^\d+$/.test(clickupTeam.trim());
   const clickupKeyValid = mode === "update" || clickupKey.trim().startsWith("pk_");
   const clickupValid = clickupTeamValid && clickupKeyValid;
+  // GitHub PATs come in five prefix flavours — accept any of them so
+  // the form doesn't reject valid OAuth-issued tokens.
+  const githubPrefixOk = /^(ghp_|github_pat_|gho_|ghu_|ghs_)/.test(
+    githubToken.trim(),
+  );
+  const githubValid = mode === "update" || githubPrefixOk;
   const serviceValid =
-    service === "slack" ? slackValid : service === "clickup" ? clickupValid : false;
+    service === "slack"
+      ? slackValid
+      : service === "clickup"
+        ? clickupValid
+        : service === "github"
+          ? githubValid
+          : false;
   const valid = name.trim().length > 0 && serviceValid;
 
   return (
@@ -514,7 +564,13 @@ function IntegrationForm({
           <input
             value={name}
             onChange={(e) => setName(e.target.value)}
-            placeholder={service === "clickup" ? "team_tasks" : "team_slack"}
+            placeholder={
+              service === "clickup"
+                ? "team_tasks"
+                : service === "github"
+                  ? "team_github"
+                  : "team_slack"
+            }
             className="w-full rounded border bg-background px-2 py-1 font-mono text-xs"
             autoComplete="off"
           />
@@ -528,6 +584,7 @@ function IntegrationForm({
           >
             <option value="slack">Slack</option>
             <option value="clickup">ClickUp</option>
+            <option value="github">GitHub</option>
           </select>
         </Field>
       </div>
@@ -553,6 +610,17 @@ function IntegrationForm({
           setTeamId={setClickupTeam}
           allowWrite={clickupAllowWrite}
           setAllowWrite={setClickupAllowWrite}
+        />
+      )}
+
+      {service === "github" && (
+        <GithubFields
+          mode={mode}
+          existingTokenRedacted={initial?.github_token}
+          token={githubToken}
+          setToken={setGithubToken}
+          allowWrite={githubAllowWrite}
+          setAllowWrite={setGithubAllowWrite}
         />
       )}
 
@@ -739,6 +807,75 @@ function ClickUpFields({
         the number in <span className="font-mono">app.clickup.com/&lt;TEAM_ID&gt;/…</span>.
         The key never leaves your machine — only the model running on this
         account&apos;s session sees the resulting tool surface.
+      </div>
+    </div>
+  );
+}
+
+function GithubFields({
+  mode,
+  existingTokenRedacted,
+  token,
+  setToken,
+  allowWrite,
+  setAllowWrite,
+}: {
+  mode: "create" | "update";
+  existingTokenRedacted?: string;
+  token: string;
+  setToken: (v: string) => void;
+  allowWrite: boolean;
+  setAllowWrite: (v: boolean) => void;
+}) {
+  return (
+    <div className="space-y-2">
+      <Field
+        label="GitHub token"
+        hint={
+          mode === "update"
+            ? `leave empty to keep existing (${existingTokenRedacted ?? "set"})`
+            : "ghp_… (classic PAT) or github_pat_… (fine-grained)"
+        }
+      >
+        <input
+          type="password"
+          value={token}
+          onChange={(e) => setToken(e.target.value)}
+          placeholder={
+            mode === "update" ? existingTokenRedacted ?? "" : "ghp_… or github_pat_…"
+          }
+          className="w-full rounded border bg-background px-2 py-1 font-mono text-xs"
+          autoComplete="off"
+        />
+      </Field>
+
+      <label className="flex items-start gap-2 rounded-md border bg-muted/30 px-2 py-1.5 text-xs">
+        <input
+          type="checkbox"
+          checked={allowWrite}
+          onChange={(e) => setAllowWrite(e.target.checked)}
+          className="mt-0.5"
+        />
+        <span>
+          <span className="font-medium">Allow write operations</span>
+          <span className="ml-1 text-muted-foreground">
+            (off by default — server runs with{" "}
+            <span className="font-mono">GITHUB_READ_ONLY=1</span> so only read
+            tools register. Turn on to enable creating issues/PRs, pushing
+            files, merging…)
+          </span>
+        </span>
+      </label>
+
+      <div className="rounded-md border border-dashed bg-muted/10 px-2 py-1.5 text-[11px] text-muted-foreground">
+        <span className="font-medium text-foreground">Requires Docker.</span>{" "}
+        This integration runs the official{" "}
+        <span className="font-mono">ghcr.io/github/github-mcp-server</span> image
+        via <span className="font-mono">docker run</span>. First run pulls the
+        image (~50MB) — Test connection will report success once it boots. Get a
+        PAT at <span className="font-mono">github.com/settings/tokens</span>{" "}
+        (classic) or <span className="font-mono">/settings/personal-access-tokens</span>{" "}
+        (fine-grained). The token never leaves your machine.
       </div>
     </div>
   );

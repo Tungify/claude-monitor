@@ -192,6 +192,10 @@ func (s *Server) handleMcpIntegrationsTest(w http.ResponseWriter, r *http.Reques
 				if strings.TrimSpace(body.ClickUpAPIKey) == "" {
 					body.ClickUpAPIKey = existing.ClickUpAPIKey
 				}
+			case integrations.ServiceGithub:
+				if strings.TrimSpace(body.GithubToken) == "" {
+					body.GithubToken = existing.GithubToken
+				}
 			}
 		}
 	}
@@ -208,16 +212,9 @@ func (s *Server) handleMcpIntegrationsTest(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	if _, err := exec.LookPath("npx"); err != nil {
-		writeJSON(w, http.StatusPreconditionFailed, map[string]any{
-			"error": "npx is not installed or not on PATH (install Node.js to enable Slack integration)",
-		})
-		return
-	}
-
-	// Cold npx fetches the package the first time, which can take >5s
-	// on slow networks. Keep the deadline generous; the timeout =
-	// success branch below absorbs the wait either way.
+	// Cold npx / docker pull fetches the package the first time, which
+	// can take >5s on slow networks. Keep the deadline generous; the
+	// timeout = success branch below absorbs the wait either way.
 	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
 	defer cancel()
 
@@ -225,6 +222,20 @@ func (s *Server) handleMcpIntegrationsTest(w http.ResponseWriter, r *http.Reques
 	if err != nil {
 		writeJSON(w, http.StatusUnprocessableEntity, map[string]string{
 			"error": err.Error(),
+		})
+		return
+	}
+
+	// Precondition check happens after stanza build so the error
+	// message names the actual runtime each service needs (npx for
+	// Slack/ClickUp's node-distributed servers, docker for GitHub's
+	// ghcr image). exec.CommandContext stashes the LookPath error on
+	// cmd.Err — using that is more reliable than re-running LookPath
+	// against cmd.Path (which gets rewritten to the absolute path on
+	// successful resolve).
+	if cmd.Err != nil {
+		writeJSON(w, http.StatusPreconditionFailed, map[string]any{
+			"error": integrationsRuntimeError(body.Service, cmd.Err),
 		})
 		return
 	}
@@ -246,6 +257,19 @@ func (s *Server) handleMcpIntegrationsTest(w http.ResponseWriter, r *http.Reques
 			"error":  runErr.Error(),
 			"output": tailLines(string(out), 20),
 		})
+	}
+}
+
+// integrationsRuntimeError shapes the precondition error message
+// around which runtime the per-service stanza needs. Keeps the
+// "install Node.js" / "install Docker" guidance close to the actual
+// LookPath failure rather than buried in service-agnostic text.
+func integrationsRuntimeError(svc integrations.Service, lookupErr error) string {
+	switch svc {
+	case integrations.ServiceGithub:
+		return "docker is not installed or not on PATH (Docker is required to run the official GitHub MCP server image): " + lookupErr.Error()
+	default:
+		return "npx is not installed or not on PATH (install Node.js to enable this integration): " + lookupErr.Error()
 	}
 }
 

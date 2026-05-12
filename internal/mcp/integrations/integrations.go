@@ -46,6 +46,7 @@ type Service string
 const (
 	ServiceSlack   Service = "slack"
 	ServiceClickUp Service = "clickup"
+	ServiceGithub  Service = "github"
 )
 
 // Integration is one user-configured service. Field set is the union
@@ -91,6 +92,20 @@ type Integration struct {
 	// and has the user's full edit/delete rights — without this
 	// guard, a single misfired tool call could destroy real data.
 	ClickUpAllowWrite bool `json:"clickup_allow_write,omitempty"`
+
+	// GitHub — personal access token (classic ghp_ / fine-grained
+	// github_pat_ / OAuth gho_/ghu_/ghs_). We run the official
+	// ghcr.io/github/github-mcp-server image via docker stdio so
+	// the read-only toggle below maps to the server's own
+	// GITHUB_READ_ONLY flag rather than relying on token scopes
+	// alone (a write-scoped PAT can still be parked read-only).
+	GithubToken string `json:"github_token,omitempty"`
+	// GithubAllowWrite opts into the full tool surface. Off by
+	// default mirrors Slack/ClickUp: read-only unless the user
+	// explicitly turns it on. When false we set GITHUB_READ_ONLY=1
+	// so the upstream filters out create/update/delete tools even
+	// when the PAT has write scopes.
+	GithubAllowWrite bool `json:"github_allow_write,omitempty"`
 }
 
 // driverKey is the top-level key in mcp.json. Sibling to "connections".
@@ -121,6 +136,8 @@ func (i Integration) Validate() error {
 		return validateSlack(i)
 	case ServiceClickUp:
 		return validateClickUp(i)
+	case ServiceGithub:
+		return validateGithub(i)
 	default:
 		return fmt.Errorf("unknown service: %q", i.Service)
 	}
@@ -170,6 +187,37 @@ func validateClickUp(i Integration) error {
 	return nil
 }
 
+// githubTokenPrefixes is the set of PAT/OAuth prefixes the GitHub
+// API recognises. We accept all of them so users can paste either a
+// classic PAT (ghp_), a fine-grained PAT (github_pat_), or one of the
+// OAuth-issued variants without us second-guessing which they have.
+var githubTokenPrefixes = []string{"ghp_", "github_pat_", "gho_", "ghu_", "ghs_"}
+
+// validateGithub gates the docker-spawn config. Only the token is
+// required — toolset / read-only choices have safe defaults. Prefix
+// check catches the common "pasted the wrong secret" failure before
+// we spend the cold-cache time pulling the docker image.
+func validateGithub(i Integration) error {
+	tok := strings.TrimSpace(i.GithubToken)
+	if tok == "" {
+		return errors.New("github_token is required")
+	}
+	matched := false
+	for _, p := range githubTokenPrefixes {
+		if strings.HasPrefix(tok, p) {
+			matched = true
+			break
+		}
+	}
+	if !matched {
+		return errors.New("github_token must start with ghp_ / github_pat_ / gho_ / ghu_ / ghs_ (GitHub PAT or OAuth token)")
+	}
+	if len(tok) < 12 {
+		return errors.New("github_token looks too short to be valid")
+	}
+	return nil
+}
+
 // Stanza emits the mcpServers entry for this integration. Returns nil
 // when the integration isn't materially configured — callers treat
 // nil as "skip this entry / strip any existing".
@@ -179,6 +227,8 @@ func (i Integration) Stanza() map[string]any {
 		return slackStanza(i)
 	case ServiceClickUp:
 		return clickupStanza(i)
+	case ServiceGithub:
+		return githubStanza(i)
 	}
 	return nil
 }
@@ -258,6 +308,45 @@ func clickupStanza(i Integration) map[string]any {
 	}
 }
 
+// githubStanza wires up the official ghcr.io/github/github-mcp-server
+// image via docker stdio. We pass `-e KEY` without a value so docker
+// reads the secret from the parent process's env rather than echoing
+// it into `ps`. The image is the upstream-recommended local path; the
+// alternative is a downloaded Go binary which we'd have to fetch and
+// version ourselves.
+//
+// Read-only is the default. GITHUB_READ_ONLY=1 pins the upstream to
+// the read-only tool subset (search_repositories, get_file_contents,
+// list_issues, …) — see the upstream's docs/configuration.md
+// "Read-only Mode" entry. When the user explicitly opts into writes
+// we omit the env var so create/update/delete tools register.
+func githubStanza(i Integration) map[string]any {
+	tok := strings.TrimSpace(i.GithubToken)
+	if tok == "" {
+		return nil
+	}
+	args := []string{
+		"run",
+		"-i",
+		"--rm",
+		"-e", "GITHUB_PERSONAL_ACCESS_TOKEN",
+	}
+	env := map[string]string{
+		"GITHUB_PERSONAL_ACCESS_TOKEN": tok,
+	}
+	if !i.GithubAllowWrite {
+		args = append(args, "-e", "GITHUB_READ_ONLY")
+		env["GITHUB_READ_ONLY"] = "1"
+	}
+	args = append(args, "ghcr.io/github/github-mcp-server")
+	return map[string]any{
+		"type":    "stdio",
+		"command": "docker",
+		"args":    args,
+		"env":     env,
+	}
+}
+
 // Redacted returns a copy with secret token replaced by "***". Used
 // by the listing API so the web UI can render "yes, configured"
 // without exposing the secret.
@@ -268,6 +357,9 @@ func (i Integration) Redacted() Integration {
 	}
 	if out.ClickUpAPIKey != "" {
 		out.ClickUpAPIKey = redactToken(out.ClickUpAPIKey)
+	}
+	if out.GithubToken != "" {
+		out.GithubToken = redactToken(out.GithubToken)
 	}
 	// Team ID is not a secret — it's a workspace identifier visible
 	// in every ClickUp URL — so leave it in cleartext so the UI can
@@ -448,6 +540,10 @@ func UpdateAndApply(rootSpec, id string, in Integration) (saved Integration, app
 	case ServiceClickUp:
 		if strings.TrimSpace(in.ClickUpAPIKey) == "" {
 			in.ClickUpAPIKey = prev[idx].ClickUpAPIKey
+		}
+	case ServiceGithub:
+		if strings.TrimSpace(in.GithubToken) == "" {
+			in.GithubToken = prev[idx].GithubToken
 		}
 	}
 	in.ID = id
