@@ -401,15 +401,55 @@ function jsonHighlight(text: string): { __html: string } {
     return { __html: escapeHtml(text) };
   }
   try {
-    return {
-      __html: hljs.highlight(text, {
-        language: "json",
-        ignoreIllegals: true,
-      }).value,
-    };
+    const raw = hljs.highlight(text, {
+      language: "json",
+      ignoreIllegals: true,
+    }).value;
+    return { __html: decorateJsonPunctuation(raw) };
   } catch {
     return { __html: escapeHtml(text) };
   }
+}
+
+// decorateJsonPunctuation wraps bare {}[],: characters in
+// hljs-punctuation spans so they pick up the syntax palette.
+// hljs's JSON grammar doesn't tag punctuation, so without this pass
+// brackets/commas/colons render in foreground colour — exactly the
+// "wall of plain text with a few coloured tokens" look the user
+// complained about. We track span nesting depth so colons inside
+// `hljs-string` values (e.g. a stored URL or a timestamp like
+// "12:34") are left alone — they're part of the user's data, not
+// JSON syntax.
+function decorateJsonPunctuation(html: string): string {
+  let out = "";
+  let depth = 0;
+  let i = 0;
+  while (i < html.length) {
+    const ch = html[i];
+    if (ch === "<") {
+      const end = html.indexOf(">", i);
+      if (end === -1) {
+        out += html.slice(i);
+        break;
+      }
+      const tag = html.slice(i, end + 1);
+      out += tag;
+      if (tag.startsWith("</")) depth = Math.max(0, depth - 1);
+      else if (!tag.endsWith("/>")) depth++;
+      i = end + 1;
+      continue;
+    }
+    if (
+      depth === 0 &&
+      (ch === "{" || ch === "}" || ch === "[" || ch === "]" || ch === "," || ch === ":")
+    ) {
+      out += `<span class="hljs-punctuation">${ch}</span>`;
+    } else {
+      out += ch;
+    }
+    i++;
+  }
+  return out;
 }
 
 function CopyButton({ text }: { text: string }) {
