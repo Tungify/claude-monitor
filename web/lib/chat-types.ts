@@ -157,6 +157,36 @@ export interface SessionSummary {
   // codex (different account) or reverse handoffs later without a
   // schema bump.
   handoffs?: HandoffRecord[];
+  // Persistent `/goal` loop state. Omitted when no goal is set. Even
+  // after the loop ends (met / exhausted / cancelled) we keep the
+  // record around so the header chip can render the final outcome
+  // until the user explicitly clears it or starts a fresh chat.
+  goal?: SessionGoal;
+}
+
+// SessionGoal is the persistent loop condition set via `/goal <text>`.
+// Mirrors Claude Code CLI's goal feature: a directive the model keeps
+// working toward across multiple turns until it emits the literal
+// [GOAL_MET] sentinel in a reply, at which point the loop ends. The
+// orchestrator handles the loop server-side by auto-pushing a
+// "continue" user message after each `result` while status === "active".
+//
+// iterations counts how many auto-continues have fired (the first turn
+// — when the user set the goal — is iteration 0). max_iterations is a
+// safety cap so a model that never volunteers [GOAL_MET] doesn't burn
+// budget forever. Once hit we flip status to "exhausted" and stop.
+export interface SessionGoal {
+  text: string;
+  // ISO-8601 wall-clock the goal was set. Used by the header chip to
+  // render an age ("set 2m ago").
+  set_at: string;
+  iterations: number;
+  max_iterations: number;
+  // active: the loop is running, will auto-continue at next result.
+  // met: model emitted [GOAL_MET]; loop is done.
+  // exhausted: hit max_iterations without [GOAL_MET]; loop is done.
+  // cancelled: user ran `/goal clear` (or interrupted the session).
+  status: "active" | "met" | "exhausted" | "cancelled";
 }
 
 // SubagentSummary describes one Task tool_use spawn. The Task tool's
@@ -322,6 +352,11 @@ export type ChatEvent =
   // a "→ codex" divider between the last Claude assistant turn and
   // the first codex turn.
   | { type: "handoff"; data: HandoffRecord }
+  // Fired whenever the session's /goal state changes: a new goal is
+  // set, an iteration ticks, the model emits [GOAL_MET], the safety
+  // cap fires, or the user clears it. data === null means no goal is
+  // currently set (post-clear).
+  | { type: "goal_updated"; data: SessionGoal | null }
   // Sentinel emitted by the SSE route AFTER it finishes replaying
   // history. The client uses this to know when items.length is final
   // (no more historical messages will arrive in this burst), so the

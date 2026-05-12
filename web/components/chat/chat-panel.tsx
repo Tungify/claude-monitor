@@ -2,7 +2,7 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
-import { ArrowDown } from "lucide-react";
+import { ArrowDown, Target, X } from "lucide-react";
 import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 import { Virtuoso, type VirtuosoHandle } from "react-virtuoso";
 import { useChatSession } from "@/hooks/use-chat-session";
@@ -23,6 +23,7 @@ import type {
   HandoffRecord,
   PermissionMode,
   SessionProvider,
+  SessionGoal,
   SessionSummary,
   SessionUsage,
   StreamingBlock,
@@ -891,6 +892,9 @@ export function ChatPanel({ session }: Props) {
             </div>
           </div>
           <div className="pointer-events-auto flex shrink-0 items-center gap-2">
+            {chat.goal && (
+              <GoalChip goal={chat.goal} onClear={() => void chat.setGoal(null)} />
+            )}
             {!closed && (
               <Button variant="outline" size="sm" onClick={() => chat.stop()}>
                 Stop
@@ -1377,6 +1381,72 @@ function StatusBadge({ status }: { status: SessionSummary["status"] }) {
           ? "secondary"
           : "default";
   return <Badge variant={variant}>{status.replace("_", " ")}</Badge>;
+}
+
+// GoalChip surfaces the persistent /goal loop in the header. Truncates
+// the goal text aggressively (the chip lives next to the Stop button
+// in a crowded toolbar); the full text shows in the native title
+// tooltip and the slash-command output. Status colours mirror the
+// finished outcomes: emerald for met, amber for exhausted, muted for
+// cancelled, primary while active.
+function GoalChip({
+  goal,
+  onClear,
+}: {
+  goal: SessionGoal;
+  onClear: () => void;
+}) {
+  const tone =
+    goal.status === "met"
+      ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300"
+      : goal.status === "exhausted"
+        ? "border-amber-500/40 bg-amber-500/10 text-amber-700 dark:text-amber-300"
+        : goal.status === "cancelled"
+          ? "border-muted-foreground/30 bg-muted/40 text-muted-foreground"
+          : "border-primary/40 bg-primary/10 text-primary";
+  const counter =
+    goal.status === "active"
+      ? `${goal.iterations}/${goal.max_iterations}`
+      : goal.status;
+  const truncated =
+    goal.text.length > 40 ? `${goal.text.slice(0, 40)}…` : goal.text;
+  return (
+    <span
+      title={`Goal: ${goal.text}\nStatus: ${goal.status}\nIterations: ${goal.iterations}/${goal.max_iterations}\nSet ${formatSetAt(goal.set_at)}`}
+      className={`inline-flex max-w-[260px] items-center gap-1.5 rounded-full border px-2 py-0.5 text-xs ${tone}`}
+    >
+      <Target className="size-3 shrink-0" aria-hidden />
+      <span className="truncate font-medium">{truncated}</span>
+      <span className="shrink-0 font-mono tabular-nums opacity-70">
+        {counter}
+      </span>
+      <button
+        type="button"
+        onClick={onClear}
+        aria-label="Clear goal"
+        className="inline-flex size-4 shrink-0 items-center justify-center rounded-full hover:bg-foreground/10"
+      >
+        <X className="size-3" aria-hidden />
+      </button>
+    </span>
+  );
+}
+
+// formatSetAt renders the ISO timestamp on a SessionGoal as a relative
+// age ("2m ago", "1h ago"). Falls back to the raw ISO when parsing
+// fails so we never render NaN.
+function formatSetAt(iso: string): string {
+  const t = Date.parse(iso);
+  if (!Number.isFinite(t)) return iso;
+  const diffMs = Date.now() - t;
+  const sec = Math.max(0, Math.round(diffMs / 1000));
+  if (sec < 60) return `${sec}s ago`;
+  const min = Math.round(sec / 60);
+  if (min < 60) return `${min}m ago`;
+  const hr = Math.round(min / 60);
+  if (hr < 24) return `${hr}h ago`;
+  const day = Math.round(hr / 24);
+  return `${day}d ago`;
 }
 
 // runChatCommand is the dispatcher for slash commands typed inside an
@@ -2132,6 +2202,55 @@ async function runChatCommand(
 
     case "rewind": {
       ctx.openRewind();
+      return;
+    }
+
+    case "goal": {
+      // `/goal` (no args) or `/goal show` → describe current state.
+      // `/goal clear` (alias `off`, `stop`) → cancel an active loop.
+      // `/goal <text>` → arm/replace the loop with that text.
+      const raw = parsed.args.trim();
+      const lc = raw.toLowerCase();
+      const isClear = raw === "" ? false : ["clear", "off", "stop", "cancel"].includes(lc);
+      if (raw === "") {
+        const g = ctx.chat.goal;
+        if (!g) {
+          ctx.appendOutput({
+            echo: parsed.raw,
+            subtitle: "Goal",
+            body:
+              "No goal set. Type `/goal <text>` to start a persistent loop. " +
+              "Claude works toward it across turns until it emits `[GOAL_MET]` " +
+              "or the safety cap (12 continues) trips.",
+          });
+        } else {
+          ctx.appendOutput({
+            echo: parsed.raw,
+            subtitle: "Goal",
+            body:
+              `**Status:** ${g.status}  ·  **Iterations:** ${g.iterations}/${g.max_iterations}\n\n` +
+              `**Goal:** ${g.text}\n\n` +
+              `Set ${formatSetAt(g.set_at)}. Type \`/goal clear\` to cancel.`,
+          });
+        }
+        return;
+      }
+      try {
+        await ctx.chat.setGoal(isClear ? null : raw);
+        ctx.appendOutput({
+          echo: parsed.raw,
+          subtitle: "Goal",
+          body: isClear
+            ? "_Goal cleared._"
+            : `_Goal armed:_ **${raw}**\n\nClaude will continue across turns until it emits \`[GOAL_MET]\` or hits the safety cap.`,
+        });
+      } catch (err) {
+        ctx.appendOutput({
+          echo: parsed.raw,
+          tone: "error",
+          body: `Failed to update goal: ${err instanceof Error ? err.message : String(err)}`,
+        });
+      }
       return;
     }
 

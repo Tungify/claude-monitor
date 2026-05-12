@@ -51,6 +51,13 @@ export const CHAT_COMMANDS: SlashCommand[] = [
     group: "Conversation",
   },
   {
+    name: "goal",
+    argHint: "<text> | clear",
+    description:
+      "Set a persistent goal Claude works toward until it emits [GOAL_MET]",
+    group: "Conversation",
+  },
+  {
     name: "rewind",
     description: "Restore file edits and conversation to a snapshot",
     group: "Conversation",

@@ -65,6 +65,7 @@ import type {
   PermissionMode,
   PermissionRequest,
   RateLimitInfo,
+  SessionGoal,
   SessionProvider,
   SessionSnapshot,
   SessionStatus,
@@ -173,6 +174,11 @@ interface ChatSession {
   // is in flight, or codex respawn is queued). Guards re-entry: a
   // user can't fire two handoffs simultaneously.
   handoffInFlight?: boolean;
+  // Persistent `/goal` loop. While status === "active" the driver auto-
+  // pushes a "continue" user message after each `result` until the
+  // assistant emits the [GOAL_MET] sentinel or iterations hits the cap.
+  // See SessionGoal in chat-types for the full state machine.
+  goal?: SessionGoal;
 }
 
 // InterruptedSession is the on-restart shadow of a ChatSession: just
@@ -202,6 +208,12 @@ interface InterruptedSession {
   // Handoffs survive a restart so a session that was already routed
   // through codex resumes through codex (not back through claude).
   handoffs?: HandoffRecord[];
+  // /goal state survives restart as a record — but a goal that was
+  // "active" when the daemon died gets restored as "cancelled" on
+  // resume below: the SDK Query is gone, the auto-continue loop is
+  // broken, and we don't want a silent restart to re-arm a runaway
+  // loop. The user can re-issue `/goal <text>` if they still want it.
+  goal?: SessionGoal;
 }
 
 // Stash the registries on globalThis so they survive Next.js dev module
@@ -269,6 +281,14 @@ async function initFromDisk(): Promise<void> {
         rateLimit: s.rate_limit,
         rateLimitObservedAt: s.rate_limit_observed_at,
         handoffs: s.handoffs,
+        // Re-arm a persisted goal in the dormant "cancelled" state
+        // (see InterruptedSession.goal note). The record stays so the
+        // chip can still show "Goal — <text> (cancelled at restart)";
+        // user re-issues `/goal <text>` to revive the loop.
+        goal:
+          s.goal && s.goal.status === "active"
+            ? { ...s.goal, status: "cancelled" }
+            : s.goal,
       });
     }
     if (stored.length > 0) {
@@ -467,6 +487,7 @@ async function persistNow(id: string): Promise<void> {
       rate_limit: s.rateLimit,
       rate_limit_observed_at: s.rateLimitObservedAt,
       handoffs: s.handoffs,
+      goal: s.goal,
     };
     await persistStoredSession(stored);
   } catch (err) {
@@ -522,6 +543,7 @@ function summarize(session: ChatSession): SessionSummary {
     handoffs: session.handoffs && session.handoffs.length > 0
       ? session.handoffs
       : undefined,
+    goal: session.goal,
   };
 }
 
@@ -1560,6 +1582,12 @@ async function driveSession(session: ChatSession): Promise<void> {
       if (msg.type === "result") {
         setStatus(session, "idle");
         void refreshContextUsage(session);
+        // /goal auto-continue: if the user set a persistent goal and
+        // the assistant didn't emit the [GOAL_MET] sentinel, push the
+        // next "continue" user message so the SDK keeps working. Runs
+        // here (post-status-flip, pre-rate-limit) so the loop fires
+        // even on tool-light turns where no rate_limit_event happens.
+        advanceGoalLoop(session);
       } else if (msg.type === "rate_limit_event") {
         // SDK auto-retries internally up to CLAUDE_CODE_MAX_RETRIES;
         // we observe so the UI can render a countdown. We DON'T
@@ -1637,6 +1665,7 @@ function summarizeInterrupted(s: InterruptedSession): SessionSummary {
     rate_limit: s.rateLimit,
     rate_limit_observed_at: s.rateLimitObservedAt,
     handoffs: s.handoffs && s.handoffs.length > 0 ? s.handoffs : undefined,
+    goal: s.goal,
   };
 }
 
@@ -1711,6 +1740,151 @@ export function emitPlanEvent(
   const s = getOrResume(sessionId);
   if (!s) throw new Error("session not found");
   emit(s, { type, data: plan });
+}
+
+// Default safety cap for /goal auto-continue. Sized empirically: a
+// well-scoped goal usually wraps in 3–6 turns; 12 lets a moderately
+// complex one finish without burning a 5-hour window on a runaway.
+// Hit the cap → status flips to "exhausted" and the loop stops.
+const GOAL_MAX_ITERATIONS = 12;
+
+// The literal sentinel the model must emit (as part of its assistant
+// text) to mark the goal as accomplished. Matched case-insensitive,
+// flexible on the separator so [GOAL MET] / [goal-met] / [GoalMet]
+// all work — the model isn't perfectly literal.
+const GOAL_MET_PATTERN = /\[\s*goal[\s_-]?met\s*\]/i;
+
+// Sentinel injected when /goal is first set. Prefixes the user's goal
+// text and frames the loop contract for the model: keep working, end
+// with [GOAL_MET]. We send it via sendMessage so it appears as a
+// regular user message in history — that way the chat surface is
+// honest about what's driving subsequent turns.
+function buildGoalPrimer(text: string, maxIterations: number): string {
+  return [
+    `## /goal directive`,
+    ``,
+    `You have just been given a persistent goal. Work on it autonomously across multiple turns; do not stop and ask for permission between turns. Use your tools, plan, and iterate.`,
+    ``,
+    `**Goal:** ${text}`,
+    ``,
+    `When the goal is complete, end that turn's reply with the literal sentinel \`[GOAL_MET]\` on its own line. The orchestrator watches for it and will stop the auto-continue loop. If you genuinely cannot make progress (missing access, ambiguous requirement, hard error you can't resolve) say so plainly — the user will intervene.`,
+    ``,
+    `Safety cap: the loop will auto-stop after ${maxIterations} continues if no \`[GOAL_MET]\` is emitted. Pace yourself — don't burn turns on filler updates.`,
+    ``,
+    `Begin now.`,
+  ].join("\n");
+}
+
+// Continue prompt pushed after each result while the goal is still
+// active. Kept terse so it doesn't dilute the goal directive that's
+// still anchoring the conversation upstream.
+function buildGoalContinue(text: string, iteration: number): string {
+  return `continue toward goal (${iteration}/${GOAL_MAX_ITERATIONS}): ${text}`;
+}
+
+function lastTopLevelAssistantText(history: SDKMessage[]): string {
+  for (let i = history.length - 1; i >= 0; i--) {
+    const m = history[i];
+    if (m.type !== "assistant") continue;
+    const parent = (m as { parent_tool_use_id?: string | null })
+      .parent_tool_use_id;
+    if (parent) continue;
+    const content = m.message?.content;
+    if (!Array.isArray(content)) return "";
+    const parts: string[] = [];
+    for (const b of content) {
+      if ((b as { type?: string }).type === "text") {
+        const t = (b as { text?: string }).text;
+        if (typeof t === "string") parts.push(t);
+      }
+    }
+    return parts.join("\n");
+  }
+  return "";
+}
+
+function emitGoalUpdated(session: ChatSession): void {
+  emit(session, { type: "goal_updated", data: session.goal ?? null });
+  schedulePersist(session.id);
+}
+
+// advanceGoalLoop runs on every `result` message. Skips silently when
+// no goal is active. When active:
+//   - if the last assistant text contains the [GOAL_MET] sentinel,
+//     flip to "met" and stop the loop;
+//   - if we've hit the iteration cap, flip to "exhausted" and stop;
+//   - else bump the counter and push a continue user message so the
+//     SDK iterator picks up the next turn.
+function advanceGoalLoop(session: ChatSession): void {
+  const goal = session.goal;
+  if (!goal || goal.status !== "active") return;
+  const lastText = lastTopLevelAssistantText(session.history);
+  if (GOAL_MET_PATTERN.test(lastText)) {
+    session.goal = { ...goal, status: "met" };
+    emitGoalUpdated(session);
+    return;
+  }
+  const next = goal.iterations + 1;
+  if (next > goal.max_iterations) {
+    session.goal = { ...goal, status: "exhausted" };
+    emitGoalUpdated(session);
+    return;
+  }
+  session.goal = { ...goal, iterations: next };
+  emitGoalUpdated(session);
+  try {
+    sendMessage(session.id, buildGoalContinue(goal.text, next));
+  } catch (err) {
+    // Failing to push the continue (session went away, closed) just
+    // ends the loop quietly — the goal record stays so the UI can
+    // show the partial progress.
+    console.warn(`[sessions] goal continue push failed for ${session.id}:`, err);
+  }
+}
+
+// setSessionGoal is the public entry for /goal. Pass a non-empty text
+// to (re)arm the loop and prime it with a directive prompt; pass null
+// to cancel an active loop (the record flips to "cancelled" so the UI
+// chip can render the final state). Returns the resulting goal record
+// (or null when cleared) so the route can echo it back to the client.
+export function setSessionGoal(
+  sessionId: string,
+  text: string | null,
+): SessionGoal | null {
+  const s = getOrResume(sessionId);
+  if (!s) throw new Error("session not found");
+  if (text === null || text.trim() === "") {
+    // Clear: drop the record entirely (chip disappears). The
+    // auto-continue loop is gated on goal?.status === "active", so
+    // setting goal to undefined here also stops the next push.
+    s.goal = undefined;
+    emitGoalUpdated(s);
+    return null;
+  }
+  const trimmed = text.trim();
+  s.goal = {
+    text: trimmed,
+    set_at: new Date().toISOString(),
+    iterations: 0,
+    max_iterations: GOAL_MAX_ITERATIONS,
+    status: "active",
+  };
+  emitGoalUpdated(s);
+  // Prime the loop with the directive as a real user message so the
+  // SDK starts working on it. Subsequent continues are pushed by
+  // advanceGoalLoop after each result.
+  try {
+    sendMessage(sessionId, buildGoalPrimer(trimmed, GOAL_MAX_ITERATIONS));
+  } catch (err) {
+    // If the primer push fails (session closed, queue full, ...),
+    // demote the record to "cancelled" so the UI doesn't claim we're
+    // looping when nothing actually queued. Don't throw — the route
+    // already validated the session exists; this is best-effort.
+    s.goal = { ...s.goal, status: "cancelled" };
+    emitGoalUpdated(s);
+    console.warn(`[sessions] goal primer push failed for ${sessionId}:`, err);
+  }
+  return s.goal;
 }
 
 const REQUEST_DEDUPE_TTL_MS = 30_000;
@@ -2586,6 +2760,14 @@ export function interruptTurn(
     s.status !== "rate_limited"
   ) {
     return { ok: false, reason: "not_running" };
+  }
+  // Interrupt also kills any in-flight /goal auto-continue loop. The
+  // user explicitly hit stop; auto-pushing another "continue" message
+  // after respawn would be insulting. Record stays so the chip can
+  // show "cancelled" until the user clears it or starts a fresh goal.
+  if (s.goal && s.goal.status === "active") {
+    s.goal = { ...s.goal, status: "cancelled" };
+    emitGoalUpdated(s);
   }
   emit(s, { type: "turn_interrupted", data: {} });
   respawnQuery(s);

@@ -11,6 +11,7 @@ import type {
   HandoffRecord,
   PermissionMode,
   RateLimitInfo,
+  SessionGoal,
   SessionProvider,
   SessionUsage,
 } from "@/lib/chat-types";
@@ -57,6 +58,12 @@ export interface StoredSession {
   // Persisted so a daemon restart resumes codex turns against the
   // recorded auth slot + model without losing the summary preamble.
   handoffs?: HandoffRecord[];
+  // Persistent /goal loop state, if any. Persisted so a daemon
+  // restart of an in-flight goal keeps the loop intent visible (the
+  // status flips to "cancelled" on restart since the underlying
+  // SDK Query is gone — user has to re-issue `/goal <text>` to
+  // resume the loop). Bare metadata, no callbacks.
+  goal?: SessionGoal;
 }
 
 // One JSON file per session keeps writes scoped (a 5MB conversation

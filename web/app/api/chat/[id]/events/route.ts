@@ -57,6 +57,12 @@ export async function GET(req: Request, { params }: Ctx) {
       if (snap.summary.context_usage) {
         writeEvent({ type: "context_usage", data: snap.summary.context_usage });
       }
+      // Replay /goal state so the header chip shows the live loop
+      // (or its final outcome) right after reconnect instead of
+      // waiting for the next mutation.
+      if (snap.summary.goal) {
+        writeEvent({ type: "goal_updated", data: snap.summary.goal });
+      }
       if (snap.pending_permission) {
         writeEvent({ type: "permission_request", data: snap.pending_permission });
       }

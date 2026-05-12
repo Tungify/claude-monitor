@@ -9,6 +9,7 @@ import type {
   HandoffRecord,
   PermissionDecision,
   PermissionRequest,
+  SessionGoal,
   SessionStatus,
   SessionUsage,
   StreamingBlock,
@@ -53,6 +54,13 @@ interface State {
   // when a fresh handoff fires. Used by chat-panel to drop boundary
   // cards at the right history indices.
   handoffs: HandoffRecord[];
+  // Active or recently-finished /goal loop. Replayed on connect via
+  // a synthetic goal_updated event so the header chip lights up
+  // without waiting for the next mutation. `null` means no goal is
+  // set; non-null carries the full state record (text + status +
+  // iteration counters) regardless of whether the loop is still
+  // running.
+  goal: SessionGoal | null;
 }
 
 type Action =
@@ -70,6 +78,7 @@ type Action =
   | { kind: "queue_edited"; msg: SDKMessage }
   | { kind: "queue_cancelled"; uuid: string }
   | { kind: "handoff"; record: HandoffRecord }
+  | { kind: "goal_updated"; goal: SessionGoal | null }
   | { kind: "turn_interrupted" }
   | { kind: "hydrated" }
   // Wipe state back to the initial shape. Dispatched whenever the
@@ -319,6 +328,8 @@ function reducer(state: State, action: Action): State {
       if (exists) return state;
       return { ...state, handoffs: [...state.handoffs, action.record] };
     }
+    case "goal_updated":
+      return { ...state, goal: action.goal };
     case "turn_interrupted":
       return { ...state, streamingBlocks: [], streamingUsage: null };
     case "hydrated":
@@ -347,6 +358,7 @@ const initial: State = {
   contextUsage: null,
   hydrated: false,
   handoffs: [],
+  goal: null,
 };
 
 export interface UseChatSession extends State {
@@ -365,6 +377,10 @@ export interface UseChatSession extends State {
   // returns 409 once a message is in flight.
   editQueued: (uuid: string, text: string) => Promise<void>;
   cancelQueued: (uuid: string) => Promise<void>;
+  // setGoal arms a `/goal` loop with the given text, or clears it when
+  // passed null. Errors land in the chat_error stream just like the
+  // other helpers — no throw at the call site.
+  setGoal: (text: string | null) => Promise<void>;
   // Subagent grouping derived from history. byTaskId is keyed by Task
   // tool_use_id; childrenByTaskId carries the SDKMessages emitted while
   // the subagent ran; resultTaskIds names tasks whose tool_result echo
@@ -482,6 +498,10 @@ export function useChatSession(sessionId: string): UseChatSession {
     });
     es.addEventListener("turn_interrupted", () => {
       dispatch({ kind: "turn_interrupted" });
+    });
+    es.addEventListener("goal_updated", (e) => {
+      const goal = JSON.parse((e as MessageEvent).data) as SessionGoal | null;
+      dispatch({ kind: "goal_updated", goal });
     });
     es.addEventListener("history_replayed", () => {
       dispatch({ kind: "hydrated" });
@@ -624,6 +644,23 @@ export function useChatSession(sessionId: string): UseChatSession {
     }
   };
 
+  // /goal control — arm (text) or clear (clear:true) the persistent
+  // loop. Server pushes the directive primer on arm and the continue
+  // nudges on each result; we just kick it off.
+  const setGoal = async (text: string | null) => {
+    const body =
+      text === null ? JSON.stringify({ clear: true }) : JSON.stringify({ text });
+    const res = await fetch(`/api/chat/${sessionId}/goal`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body,
+    });
+    if (!res.ok) {
+      const detail = await res.text();
+      dispatch({ kind: "chat_error", message: `goal failed: ${detail}` });
+    }
+  };
+
   // Recompute subagent grouping when history changes. Cheap walk —
   // history is capped at 1000 messages and most chats stay under 200.
   // useMemo (not React Compiler — the input is a stable Map/Set so we
@@ -659,6 +696,7 @@ export function useChatSession(sessionId: string): UseChatSession {
     interrupt,
     editQueued,
     cancelQueued,
+    setGoal,
     subagents: derived.list,
     subagentsByTaskId: derived.byTaskId,
     subagentChildrenByTaskId: derived.childrenByTaskId,
