@@ -280,43 +280,34 @@ export function Composer(props: Props) {
     caretToEnd();
   };
 
-  // History recall fires only when the caret has nowhere to go
-  // vertically — which we detect by letting the browser handle ↑/↓
-  // first and checking whether the selection actually moved. This is
-  // visual-line aware (a long wrapped single-line counts as multiple
-  // rows even with zero \n in the source), unlike a logical-line
-  // check on selectionStart.
-  const tryHistoryAfterArrow = (direction: "up" | "down") => {
+  // History recall fires only when the caret is at the absolute
+  // boundary of the textarea (position 0 for ↑, value.length for ↓).
+  // The earlier "wait a microtask, see if the browser moved the
+  // caret" approach raced the default-action timing — in practice
+  // microtasks sometimes flushed before the keydown's default ran,
+  // so a multi-line draft would lose its in-progress text to a
+  // history recall on a plain row-up press. With Enter=newline as
+  // the composer convention, multi-line drafts have explicit \n
+  // boundaries; checking the caret position is deterministic and
+  // matches bash/zsh + the Claude CLI REPL.
+  const tryHistoryAfterArrow = (direction: "up" | "down"): boolean => {
     const ta = taRef.current;
     const list = props.history;
-    if (!ta || !list || list.length === 0) return;
-    const beforeStart = ta.selectionStart;
-    const beforeEnd = ta.selectionEnd;
-    // queueMicrotask runs after the browser's default arrow-key
-    // handler has updated selectionStart/End. If the caret didn't
-    // move, we've hit the top/bottom edge — pop history then.
-    queueMicrotask(() => {
-      if (!taRef.current) return;
-      const ta2 = taRef.current;
-      if (
-        ta2.selectionStart !== beforeStart ||
-        ta2.selectionEnd !== beforeEnd
-      ) {
-        // Caret moved within the textarea; the user is navigating
-        // rows, not asking for history.
-        return;
-      }
-      if (direction === "up") {
-        const next =
-          historyIdx === null ? list.length - 1 : historyIdx - 1;
-        recallHistory(next);
-      } else {
-        if (historyIdx === null) return;
-        const next = historyIdx + 1;
-        if (next >= list.length) exitHistory();
-        else recallHistory(next);
-      }
-    });
+    if (!ta || !list || list.length === 0) return false;
+    const start = ta.selectionStart;
+    const end = ta.selectionEnd;
+    if (direction === "up") {
+      if (start !== 0 || end !== 0) return false;
+      const next = historyIdx === null ? list.length - 1 : historyIdx - 1;
+      recallHistory(next);
+      return true;
+    }
+    if (start !== ta.value.length || end !== ta.value.length) return false;
+    if (historyIdx === null) return false;
+    const next = historyIdx + 1;
+    if (next >= list.length) exitHistory();
+    else recallHistory(next);
+    return true;
   };
 
   // submitText accepts an optional override so the slash-menu can submit
@@ -429,20 +420,25 @@ export function Composer(props: Props) {
     // handle the key first means the composition finishes before any
     // submit/menu logic runs.
     if (e.nativeEvent.isComposing || e.keyCode === 229) return;
-    // Terminal-style history recall. We DO NOT preventDefault here —
-    // the browser handles ↑/↓ for row navigation (including visually
-    // wrapped lines), and tryHistoryAfterArrow re-checks the caret in
-    // a microtask. If the caret didn't move, the user has hit the
-    // top/bottom edge and we pop the history index instead.
+    // Terminal-style history recall. Only fires when the caret is
+    // at the textarea's start (↑) or end (↓); anywhere else we leave
+    // the keystroke alone so the browser performs normal row
+    // navigation (including across visually wrapped lines).
     if (
       !menuOpen &&
       (e.key === "ArrowUp" || e.key === "ArrowDown") &&
       props.history &&
       props.history.length > 0
     ) {
-      tryHistoryAfterArrow(e.key === "ArrowUp" ? "up" : "down");
-      // Fall through — don't return. Other handlers below are gated
-      // by different keys so they won't fire on arrows.
+      const fired = tryHistoryAfterArrow(
+        e.key === "ArrowUp" ? "up" : "down",
+      );
+      if (fired) {
+        e.preventDefault();
+        return;
+      }
+      // Fall through — caret wasn't at the boundary, let the
+      // browser move the cursor as usual.
     }
     if (menuOpen) {
       if (e.key === "ArrowDown") {
@@ -583,7 +579,8 @@ export function Composer(props: Props) {
             aria-hidden
             className="pointer-events-none absolute right-0 bottom-0 left-0 h-[2px] overflow-hidden rounded-full"
           >
-            <div className="cm-script-sweep h-full w-1/3 bg-gradient-to-r from-transparent via-emerald-500 to-transparent" />
+            <div className="cm-script-sweep absolute inset-y-0 left-0 w-1/3 bg-gradient-to-r from-transparent via-emerald-500 to-transparent" />
+            <div className="cm-script-sweep cm-script-sweep-offset absolute inset-y-0 left-0 w-1/3 bg-gradient-to-r from-transparent via-emerald-500 to-transparent" />
           </div>
         )}
       </div>

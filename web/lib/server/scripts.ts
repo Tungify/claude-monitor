@@ -2,7 +2,7 @@ import "server-only";
 
 import { spawn, type ChildProcessByStdio } from "node:child_process";
 import { readFile, stat } from "node:fs/promises";
-import type { Readable } from "node:stream";
+import type { Readable, Writable } from "node:stream";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 
@@ -57,7 +57,7 @@ interface RunHandle {
   output: OutputChunk[];
   outputBytes: number;
   truncated: boolean;
-  process: ChildProcessByStdio<null, Readable, Readable> | null;
+  process: ChildProcessByStdio<Writable, Readable, Readable> | null;
   listeners: Set<RunListener>;
 }
 
@@ -172,21 +172,15 @@ function cmdForRun(
   return { cmd: "npm", args: ["run", name] };
 }
 
-// Strip the most common ANSI escape sequences so colored npm output
-// lands as readable text in the browser. We're not building a
-// terminal emulator; keeping it plain avoids a dep on ansi-up etc.
-const ANSI_RE = /\x1B\[[0-9;?]*[A-Za-z]/g;
-
 function pushChunk(run: RunHandle, stream: "stdout" | "stderr", raw: string) {
-  const cleaned = raw.replace(ANSI_RE, "");
-  if (!cleaned) return;
+  if (!raw) return;
   const chunk: OutputChunk = {
     ts: new Date().toISOString(),
     stream,
-    data: cleaned,
+    data: raw,
   };
   run.output.push(chunk);
-  run.outputBytes += cleaned.length;
+  run.outputBytes += raw.length;
   // Trim from the front whenever either bound trips. Loop because a
   // single huge chunk could put us multiple chunks over the byte cap.
   while (
@@ -219,11 +213,22 @@ export async function startRun(
   // SIGTERM the whole tree on cancel (npm scripts routinely fork a
   // second process via sh -c). We don't unref — we want to keep the
   // Node process alive while a run is in flight.
+  //
+  // stdin is piped (not "ignore") so the popover can forward typed
+  // input from the user — necessary whenever a script prompts for
+  // y/n confirmation, a password, a choice, etc. We're not allocating
+  // a pty, so tools that gate features on `isTTY` won't behave
+  // exactly like a terminal, but anything that reads stdin via the
+  // ordinary `read`/`process.stdin` path works fine.
+  //
+  // FORCE_COLOR=1 keeps colorized output enabled even though stdout
+  // isn't a TTY — the client side parses ANSI SGR codes into styled
+  // spans so logs read like they do in a terminal.
   const proc = spawn(cmd, args, {
     cwd,
     detached: true,
-    env: { ...process.env, FORCE_COLOR: "0", CI: "1" },
-    stdio: ["ignore", "pipe", "pipe"],
+    env: { ...process.env, FORCE_COLOR: "1", CI: "1" },
+    stdio: ["pipe", "pipe", "pipe"],
   });
   const run: RunHandle = {
     id,
@@ -320,6 +325,27 @@ export function subscribeRun(runId: string, cb: RunListener): () => void {
   return () => {
     r.listeners.delete(cb);
   };
+}
+
+// Forward a chunk of typed input to the child's stdin. We surface the
+// echo back into the output buffer (tagged as stdout) so the popover
+// shows what was sent — the child isn't running on a TTY so it won't
+// echo typed input on its own, and seeing the prompt followed by a
+// blank gap is confusing. Returns false when the run is gone, has
+// already exited, or stdin is no longer writable.
+export function writeInput(runId: string, data: string): boolean {
+  const r = RUNS.get(runId);
+  if (!r) return false;
+  if (r.endedAt !== null) return false;
+  const proc = r.process;
+  if (!proc || !proc.stdin || proc.stdin.destroyed) return false;
+  try {
+    proc.stdin.write(data);
+    pushChunk(r, "stdout", data);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 export function cancelRun(runId: string): boolean {

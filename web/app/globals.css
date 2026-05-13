@@ -299,16 +299,27 @@
   }
 }
 
-/* Indeterminate sweep for the script-runner row indicator. A narrow
-   gradient slides across the composer's top chip row while a script
-   is executing, so the user has a passive "something is running" cue
-   even when they've scrolled away from the popover. */
+/* Indeterminate sweep for the script-runner row indicator. The row
+   below the composer's top chip cluster shows a continuous flow of
+   emerald peaks while a script is running.
+   Two translated bars run with the same keyframes but a half-period
+   phase offset — when one bar's peak is exiting the right edge, the
+   other's peak is entering from the left, so there's never a frame
+   where the row goes dark mid-cycle. translateX percentages are
+   relative to the bar's own width (1/3 of the track), so -100% lands
+   its right edge at 0% of the track (just off-screen left) and 300%
+   lands its left edge at 100% (just off-screen right). Linear easing
+   keeps the speed constant; ease-in-out would visually pile the
+   bars up at the endpoints. */
 @keyframes cm-script-sweep {
-  0% { transform: translateX(-40%); }
-  100% { transform: translateX(140%); }
+  0%   { transform: translateX(-100%); }
+  100% { transform: translateX(300%); }
 }
 .cm-script-sweep {
-  animation: cm-script-sweep 1.4s ease-in-out infinite;
+  animation: cm-script-sweep 1.6s linear infinite;
+}
+.cm-script-sweep-offset {
+  animation-delay: -0.8s;
 }
 
 /* Markdown table polish. Default react-markdown tables render flush

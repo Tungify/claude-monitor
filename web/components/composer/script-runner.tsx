@@ -1,9 +1,17 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type KeyboardEvent,
+} from "react";
 import {
   Check,
   ChevronDown,
+  CornerDownLeft,
   Loader2,
   Play,
   Square,
@@ -15,6 +23,7 @@ import {
   PopoverContent,
   PopoverTrigger,
 } from "@/components/ui/popover";
+import { renderAnsi } from "@/lib/ansi";
 import { cn } from "@/lib/utils";
 
 interface ScriptInfo {
@@ -298,6 +307,26 @@ export function ScriptRunner({
     }
   };
 
+  // Forward a line of typed input to the child process's stdin.
+  // We append "\n" here rather than asking callers to do it — every
+  // call site is "user pressed Enter to send a line", and forgetting
+  // the newline would leave the child blocked on its `read`.
+  const sendInput = async (line: string) => {
+    if (!run || run.endedAt !== null) return;
+    try {
+      await fetch(`/api/scripts/run/${run.id}/input`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ data: line + "\n" }),
+      });
+    } catch {
+      // Best-effort — if the request fails the user can retry by
+      // typing again. We don't surface this as an error because the
+      // most common cause is the child exiting between keystrokes,
+      // which already shows up as the "done" state.
+    }
+  };
+
   const dismissRun = () => {
     setRun(null);
     setStartError(null);
@@ -392,6 +421,7 @@ export function ScriptRunner({
             elapsedMs={elapsedMs}
             onCancel={cancel}
             onDismiss={dismissRun}
+            onInput={sendInput}
             outputRef={outputRef}
             onScroll={(pinned) => {
               outputPinnedRef.current = pinned;
@@ -526,6 +556,7 @@ function RunView({
   elapsedMs,
   onCancel,
   onDismiss,
+  onInput,
   outputRef,
   onScroll,
 }: {
@@ -533,6 +564,7 @@ function RunView({
   elapsedMs: number;
   onCancel: () => void;
   onDismiss: () => void;
+  onInput: (line: string) => void | Promise<void>;
   outputRef: React.RefObject<HTMLDivElement | null>;
   onScroll: (pinned: boolean) => void;
 }) {
@@ -543,6 +575,25 @@ function RunView({
     : ok
       ? "done"
       : `failed (${run.exitCode ?? run.signal ?? "?"})`;
+  const [stdinDraft, setStdinDraft] = useState("");
+
+  const submitStdin = () => {
+    void onInput(stdinDraft);
+    setStdinDraft("");
+  };
+
+  const onStdinKey = (e: KeyboardEvent<HTMLInputElement>) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      submitStdin();
+    }
+  };
+
+  // ANSI rendering is intentionally memoised on the raw string so the
+  // expensive parse only runs when new bytes have actually arrived,
+  // not on every parent re-render (1Hz elapsed tick, scroll changes,
+  // etc.).
+  const rendered = useMemo(() => renderAnsi(run.output), [run.output]);
 
   return (
     <div className="flex max-h-[28rem] flex-col">
@@ -590,19 +641,53 @@ function RunView({
           const pinned = el.scrollHeight - el.scrollTop - el.clientHeight < 24;
           onScroll(pinned);
         }}
-        className="min-h-0 flex-1 overflow-y-auto whitespace-pre-wrap break-words bg-muted/40 p-2 font-mono text-[10.5px] leading-relaxed"
+        className="min-h-0 flex-1 overflow-y-auto whitespace-pre-wrap break-words bg-zinc-950 p-2 font-mono text-[10.5px] leading-relaxed text-zinc-100"
       >
         {run.truncated && (
-          <div className="mb-1 text-[10px] italic text-muted-foreground">
+          <div className="mb-1 text-[10px] italic text-zinc-400">
             (older output trimmed)
           </div>
         )}
-        {run.output || (
-          <span className="text-muted-foreground">
+        {run.output ? (
+          rendered
+        ) : (
+          <span className="text-zinc-400">
             {finished ? "(no output)" : "Waiting for output…"}
           </span>
         )}
       </div>
+      {/* stdin row — only while the script is still alive. The child
+          isn't on a TTY so prompts won't always look "real", but
+          anything reading stdin via the normal `read`/`process.stdin`
+          path will receive each line on Enter. */}
+      {!finished && (
+        <div className="flex items-center gap-1.5 border-t px-2 py-1.5">
+          <span className="font-mono text-[10.5px] text-muted-foreground select-none">
+            $
+          </span>
+          <input
+            type="text"
+            value={stdinDraft}
+            onChange={(e) => setStdinDraft(e.target.value)}
+            onKeyDown={onStdinKey}
+            placeholder="Type to send to stdin, press Enter"
+            autoComplete="off"
+            autoCorrect="off"
+            autoCapitalize="off"
+            spellCheck={false}
+            className="min-w-0 flex-1 bg-transparent font-mono text-[11px] outline-none placeholder:text-muted-foreground/60"
+          />
+          <button
+            type="button"
+            onClick={submitStdin}
+            aria-label="Send line to stdin"
+            className="inline-flex items-center gap-1 rounded border px-1.5 py-0.5 text-[10.5px] text-muted-foreground hover:bg-muted hover:text-foreground"
+          >
+            <CornerDownLeft className="size-3" />
+            send
+          </button>
+        </div>
+      )}
       <div className="border-t px-3 py-1.5 text-[10px] text-muted-foreground">
         {status}
       </div>
