@@ -11,6 +11,7 @@
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "^0.2.133",
     "@base-ui/react": "^1.4.1",
+    "@modelcontextprotocol/sdk": "^1.29.0",
     "@openai/codex-sdk": "^0.130.0",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
