@@ -318,7 +318,7 @@ function BarRow({ bar }: { bar: UsageBar }) {
       ? "bg-destructive"
       : tone === "warning"
         ? "bg-amber-500"
-        : "bg-primary";
+        : "bg-emerald-500";
   return (
     <div className="flex items-center gap-3 text-xs">
       <div className="w-28 shrink-0 truncate text-muted-foreground">

@@ -8,8 +8,9 @@ function Progress({
   className,
   children,
   value,
+  indicatorClassName,
   ...props
-}: ProgressPrimitive.Root.Props) {
+}: ProgressPrimitive.Root.Props & { indicatorClassName?: string }) {
   return (
     <ProgressPrimitive.Root
       value={value}
@@ -19,7 +20,7 @@ function Progress({
     >
       {children}
       <ProgressTrack>
-        <ProgressIndicator />
+        <ProgressIndicator className={indicatorClassName} />
       </ProgressTrack>
     </ProgressPrimitive.Root>
   )
@@ -74,10 +75,21 @@ function ProgressValue({ className, ...props }: ProgressPrimitive.Value.Props) {
   )
 }
 
+// Indicator color for quota-style "approaching limit" bars. Mirrors the
+// status-dot palette used elsewhere (emerald / amber / destructive) so
+// a near-full 5h or weekly window jumps out the same way an offline
+// daemon does.
+function quotaTone(pct: number): string {
+  if (pct >= 95) return "bg-destructive"
+  if (pct >= 75) return "bg-amber-500"
+  return "bg-emerald-500"
+}
+
 export {
   Progress,
   ProgressTrack,
   ProgressIndicator,
   ProgressLabel,
   ProgressValue,
+  quotaTone,
 }

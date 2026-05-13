@@ -41,6 +41,7 @@ import { SidebarTrigger } from "@/components/sidebar/sidebar-trigger";
 import { MessageBubble, StreamingTurn } from "./message-bubble";
 import { ThinkingIndicator, TurnMetaLine } from "./thinking-indicator";
 import { QueueIndicator, computeQueuedMessages } from "./queue-indicator";
+import { stripCliEnvelopes } from "@/lib/cli-envelope";
 import { PermissionDialog } from "./permission-dialog";
 import { PlanCard } from "./plan-card";
 import { McpDialog } from "./mcp-dialog";
@@ -671,6 +672,33 @@ export function ChatPanel({ session }: Props) {
     chat.status === "thinking",
   );
 
+  // Linear list of user-typed prose (oldest → newest) for the
+  // composer's ↑/↓ history recall. CLI envelopes are stripped so the
+  // user re-sees their original prompt rather than the
+  // <command-name>...</command-name> wrapper. Empty entries (e.g.
+  // pure tool_result echoes from the SDK) are skipped.
+  const userInputHistory = useMemo(() => {
+    const out: string[] = [];
+    for (const m of chat.history) {
+      if (m.type !== "user") continue;
+      const c = m.message.content;
+      let text = "";
+      if (typeof c === "string") {
+        text = c;
+      } else if (Array.isArray(c)) {
+        const t = c.find(
+          (b): b is { type: "text"; text: string } =>
+            (b as { type?: string }).type === "text" &&
+            typeof (b as { text?: unknown }).text === "string",
+        );
+        if (t) text = t.text;
+      }
+      const stripped = stripCliEnvelopes(text).trim();
+      if (stripped) out.push(stripped);
+    }
+    return out;
+  }, [chat.history]);
+
   const closed = chat.status === "closed" || chat.status === "errored";
 
   const onSubmit = async ({ text, attachments }: ComposerSubmit) => {
@@ -1086,6 +1114,7 @@ export function ChatPanel({ session }: Props) {
               // ChatPanel; the user comes back to the same chat and
               // expects their unfinished text still there.
               draftKey={`cm-draft:session:${session.id}`}
+              history={userInputHistory}
               placeholder={
                 closed
                   ? "Session ended — start a new one"

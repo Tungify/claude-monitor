@@ -3,7 +3,7 @@
 import { useEffect, useRef, useState } from "react";
 import { ChevronUp, Globe2, Router, Users } from "lucide-react";
 import { useDaemonContext } from "@/lib/daemon-context";
-import { Progress } from "@/components/ui/progress";
+import { Progress, quotaTone } from "@/components/ui/progress";
 import { AccountsDialog } from "@/components/accounts-dialog";
 import { NetworkDialog } from "@/components/network-dialog";
 import { OpenRouterDialog } from "@/components/openrouter-dialog";
@@ -96,7 +96,11 @@ export function AccountChip() {
             </span>
             {utilPct !== null ? (
               <span className="flex items-center gap-1.5">
-                <Progress value={Math.min(utilPct, 100)} className="h-1 flex-1" />
+                <Progress
+                  value={Math.min(utilPct, 100)}
+                  className="h-1 flex-1"
+                  indicatorClassName={quotaTone(utilPct)}
+                />
                 <span className="tabular-nums text-[10px] text-muted-foreground">
                   {utilPct}%
                 </span>

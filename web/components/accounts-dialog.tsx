@@ -30,7 +30,7 @@ import {
 } from "@/components/ui/dialog";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Progress } from "@/components/ui/progress";
+import { Progress, quotaTone } from "@/components/ui/progress";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import type { ConnectionStatus } from "@/hooks/use-daemon";
 
@@ -476,7 +476,11 @@ function UtilBlock({
         <span>{label}</span>
         <span className="tabular-nums">{v}%</span>
       </div>
-      <Progress value={Math.min(v, 100)} className="h-1.5" />
+      <Progress
+        value={Math.min(v, 100)}
+        className="h-1.5"
+        indicatorClassName={quotaTone(v)}
+      />
       {/* Reset hint sits right under the bar so the eye reads:
           label · % → progress → "resets in 1h 30m". Title attr keeps the
           full ISO timestamp accessible on hover for power users. */}

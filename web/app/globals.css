@@ -128,6 +128,13 @@
   html {
     @apply font-sans;
   }
+  button:not(:disabled),
+  [role="button"]:not([aria-disabled="true"]),
+  [type="button"]:not(:disabled),
+  [type="submit"]:not(:disabled),
+  [type="reset"]:not(:disabled) {
+    cursor: pointer;
+  }
 }
 
 /* Prose styles for assistant chat messages. Tight spacing, no horizontal
@@ -290,6 +297,18 @@
     opacity: 1;
     transform: scale(1);
   }
+}
+
+/* Indeterminate sweep for the script-runner row indicator. A narrow
+   gradient slides across the composer's top chip row while a script
+   is executing, so the user has a passive "something is running" cue
+   even when they've scrolled away from the popover. */
+@keyframes cm-script-sweep {
+  0% { transform: translateX(-40%); }
+  100% { transform: translateX(140%); }
+}
+.cm-script-sweep {
+  animation: cm-script-sweep 1.4s ease-in-out infinite;
 }
 
 /* Markdown table polish. Default react-markdown tables render flush
