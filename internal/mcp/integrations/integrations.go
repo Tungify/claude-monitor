@@ -25,6 +25,8 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
@@ -272,39 +274,75 @@ func slackStanza(i Integration) map[string]any {
 	}
 }
 
-// clickupStanza wires up @taazkareem/clickup-mcp-server. Stdio is the
-// upstream's default transport so we don't pass an explicit flag (the
-// CLI rejects unknown flags). Both env vars are required — validate
-// already gated this, but defend in depth: if either is empty after
-// trim, return nil so the caller strips the entry rather than
-// spawning a server with broken auth.
+// resolveLocalClickUpBin finds the absolute path to the in-tree
+// read-only ClickUp MCP server's compiled entry point. The server
+// lives at <repo>/mcp-servers/clickup/dist/index.js and must be built
+// (npm run build) before claude-monitor can spawn it.
+//
+// Resolution order:
+//  1. CLICKUP_LOCAL_MCP_PATH env var (explicit override).
+//  2. Walk up from os.Executable()'s dir, then from cwd, looking for
+//     the dist file. The executable path works when running from the
+//     repo's bin/ dir; cwd works when running via `go run` or `make`.
+//
+// Returns "" when nothing matches — caller treats empty as "skip this
+// integration / strip stanza" rather than spawning a broken server.
+func resolveLocalClickUpBin() string {
+	if p := strings.TrimSpace(os.Getenv("CLICKUP_LOCAL_MCP_PATH")); p != "" {
+		return p
+	}
+	starts := make([]string, 0, 2)
+	if exe, err := os.Executable(); err == nil {
+		starts = append(starts, filepath.Dir(exe))
+	}
+	if cwd, err := os.Getwd(); err == nil {
+		starts = append(starts, cwd)
+	}
+	for _, start := range starts {
+		dir := start
+		for i := 0; i < 8; i++ {
+			candidate := filepath.Join(dir, "mcp-servers", "clickup", "dist", "index.js")
+			if _, err := os.Stat(candidate); err == nil {
+				return candidate
+			}
+			parent := filepath.Dir(dir)
+			if parent == dir {
+				break
+			}
+			dir = parent
+		}
+	}
+	return ""
+}
+
+// clickupStanza must produce a byte-identical shape to the TS side's
+// clickupStanza in web/lib/server/integrations-mcp.ts. Both surfaces
+// (daemon-injected .claude.json and SDK-spawned mcpServers) spawn the
+// same in-tree Node binary with the same env vars.
+//
+// We bundle a self-hosted read-only MCP server at mcp-servers/clickup/
+// (built to dist/index.js). The third-party @taazkareem package is no
+// longer used; the local server is always read-only by design, so
+// ClickUpAllowWrite is currently a no-op (kept on the struct for
+// forward-compat when write tools are added to the local server).
 func clickupStanza(i Integration) map[string]any {
 	key := strings.TrimSpace(i.ClickUpAPIKey)
 	team := strings.TrimSpace(i.ClickUpTeamID)
 	if key == "" || team == "" {
 		return nil
 	}
-	env := map[string]string{
-		"CLICKUP_API_KEY": key,
-		"CLICKUP_TEAM_ID": team,
-	}
-	// Read-only is the default. CLICKUP_MCP_PERSONA=auditor pins
-	// the upstream to the curated read-only tool list (get_task,
-	// list_lists, get_workspace, …) — see the upstream's
-	// docs/reference/personas.md "Auditor" entry. When the user
-	// explicitly opts into writes we omit the env var so all tools
-	// register.
-	if !i.ClickUpAllowWrite {
-		env["CLICKUP_MCP_PERSONA"] = "auditor"
+	bin := resolveLocalClickUpBin()
+	if bin == "" {
+		return nil
 	}
 	return map[string]any{
 		"type":    "stdio",
-		"command": "npx",
-		"args": []string{
-			"-y",
-			"@taazkareem/clickup-mcp-server@latest",
+		"command": "node",
+		"args":    []string{bin},
+		"env": map[string]string{
+			"CLICKUP_API_KEY": key,
+			"CLICKUP_TEAM_ID": team,
 		},
-		"env": env,
 	}
 }
 

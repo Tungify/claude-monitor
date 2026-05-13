@@ -3,6 +3,7 @@ PKG         := ./cmd/claude-monitor
 ALL_PKGS    := ./...
 BIN_DIR     := bin
 WEB_DIR     := web
+MCP_SERVERS := mcp-servers/clickup
 INSTALL_DIR ?= $(HOME)/bin
 
 GOOS   ?= $(shell go env GOOS)
@@ -17,12 +18,20 @@ ifeq ($(GOOS),darwin)
 LDFLAGS += -linkmode=external
 endif
 
-.PHONY: all build build-go build-web run once install clean fmt vet tidy release help
+.PHONY: all build build-go build-web build-mcp run once install clean fmt vet tidy release help
 
 all: build
 
-## build: compile Go binary AND build the Next.js web orchestrator
-build: build-go build-web
+## build: compile Go binary, build the Next.js web orchestrator, and the local MCP servers
+build: build-go build-web build-mcp
+
+## build-mcp: build every in-tree local MCP server (Node TypeScript projects)
+build-mcp:
+	@for d in $(MCP_SERVERS); do \
+		echo "building $$d"; \
+		(cd $$d && npm install --silent && npm run build --silent) || exit 1; \
+	done
+	@echo "built local MCP servers"
 
 ## build-go: compile the Go binary into ./bin/
 build-go:

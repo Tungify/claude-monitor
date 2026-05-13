@@ -101,29 +101,62 @@ function slackStanza(i: IntegrationDisk): StdioStanza | null {
   };
 }
 
+// resolveLocalClickUpBin finds the absolute path to the in-tree
+// read-only ClickUp MCP server's compiled entry point. The server
+// lives at <repo>/mcp-servers/clickup/dist/index.js and must be built
+// (npm run build) before claude-monitor can spawn it.
+//
+// Resolution order:
+//   1. CLICKUP_LOCAL_MCP_PATH env var (explicit override).
+//   2. Walk up from process.cwd() looking for the dist file. Works
+//      whether Next.js runs with cwd=web/ (typical) or cwd=repo-root.
+//
+// Returns null when nothing matches — caller treats null as "skip this
+// integration / strip stanza" rather than spawning a broken server.
+function resolveLocalClickUpBin(): string | null {
+  const override = process.env.CLICKUP_LOCAL_MCP_PATH?.trim();
+  if (override) return override;
+  let dir = process.cwd();
+  for (let i = 0; i < 8; i++) {
+    const candidate = path.join(
+      dir,
+      "mcp-servers",
+      "clickup",
+      "dist",
+      "index.js",
+    );
+    if (existsSync(candidate)) return candidate;
+    const parent = path.dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return null;
+}
+
 // clickupStanza must produce a byte-identical shape to the Go side's
 // clickupStanza in internal/mcp/integrations/integrations.go. Both
 // surfaces (daemon-injected .claude.json and SDK-spawned mcpServers)
-// need to address the same npx package with the same env vars.
+// need to spawn the same local Node binary with the same env vars.
+//
+// We bundle a self-hosted read-only MCP server at mcp-servers/clickup/
+// (built to dist/index.js). The third-party @taazkareem package is no
+// longer used; the local server is always read-only by design, so the
+// clickup_allow_write flag is currently a no-op (kept on the schema
+// for forward-compat when write tools are added).
 function clickupStanza(i: IntegrationDisk): StdioStanza | null {
   const key = i.clickup_api_key?.trim();
   const team = i.clickup_team_id?.trim();
   if (!key || !team) return null;
-  const env: Record<string, string> = {
-    CLICKUP_API_KEY: key,
-    CLICKUP_TEAM_ID: team,
-  };
-  // Read-only is the default — must produce byte-identical env to
-  // the Go side's clickupStanza so the daemon-injected stanza and
-  // the SDK-spawned stanza both narrow to the auditor persona.
-  if (!i.clickup_allow_write) {
-    env.CLICKUP_MCP_PERSONA = "auditor";
-  }
+  const bin = resolveLocalClickUpBin();
+  if (!bin) return null;
   return {
     type: "stdio",
-    command: "npx",
-    args: ["-y", "@taazkareem/clickup-mcp-server@latest"],
-    env,
+    command: "node",
+    args: [bin],
+    env: {
+      CLICKUP_API_KEY: key,
+      CLICKUP_TEAM_ID: team,
+    },
   };
 }
 

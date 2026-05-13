@@ -1,6 +1,8 @@
 package integrations
 
 import (
+	"fmt"
+	"os"
 	"runtime"
 	"strings"
 	"testing"
@@ -165,6 +167,7 @@ func TestValidate_ClickUp(t *testing.T) {
 }
 
 func TestStanza_ClickUp(t *testing.T) {
+	t.Setenv("CLICKUP_LOCAL_MCP_PATH", "/fake/mcp-servers/clickup/dist/index.js")
 	in := Integration{
 		Name:          "tasks",
 		Service:       ServiceClickUp,
@@ -175,11 +178,11 @@ func TestStanza_ClickUp(t *testing.T) {
 	if s == nil {
 		t.Fatal("expected non-nil stanza")
 	}
-	if s["command"] != "npx" {
+	if s["command"] != "node" {
 		t.Fatalf("command: %v", s["command"])
 	}
 	args, _ := s["args"].([]string)
-	wantArgs := []string{"-y", "@taazkareem/clickup-mcp-server@latest"}
+	wantArgs := []string{"/fake/mcp-servers/clickup/dist/index.js"}
 	if len(args) != len(wantArgs) {
 		t.Fatalf("args length mismatch: got %v", args)
 	}
@@ -195,41 +198,70 @@ func TestStanza_ClickUp(t *testing.T) {
 	if env["CLICKUP_TEAM_ID"] != "987654321" {
 		t.Fatalf("team id not set: %#v", env)
 	}
+	// Local server is always read-only by design — no persona env should
+	// leak through. AllowWrite is a no-op until the local server grows
+	// write tools.
+	if _, has := env["CLICKUP_MCP_PERSONA"]; has {
+		t.Fatalf("unexpected CLICKUP_MCP_PERSONA in env: %#v", env)
+	}
 }
 
-func TestStanza_ClickUp_DefaultsToReadOnly(t *testing.T) {
+func TestStanza_ClickUp_AllowWriteIsNoop(t *testing.T) {
+	// Until the local server adds write tools, ClickUpAllowWrite must
+	// not alter the spawned stanza. Asserts the two variants are
+	// byte-equivalent so a future contributor can't accidentally
+	// re-introduce a persona-style toggle without updating this test.
+	t.Setenv("CLICKUP_LOCAL_MCP_PATH", "/fake/dist.js")
+	base := Integration{
+		Name:          "tasks",
+		Service:       ServiceClickUp,
+		ClickUpAPIKey: "pk_x",
+		ClickUpTeamID: "1",
+	}
+	off := base.Stanza()
+	on := Integration{
+		Name:              base.Name,
+		Service:           base.Service,
+		ClickUpAPIKey:     base.ClickUpAPIKey,
+		ClickUpTeamID:     base.ClickUpTeamID,
+		ClickUpAllowWrite: true,
+	}.Stanza()
+	if fmt.Sprintf("%v", off) != fmt.Sprintf("%v", on) {
+		t.Fatalf("AllowWrite altered stanza:\n off=%v\n  on=%v", off, on)
+	}
+}
+
+func TestStanza_ClickUp_MissingFieldsYieldNil(t *testing.T) {
+	t.Setenv("CLICKUP_LOCAL_MCP_PATH", "/fake/dist.js")
+	if s := (Integration{Name: "tasks", Service: ServiceClickUp, ClickUpTeamID: "1"}).Stanza(); s != nil {
+		t.Fatalf("expected nil stanza for missing key, got %#v", s)
+	}
+	if s := (Integration{Name: "tasks", Service: ServiceClickUp, ClickUpAPIKey: "pk_x"}).Stanza(); s != nil {
+		t.Fatalf("expected nil stanza for missing team id, got %#v", s)
+	}
+}
+
+func TestStanza_ClickUp_MissingLocalBinYieldsNil(t *testing.T) {
+	// When neither env override nor a walk-up discovery turns up the
+	// built dist, the stanza must be nil so the daemon strips the
+	// entry rather than spawning `node` against a missing file. We
+	// point at a non-existent dir and clear cwd-walk results by
+	// chdir'ing to /tmp (no mcp-servers ancestor there).
+	t.Setenv("CLICKUP_LOCAL_MCP_PATH", "")
+	prev, _ := os.Getwd()
+	t.Cleanup(func() { _ = os.Chdir(prev) })
+	tmp := t.TempDir()
+	if err := os.Chdir(tmp); err != nil {
+		t.Fatalf("chdir: %v", err)
+	}
 	in := Integration{
 		Name:          "tasks",
 		Service:       ServiceClickUp,
 		ClickUpAPIKey: "pk_x",
 		ClickUpTeamID: "1",
 	}
-	env, _ := in.Stanza()["env"].(map[string]string)
-	if env["CLICKUP_MCP_PERSONA"] != "auditor" {
-		t.Fatalf("expected auditor persona by default, got %#v", env)
-	}
-}
-
-func TestStanza_ClickUp_AllowWriteOmitsPersona(t *testing.T) {
-	in := Integration{
-		Name:              "tasks",
-		Service:           ServiceClickUp,
-		ClickUpAPIKey:     "pk_x",
-		ClickUpTeamID:     "1",
-		ClickUpAllowWrite: true,
-	}
-	env, _ := in.Stanza()["env"].(map[string]string)
-	if _, has := env["CLICKUP_MCP_PERSONA"]; has {
-		t.Fatalf("expected no persona when allow_write=true, got %#v", env)
-	}
-}
-
-func TestStanza_ClickUp_MissingFieldsYieldNil(t *testing.T) {
-	if s := (Integration{Name: "tasks", Service: ServiceClickUp, ClickUpTeamID: "1"}).Stanza(); s != nil {
-		t.Fatalf("expected nil stanza for missing key, got %#v", s)
-	}
-	if s := (Integration{Name: "tasks", Service: ServiceClickUp, ClickUpAPIKey: "pk_x"}).Stanza(); s != nil {
-		t.Fatalf("expected nil stanza for missing team id, got %#v", s)
+	if s := in.Stanza(); s != nil {
+		t.Fatalf("expected nil stanza when local bin missing, got %#v", s)
 	}
 }
 
