@@ -322,11 +322,51 @@ export interface AskUserQuestionRequest {
 // the user skipped that question.
 export type AskUserQuestionAnswers = Record<string, string>;
 
+// Background task mirror for the BackgroundDock. We don't own the
+// processes — Claude's SDK does. We listen to its task_* system
+// messages (task_started/task_progress/task_updated/task_notification)
+// and surface a compact view of them so the user can see + kill
+// runaways without waiting for the model to circle back. Kill goes
+// through query.stopTask(taskId); output_file is a path on disk the
+// SDK writes the task's transcript/stdout to.
+export type BackgroundTaskStatus =
+  | "pending"
+  | "running"
+  | "completed"
+  | "failed"
+  | "killed";
+
+export interface BackgroundTask {
+  task_id: string;
+  tool_use_id?: string;
+  task_type?: string;
+  description: string;
+  // For Bash tasks this is the command; for subagents it's the prompt.
+  prompt?: string;
+  status: BackgroundTaskStatus;
+  started_at: string;
+  ended_at?: string;
+  error?: string;
+  // Disk path the SDK writes the running transcript to. Read it via
+  // /api/chat/[id]/bg-tasks/[taskId]/output for a live tail.
+  output_file?: string;
+  summary?: string;
+  // True once the SDK auto-backgrounds an originally foreground bash.
+  is_backgrounded?: boolean;
+  last_tool_name?: string;
+}
+
 // ChatEvent is the discriminated union streamed over SSE on
 // /api/chat/[id]/events.
 export type ChatEvent =
   | { type: "message"; data: SDKMessage }
   | { type: "status"; data: { status: SessionStatus } }
+  | { type: "bg_task_started"; data: BackgroundTask }
+  | {
+      type: "bg_task_updated";
+      data: { task_id: string; patch: Partial<BackgroundTask> };
+    }
+  | { type: "bg_task_finished"; data: BackgroundTask }
   | { type: "permission_request"; data: PermissionRequest }
   | { type: "permission_resolved"; data: { id: string } }
   | { type: "ask_user_question"; data: AskUserQuestionRequest }
@@ -376,6 +416,10 @@ export interface SessionSnapshot {
   pending_permission?: PermissionRequest;
   pending_question?: AskUserQuestionRequest;
   latest_plan?: PlanRecord;
+  // Snapshot of all background tasks the SDK is currently tracking
+  // (running + recently-finished within the SDK's retention window).
+  // Replayed on reconnect so the BackgroundDock survives a refresh.
+  background_tasks?: BackgroundTask[];
 }
 
 export type SubagentNavTarget = {

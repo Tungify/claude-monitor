@@ -81,6 +81,17 @@ export async function GET(req: Request, { params }: Ctx) {
               : "plan_submitted";
         writeEvent({ type: evType, data: snap.latest_plan });
       }
+      // Replay BackgroundDock state. Running tasks come back through
+      // bg_task_started; terminal ones through bg_task_finished so the
+      // reducer lands directly in the right state. Replay AFTER plan
+      // (matches the cadence of the rest of the snapshot replay).
+      for (const task of snap.background_tasks ?? []) {
+        if (task.status === "running" || task.status === "pending") {
+          writeEvent({ type: "bg_task_started", data: task });
+        } else {
+          writeEvent({ type: "bg_task_finished", data: task });
+        }
+      }
 
       const unsubscribe = subscribe(id, writeEvent);
 

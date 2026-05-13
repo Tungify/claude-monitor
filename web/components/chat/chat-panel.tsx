@@ -1040,6 +1040,10 @@ export function ChatPanel({ session }: Props) {
             <Composer
               mode="session"
               cwd={session.cwd}
+              sessionId={session.id}
+              bgTasks={Object.values(chat.backgroundTasks)}
+              onStopBgTask={chat.stopBgTask}
+              onDismissBgTask={chat.dismissBgTask}
               model={model}
               onModelChange={(id) => {
                 // Picking a model from the OTHER provider triggers a

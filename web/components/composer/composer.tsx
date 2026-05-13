@@ -14,11 +14,13 @@ import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import type {
   Attachment,
+  BackgroundTask,
   ContextUsageBreakdown,
   Effort,
   SessionProvider,
   SessionUsage,
 } from "@/lib/chat-types";
+import { BackgroundDock } from "@/components/chat/background-dock";
 import { modelById } from "@/lib/models";
 import {
   matchSlashCommands,
@@ -120,6 +122,14 @@ interface HomeProps extends CommonProps {
 interface SessionProps extends CommonProps {
   mode: "session";
   cwd: string;
+  // BackgroundDock plumbing. Optional — when provided, the composer
+  // renders a compact "(N) shell" chip next to the Scripts button
+  // that opens a popover for inspecting / killing SDK background
+  // tasks (Bash run_in_background, etc.).
+  sessionId?: string;
+  bgTasks?: BackgroundTask[];
+  onStopBgTask?: (taskId: string) => Promise<void>;
+  onDismissBgTask?: (taskId: string) => void;
 }
 
 type Props = HomeProps | SessionProps;
@@ -547,11 +557,14 @@ export function Composer(props: Props) {
         />
       )}
       {/* Top chip row — folder/branch on the left, project scripts on
-          the right. The row is `relative` so the script-runner can
-          paint a thin indeterminate sweep across the bottom while a
-          build is in flight, giving the user a passive "something is
-          running" cue without taking over the chrome. */}
-      <div className="relative flex flex-wrap items-center gap-1.5 px-2 pt-2">
+          the right. Single-line layout: a wrap on this row leaves a
+          ragged second line that the user explicitly doesn't want.
+          Path + branch are the only shrinkable chips (truncate kicks
+          in via min-w-0); the right cluster stays fixed-width and
+          right-aligned. The row is `relative` so the script-runner
+          can paint a thin indeterminate sweep across the bottom while
+          a build is in flight. */}
+      <div className="relative flex min-w-0 items-center gap-1.5 px-2 pt-2">
         {props.mode === "home" ? (
           <>
             <FolderPicker
@@ -563,16 +576,38 @@ export function Composer(props: Props) {
           </>
         ) : (
           <>
-            <span className="inline-flex items-center gap-1.5 rounded-md border border-dashed px-2 py-1 font-mono text-[11px] text-muted-foreground">
-              {shorten(props.cwd)}
-            </span>
+            <CwdChip cwd={props.cwd} />
             <BranchChip cwd={props.cwd} />
           </>
         )}
+        {/* Right cluster: bg shells chip (when there are any) +
+            Scripts button. The dock chip auto-hides on 0 tasks so
+            the row stays clean when nothing is running in the
+            background. */}
+        {props.mode === "session" &&
+          props.sessionId &&
+          props.bgTasks &&
+          props.bgTasks.length > 0 &&
+          props.onStopBgTask &&
+          props.onDismissBgTask && (
+            <BackgroundDock
+              className="ms-auto shrink-0"
+              sessionId={props.sessionId}
+              tasks={props.bgTasks}
+              onStop={props.onStopBgTask}
+              onDismiss={props.onDismissBgTask}
+            />
+          )}
         <ScriptRunner
           cwd={props.cwd}
           onRunningChange={setScriptRunning}
-          className="ms-auto"
+          className={
+            props.mode === "session" &&
+            props.bgTasks &&
+            props.bgTasks.length > 0
+              ? "shrink-0"
+              : "ms-auto shrink-0"
+          }
         />
         {scriptRunning && (
           <div
@@ -742,6 +777,75 @@ function shorten(p: string): string {
   const parts = compact.split("/").filter(Boolean);
   if (parts.length <= 2) return compact;
   return ".../" + parts.slice(-2).join("/");
+}
+
+// CwdChip — session-mode cwd display. Truncates to fit and reveals
+// the full path via the native title tooltip on hover; click copies
+// the absolute path to the clipboard with a short "Copied!" flash so
+// the user gets feedback without us needing a toast system.
+function CwdChip({ cwd }: { cwd: string }) {
+  const [copied, setCopied] = useState(false);
+  // Keep the timer in a ref so a rapid second click resets the
+  // window cleanly without a stale timer flipping `copied` back to
+  // false mid-flash.
+  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => {
+    return () => {
+      if (timerRef.current) clearTimeout(timerRef.current);
+    };
+  }, []);
+
+  const onClick = async () => {
+    try {
+      if (typeof navigator !== "undefined" && navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(cwd);
+      } else if (typeof document !== "undefined") {
+        // Fallback for non-secure-context browsers where the
+        // Clipboard API is gated. Tiny offscreen textarea +
+        // execCommand("copy") is still universally supported.
+        const ta = document.createElement("textarea");
+        ta.value = cwd;
+        ta.style.position = "fixed";
+        ta.style.opacity = "0";
+        document.body.appendChild(ta);
+        ta.select();
+        try {
+          document.execCommand("copy");
+        } finally {
+          document.body.removeChild(ta);
+        }
+      }
+      setCopied(true);
+      if (timerRef.current) clearTimeout(timerRef.current);
+      timerRef.current = setTimeout(() => setCopied(false), 1200);
+    } catch {
+      // Clipboard refused (permissions / iframe sandbox). Don't
+      // flash success — leaving copied=false signals the no-op to
+      // the user via the unchanged tooltip.
+    }
+  };
+
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      title={copied ? "Copied!" : cwd}
+      aria-label={copied ? "Path copied" : `Copy path: ${cwd}`}
+      // min-w-0 lets the button shrink below its intrinsic text
+      // width so truncate can kick in; without it flex-item
+      // min-content is the full unbroken string. `shorten()` already
+      // collapses long paths to ~/.../<last 2>; this is the second
+      // line of defence on narrow viewports.
+      className={cn(
+        "min-w-0 max-w-[14rem] shrink truncate whitespace-nowrap rounded-md border border-dashed px-2 py-1 text-left align-middle font-mono text-[11px] transition-colors sm:max-w-[22rem]",
+        copied
+          ? "border-emerald-500/40 bg-emerald-500/[0.08] text-emerald-700 dark:text-emerald-300"
+          : "text-muted-foreground hover:bg-muted/40 hover:text-foreground",
+      )}
+    >
+      {copied ? "Copied!" : shorten(cwd)}
+    </button>
+  );
 }
 
 // readDraft / writeDraft: tiny localStorage wrappers so the composer

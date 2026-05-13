@@ -58,6 +58,7 @@ import type {
   AskUserQuestionEntry,
   AskUserQuestionRequest,
   Attachment,
+  BackgroundTask,
   ChatEvent,
   ContextUsageBreakdown,
   HandoffRecord,
@@ -179,6 +180,14 @@ interface ChatSession {
   // assistant emits the [GOAL_MET] sentinel or iterations hits the cap.
   // See SessionGoal in chat-types for the full state machine.
   goal?: SessionGoal;
+  // Live mirror of SDK background tasks (Bash run_in_background, Agent
+  // bg, etc.). Populated by the driveSession message loop from
+  // task_started / task_progress / task_updated / task_notification
+  // system messages. Tied to this session's Query — not persisted to
+  // disk: when a session is interrupted the SDK process dies and its
+  // tasks die with it, so a stale entry would be misleading. Cleared
+  // on resume.
+  backgroundTasks: Map<string, BackgroundTask>;
 }
 
 // InterruptedSession is the on-restart shadow of a ChatSession: just
@@ -590,6 +599,330 @@ function handleRateLimitEvent(
       setStatus(session, "rate_limited");
     }
   }
+}
+
+// Map an SDK task_notification status to our BackgroundTask status.
+// The SDK's "stopped" outcome covers both user-initiated stopTask()
+// calls and any other external termination — we surface that as
+// "killed" so the dock UI can render it distinctly from a clean
+// "completed" or a crashing "failed".
+function mapTaskTerminalStatus(
+  s: "completed" | "failed" | "stopped",
+): BackgroundTask["status"] {
+  return s === "stopped" ? "killed" : s;
+}
+
+// Mirror an SDK task_* system message into session.backgroundTasks.
+// We defensively upsert because task_progress / task_updated /
+// task_notification can theoretically arrive without a preceding
+// task_started (replay edge cases on resume, or a hot module reload
+// in dev that drops the in-memory map mid-flight). Returns true when
+// state actually changed so the caller can decide whether to emit.
+function handleTaskEvent(
+  session: ChatSession,
+  msg: SDKMessage & { type: "system" },
+): void {
+  if (!session.backgroundTasks) session.backgroundTasks = new Map();
+  const sub = (msg as { subtype?: string }).subtype;
+  const taskId = (msg as { task_id?: string }).task_id;
+  if (!taskId) return;
+  const existing = session.backgroundTasks.get(taskId);
+  if (sub === "task_started") {
+    const m = msg as unknown as {
+      task_id: string;
+      tool_use_id?: string;
+      description: string;
+      task_type?: string;
+      prompt?: string;
+      skip_transcript?: boolean;
+    };
+    // Skip ambient/housekeeping tasks the SDK marks as transcript-
+    // hidden — they're internal bookkeeping, not user-visible work,
+    // and showing them just clutters the dock.
+    if (m.skip_transcript) return;
+    const task: BackgroundTask = {
+      task_id: m.task_id,
+      tool_use_id: m.tool_use_id,
+      task_type: m.task_type,
+      description: m.description,
+      prompt: m.prompt,
+      status: "running",
+      started_at: new Date().toISOString(),
+    };
+    session.backgroundTasks.set(taskId, task);
+    emit(session, { type: "bg_task_started", data: task });
+    return;
+  }
+  if (sub === "task_progress") {
+    const m = msg as unknown as {
+      task_id: string;
+      description?: string;
+      summary?: string;
+      last_tool_name?: string;
+    };
+    const patch: Partial<BackgroundTask> = {};
+    if (m.description !== undefined) patch.description = m.description;
+    if (m.summary !== undefined) patch.summary = m.summary;
+    if (m.last_tool_name !== undefined) patch.last_tool_name = m.last_tool_name;
+    if (Object.keys(patch).length === 0) return;
+    const next: BackgroundTask = existing
+      ? { ...existing, ...patch }
+      : {
+          task_id: taskId,
+          description: m.description ?? "",
+          status: "running",
+          started_at: new Date().toISOString(),
+          summary: m.summary,
+          last_tool_name: m.last_tool_name,
+        };
+    session.backgroundTasks.set(taskId, next);
+    emit(session, { type: "bg_task_updated", data: { task_id: taskId, patch } });
+    return;
+  }
+  if (sub === "task_updated") {
+    const m = msg as unknown as {
+      task_id: string;
+      patch: {
+        status?: "pending" | "running" | "completed" | "failed" | "killed";
+        description?: string;
+        end_time?: number;
+        error?: string;
+        is_backgrounded?: boolean;
+      };
+    };
+    const patch: Partial<BackgroundTask> = {};
+    if (m.patch.status !== undefined) patch.status = m.patch.status;
+    if (m.patch.description !== undefined)
+      patch.description = m.patch.description;
+    if (m.patch.error !== undefined) patch.error = m.patch.error;
+    if (m.patch.is_backgrounded !== undefined)
+      patch.is_backgrounded = m.patch.is_backgrounded;
+    if (m.patch.end_time !== undefined)
+      patch.ended_at = new Date(m.patch.end_time).toISOString();
+    const next: BackgroundTask = existing
+      ? { ...existing, ...patch }
+      : {
+          task_id: taskId,
+          description: m.patch.description ?? "",
+          status: m.patch.status ?? "running",
+          started_at: new Date().toISOString(),
+          ...patch,
+        };
+    session.backgroundTasks.set(taskId, next);
+    emit(session, { type: "bg_task_updated", data: { task_id: taskId, patch } });
+    return;
+  }
+  if (sub === "task_notification") {
+    const m = msg as unknown as {
+      task_id: string;
+      tool_use_id?: string;
+      status: "completed" | "failed" | "stopped";
+      output_file: string;
+      summary: string;
+    };
+    const status = mapTaskTerminalStatus(m.status);
+    const next: BackgroundTask = {
+      ...(existing ?? {
+        task_id: taskId,
+        tool_use_id: m.tool_use_id,
+        description: m.summary,
+        started_at: new Date().toISOString(),
+      }),
+      status,
+      output_file: m.output_file,
+      summary: m.summary,
+      ended_at: new Date().toISOString(),
+    };
+    // Killed tasks are dropped from the server-side map so a page
+    // reload doesn't briefly resurrect them in the dock — the user
+    // explicitly doesn't want killed shells lingering. We still emit
+    // bg_task_finished so live clients can transition out of the
+    // running state in their own reducer (which mirrors this drop).
+    if (status === "killed") {
+      session.backgroundTasks.delete(taskId);
+    } else {
+      session.backgroundTasks.set(taskId, next);
+    }
+    emit(session, { type: "bg_task_finished", data: next });
+    return;
+  }
+}
+
+// Inspect a user SDKMessage's tool_result block (the wire shape the
+// SDK uses to send tool output back to the model) for the file path
+// the SDK uses to persist live output of a background task. The path
+// is NOT exposed as a structured field — it's embedded in the
+// model-facing English prose alongside the BashOutput shape:
+//
+//   "Command running in background with ID: <id>. Output is being
+//    written to: <path>. You will be notified when it completes…"
+//
+// We try three pairing paths to find the matching task:
+//   1. structured `tool_use_result.backgroundTaskId|agentId|task_id`
+//   2. fall back to the tool_result block's `tool_use_id` (matches
+//      `task.tool_use_id` recorded at task_started time)
+//   3. as a last resort, single-running-task assumption
+// Without this pairing the dock would only see output once the task
+// has already finished (task_notification ships output_file), which
+// defeats live monitoring.
+const BG_OUTPUT_PATH_RE =
+  /Output is being written to:\s*(\S+?)\.(?:\s|$)/;
+
+function captureBackgroundOutput(
+  session: ChatSession,
+  msg: SDKMessage & { type: "user" },
+): void {
+  if (!session.backgroundTasks || session.backgroundTasks.size === 0) return;
+  const tur = (msg as { tool_use_result?: unknown }).tool_use_result;
+  const turObj =
+    tur && typeof tur === "object" ? (tur as Record<string, unknown>) : null;
+
+  // Pull tool_result blocks once — used by all three pairing paths
+  // (text scan for the output file path, tool_use_id fallback, and
+  // the empty-result skip below).
+  const content = (msg as { message?: { content?: unknown } }).message?.content;
+  const toolResultBlocks: Array<{ tool_use_id?: string; content?: unknown }> =
+    [];
+  if (Array.isArray(content)) {
+    for (const block of content) {
+      if (
+        block &&
+        typeof block === "object" &&
+        (block as { type?: string }).type === "tool_result"
+      ) {
+        toolResultBlocks.push(block as { tool_use_id?: string; content?: unknown });
+      }
+    }
+  }
+
+  // (1) Structured: backgroundTaskId (Bash), agentId (Agent), or a
+  // literal task_id (subsequent TaskOutput tool calls).
+  let taskId: string | null = turObj
+    ? (typeof turObj.backgroundTaskId === "string" && turObj.backgroundTaskId) ||
+      (typeof turObj.agentId === "string" && turObj.agentId) ||
+      (typeof turObj.task_id === "string" && turObj.task_id) ||
+      null
+    : null;
+
+  // (2) tool_use_id fallback: every task_started carries a
+  // `tool_use_id`; the matching tool_result block's `tool_use_id`
+  // pairs them back. Build the index lazily.
+  if (!taskId && toolResultBlocks.length > 0) {
+    const byToolUseId = new Map<string, string>();
+    for (const t of session.backgroundTasks.values()) {
+      if (t.tool_use_id) byToolUseId.set(t.tool_use_id, t.task_id);
+    }
+    for (const block of toolResultBlocks) {
+      const tuid = block.tool_use_id;
+      if (typeof tuid === "string") {
+        const tid = byToolUseId.get(tuid);
+        if (tid) {
+          taskId = tid;
+          break;
+        }
+      }
+    }
+  }
+
+  if (!taskId) return;
+  const existing = session.backgroundTasks.get(taskId);
+  if (!existing) return;
+
+  // Output file: structured fields first (defensive — newer SDK
+  // builds might surface them), else regex the marker line out of
+  // the tool_result text content.
+  let outputFile: string | null =
+    (turObj && typeof turObj.persistedOutputPath === "string"
+      ? turObj.persistedOutputPath
+      : null) ||
+    (turObj && typeof turObj.outputFile === "string"
+      ? turObj.outputFile
+      : null) ||
+    (turObj && typeof turObj.output_file === "string"
+      ? turObj.output_file
+      : null);
+  if (!outputFile) {
+    for (const block of toolResultBlocks) {
+      const text = block.content;
+      if (typeof text === "string") {
+        const m = BG_OUTPUT_PATH_RE.exec(text);
+        if (m && m[1]) {
+          outputFile = m[1];
+          break;
+        }
+      } else if (Array.isArray(text)) {
+        // tool_result.content can also be a list of typed blocks
+        // (text/image). Concatenate any text blocks and run the
+        // regex once over the whole.
+        const joined = text
+          .map((b) =>
+            b && typeof b === "object" && (b as { type?: string }).type === "text"
+              ? String((b as { text?: unknown }).text ?? "")
+              : "",
+          )
+          .join("\n");
+        const m = BG_OUTPUT_PATH_RE.exec(joined);
+        if (m && m[1]) {
+          outputFile = m[1];
+          break;
+        }
+      }
+    }
+  }
+
+  // Inline stdout/stderr snapshot: structured fields, plus the text
+  // content of the tool_result blocks as a final fallback so the
+  // dock isn't empty for tools that bypass the structured shape.
+  let inline: string | null = null;
+  if (
+    turObj &&
+    (typeof turObj.stdout === "string" || typeof turObj.stderr === "string")
+  ) {
+    inline = `${typeof turObj.stdout === "string" ? turObj.stdout : ""}${
+      typeof turObj.stderr === "string" && turObj.stderr
+        ? `\n${turObj.stderr}`
+        : ""
+    }`;
+  }
+  if (inline === null || inline.length === 0) {
+    for (const block of toolResultBlocks) {
+      const text = block.content;
+      if (typeof text === "string" && text.trim().length > 0) {
+        inline = text;
+        break;
+      }
+      if (Array.isArray(text)) {
+        const joined = text
+          .map((b) =>
+            b && typeof b === "object" && (b as { type?: string }).type === "text"
+              ? String((b as { text?: unknown }).text ?? "")
+              : "",
+          )
+          .join("\n");
+        if (joined.trim().length > 0) {
+          inline = joined;
+          break;
+        }
+      }
+    }
+  }
+
+  const patch: Partial<BackgroundTask> = {};
+  if (outputFile && outputFile !== existing.output_file) {
+    patch.output_file = outputFile;
+  }
+  // Only overwrite the inline cache if the new snapshot actually has
+  // content — an empty stdout/stderr on the first tool_result would
+  // otherwise blow away a richer summary from earlier task_progress.
+  if (inline !== null && inline.length > 0 && inline !== existing.summary) {
+    patch.summary = inline;
+  }
+  if (Object.keys(patch).length === 0) return;
+  session.backgroundTasks.set(taskId, { ...existing, ...patch });
+  emit(session, {
+    type: "bg_task_updated",
+    data: { task_id: taskId, patch },
+  });
 }
 
 // refreshContextUsage queries the SDK control channel for an
@@ -1065,6 +1398,7 @@ function buildLiveSession(init: BuildLiveInit): ChatSession {
     rateLimit: init.rateLimit,
     rateLimitObservedAt: init.rateLimitObservedAt,
     handoffs: init.handoffs,
+    backgroundTasks: new Map(),
     query: undefined as unknown as Query, // assigned below
   };
 
@@ -1555,6 +1889,28 @@ async function driveSession(session: ChatSession): Promise<void> {
       }
       emit(session, { type: "message", data: msg });
 
+      // Mirror SDK background-task lifecycle (Bash run_in_background,
+      // Agent run_in_background, local workflows) into the session
+      // so the BackgroundDock UI can list them, tail their output,
+      // and kill them via query.stopTask() without waiting for the
+      // model to circle back. See handleTaskEvent for the full state
+      // machine.
+      if (
+        msg.type === "system" &&
+        ((msg as { subtype?: string }).subtype === "task_started" ||
+          (msg as { subtype?: string }).subtype === "task_progress" ||
+          (msg as { subtype?: string }).subtype === "task_updated" ||
+          (msg as { subtype?: string }).subtype === "task_notification")
+      ) {
+        handleTaskEvent(session, msg as SDKMessage & { type: "system" });
+      }
+      // Pair tool results back to their originating background task
+      // so the dock can show a live output file path while running.
+      // See captureBackgroundOutput for the field-probe details.
+      if (msg.type === "user") {
+        captureBackgroundOutput(session, msg as SDKMessage & { type: "user" });
+      }
+
       // Snapshot per-API-call usage from each top-level assistant
       // message. Subagent (Task) assistant messages have a non-null
       // parent_tool_use_id and run inside their own context window, so
@@ -1690,12 +2046,16 @@ export function listSessions(): SessionSummary[] {
 export function snapshotSession(id: string): SessionSnapshot | undefined {
   const s = sessions.get(id);
   if (s) {
+    const bg = s.backgroundTasks
+      ? Array.from(s.backgroundTasks.values())
+      : undefined;
     return {
       summary: summarize(s),
       history: s.history,
       pending_permission: s.pendingPermission?.request,
       pending_question: s.pendingQuestion?.request,
       latest_plan: s.latestPlan,
+      background_tasks: bg && bg.length > 0 ? bg : undefined,
     };
   }
   // Interrupted: serve metadata + history from disk so the chat panel
@@ -2772,6 +3132,45 @@ export function interruptTurn(
   emit(s, { type: "turn_interrupted", data: {} });
   respawnQuery(s);
   return { ok: true };
+}
+
+// Stop a background task via the SDK's control channel. The SDK will
+// emit a task_notification with status "stopped" that our message
+// loop hook (handleTaskEvent) translates into a bg_task_finished SSE
+// event — the dock card flips to "killed" automatically, no extra
+// state plumbing needed here.
+export async function stopBackgroundTask(
+  sessionId: string,
+  taskId: string,
+): Promise<{ ok: boolean; reason?: "session_missing" | "unsupported" | "error"; error?: string }> {
+  const s = sessions.get(sessionId);
+  if (!s) return { ok: false, reason: "session_missing" };
+  const q = s.query as unknown as {
+    stopTask?: (taskId: string) => Promise<void>;
+  };
+  if (typeof q.stopTask !== "function") {
+    return { ok: false, reason: "unsupported" };
+  }
+  try {
+    await q.stopTask(taskId);
+    return { ok: true };
+  } catch (err) {
+    return {
+      ok: false,
+      reason: "error",
+      error: err instanceof Error ? err.message : String(err),
+    };
+  }
+}
+
+// Get the current snapshot of a background task. Lookup-only — does
+// not touch the SDK. Used by the output-tail endpoint to resolve the
+// task's on-disk output_file before reading it.
+export function getBackgroundTask(
+  sessionId: string,
+  taskId: string,
+): BackgroundTask | undefined {
+  return sessions.get(sessionId)?.backgroundTasks?.get(taskId);
 }
 
 export async function stopSession(sessionId: string): Promise<void> {

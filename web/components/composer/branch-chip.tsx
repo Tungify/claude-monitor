@@ -51,10 +51,13 @@ export function BranchChip({ cwd }: { cwd: string | null | undefined }) {
             ? `Branch: ${branch.branch}${hasDiff ? ` · ${additions} additions, ${deletions} deletions` : ""}`
             : `Detached HEAD at ${branch.detached}`
         }
-        className="inline-flex items-center gap-1.5 rounded-md border border-dashed px-2 py-1 font-mono text-[11px] text-muted-foreground hover:bg-muted/40"
+        className="inline-flex min-w-0 shrink items-center gap-1.5 rounded-md border border-dashed px-2 py-1 font-mono text-[11px] text-muted-foreground hover:bg-muted/40"
       >
         <GitBranch className="size-3 shrink-0 opacity-70" aria-hidden />
-        <span className="max-w-[160px] truncate">{text}</span>
+        {/* min-w-0 on the text lets it actually truncate inside the
+            flex button; max keeps a sane upper bound when there's
+            room to spare. */}
+        <span className="min-w-0 max-w-[160px] truncate">{text}</span>
         {hasDiff && (
           <span className="flex items-center gap-1 text-[10px]">
             <span className="text-emerald-600 dark:text-emerald-400">
