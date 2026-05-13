@@ -6,6 +6,7 @@ import { ArrowDown, Target, X } from "lucide-react";
 import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 import { Virtuoso, type VirtuosoHandle } from "react-virtuoso";
 import { useChatSession } from "@/hooks/use-chat-session";
+import { useDesktopNotifications } from "@/hooks/use-desktop-notifications";
 import { useDaemonContext } from "@/lib/daemon-context";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -221,6 +222,7 @@ interface CommandLog {
 
 export function ChatPanel({ session }: Props) {
   const chat = useChatSession(session.id);
+  useDesktopNotifications(chat.status, session.title ?? undefined);
   const daemon = useDaemonContext();
   const router = useRouter();
   const [effort, setEffort] = useState<Effort>(session.effort ?? DEFAULT_EFFORT);
