@@ -65,8 +65,9 @@ struct UsageBar: View {
             Text(pct(window.utilization))
                 .font(.system(size: 10, weight: .semibold))
                 .monospacedDigit()
+                .lineLimit(1)
                 .foregroundStyle(loadColor(window.utilization))
-                .frame(width: 30, alignment: .trailing)
+                .frame(width: 36, alignment: .trailing)
         }
         .frame(maxWidth: .infinity)
         .help(window.resetsAt != nil ? "resets \(resetsIn(window.resetsAt))" : "")

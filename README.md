@@ -101,6 +101,24 @@ claude-monitor --version
 
 Every other option is toggled in-app and persisted to `~/.claude-monitor/config.json`.
 
+## Menu bar app (macOS)
+
+A native SwiftUI menu-bar companion. It shows the active account's live 5-hour usage right in the bar, and opens a Control-Center-style panel to see every account's quota and switch with a click.
+
+<p align="center"><img src="docs/menubar.png" alt="Claude Monitor menu-bar panel" width="330"></p>
+
+- **At-a-glance bar** — the active Claude account's 5h % (colored by load), or the active Codex plan.
+- **Per-account bars** — 5h + weekly for each account on one row, color-coded (green < 70%, orange ≥ 70%, red ≥ 90%); a `READY` badge marks the least-loaded account worth switching to.
+- **One-click switch** — click a row to rotate the OAuth slot to that account (the same swap the TUI's `[m]` performs). `Auto-swap` and `Open at Login` toggles are built in.
+- **Self-contained** — talks only to the local daemon's HTTP API and starts one (`claude-monitor --serve`) if none is running, so accounts and swapping work without opening the dashboard. The daemon owns all keychain access; the menu-bar app never touches credentials.
+
+```sh
+make menubar-run          # build + launch (re-run after a `git pull` to update)
+make menubar-install      # install into /Applications + relaunch
+```
+
+Requires the Xcode Command Line Tools (`swiftc`) and macOS 14+. Enable **Open at Login** from the panel to start it on boot. It's a compiled app bundle, so it does **not** auto-update — after pulling new code, re-run `make menubar-run` to rebuild and relaunch.
+
 ## Account discovery
 
 Two layouts are supported and auto-detected:
@@ -293,6 +311,9 @@ format.go            string helpers (truncate, padRight, visibleLen)
 | `build`                | Build the binary into `./bin/claude-monitor` (ad-hoc codesigned on darwin)         |
 | `run`                  | Build and launch the TUI                                                           |
 | `install`              | Copy the binary to `$INSTALL_DIR` (default `~/bin`)                                |
+| `menubar`              | macOS: build the SwiftUI menu-bar app into `bin/Claude Monitor.app`                |
+| `menubar-run`          | macOS: build and (re)launch it from `./bin` — one command to update after a pull   |
+| `menubar-install`      | macOS: build, copy into `/Applications`, and relaunch                              |
 | `release`              | Cross-compile darwin/linux × amd64/arm64                                           |
 | `fmt` / `vet` / `tidy` | gofmt / go vet / go mod tidy                                                       |
 | `clean`                | Remove `./bin/`                                                                    |
