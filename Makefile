@@ -1,10 +1,14 @@
-BINARY      := claude-monitor
-PKG         := ./cmd/claude-monitor
-ALL_PKGS    := ./...
-BIN_DIR     := bin
-WEB_DIR     := web
-MCP_SERVERS := mcp-servers/clickup
-INSTALL_DIR ?= $(HOME)/bin
+BINARY       := claude-monitor
+PKG          := ./cmd/claude-monitor
+MENUBAR_DIR  := macos/menubar
+ALL_PKGS     := ./...
+BIN_DIR      := bin
+WEB_DIR      := web
+MCP_SERVERS  := mcp-servers/clickup
+INSTALL_DIR  ?= $(HOME)/bin
+# macOS menu-bar app bundle. Space in the name is intentional (Finder name);
+# every recipe reference is quoted.
+APP_DIR      := $(BIN_DIR)/Claude Monitor.app
 
 GOOS   ?= $(shell go env GOOS)
 GOARCH ?= $(shell go env GOARCH)
@@ -18,7 +22,7 @@ ifeq ($(GOOS),darwin)
 LDFLAGS += -linkmode=external
 endif
 
-.PHONY: all build build-go build-web build-mcp run once install clean fmt vet tidy release help
+.PHONY: all build build-go build-web build-mcp menubar menubar-install run once install clean fmt vet tidy release help
 
 all: build
 
@@ -46,6 +50,42 @@ build-web:
 	@cd $(WEB_DIR) && pnpm install --frozen-lockfile
 	@cd $(WEB_DIR) && pnpm exec next build
 	@echo "built $(WEB_DIR)/.next"
+
+## menubar: build the native SwiftUI menu-bar app -> "bin/Claude Monitor.app" (macOS only)
+menubar:
+	@if [ "$(GOOS)" != "darwin" ]; then echo "menubar is macOS-only (GOOS=$(GOOS))"; exit 1; fi
+	@command -v swift >/dev/null 2>&1 || { echo "swift not found; install Xcode Command Line Tools: xcode-select --install"; exit 1; }
+	@rm -rf "$(APP_DIR)"
+	@mkdir -p "$(APP_DIR)/Contents/MacOS"
+	swift build --package-path $(MENUBAR_DIR) -c release
+	cp "$(MENUBAR_DIR)/.build/release/claude-menubar" "$(APP_DIR)/Contents/MacOS/claude-menubar"
+	go build -ldflags '$(LDFLAGS)' -o "$(APP_DIR)/Contents/MacOS/claude-monitor" $(PKG)
+	@printf '%s\n' \
+		'<?xml version="1.0" encoding="UTF-8"?>' \
+		'<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
+		'<plist version="1.0"><dict>' \
+		'	<key>CFBundleName</key><string>Claude Monitor</string>' \
+		'	<key>CFBundleDisplayName</key><string>Claude Monitor</string>' \
+		'	<key>CFBundleIdentifier</key><string>com.claude-monitor.menubar</string>' \
+		'	<key>CFBundleExecutable</key><string>claude-menubar</string>' \
+		'	<key>CFBundlePackageType</key><string>APPL</string>' \
+		'	<key>CFBundleShortVersionString</key><string>$(VERSION)</string>' \
+		'	<key>CFBundleVersion</key><string>$(VERSION)</string>' \
+		'	<key>LSMinimumSystemVersion</key><string>14.0</string>' \
+		'	<key>LSUIElement</key><true/>' \
+		'	<key>NSHighResolutionCapable</key><true/>' \
+		'</dict></plist>' > "$(APP_DIR)/Contents/Info.plist"
+	@codesign -f -s - "$(APP_DIR)" >/dev/null
+	@echo "built \"$(APP_DIR)\""
+	@echo "  open it now:   open \"$(APP_DIR)\""
+	@echo "  install it:    make menubar-install   (copies to /Applications)"
+	@echo "  auto-start:    enable \"Open at Login\" from the menu-bar dropdown"
+
+## menubar-install: build the app bundle and copy it into /Applications
+menubar-install: menubar
+	@rm -rf "/Applications/Claude Monitor.app"
+	@cp -R "$(APP_DIR)" "/Applications/Claude Monitor.app"
+	@echo "installed \"/Applications/Claude Monitor.app\" — launch it from Spotlight or /Applications"
 
 ## run: build everything and start claude-monitor (daemon + web)
 run: build
