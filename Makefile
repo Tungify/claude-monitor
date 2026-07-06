@@ -22,7 +22,7 @@ ifeq ($(GOOS),darwin)
 LDFLAGS += -linkmode=external
 endif
 
-.PHONY: all build build-go build-web build-mcp menubar menubar-install run once install clean fmt vet tidy release help
+.PHONY: all build build-go build-web build-mcp menubar menubar-run menubar-install run once install clean fmt vet tidy release help
 
 all: build
 
@@ -77,15 +77,32 @@ menubar:
 		'</dict></plist>' > "$(APP_DIR)/Contents/Info.plist"
 	@codesign -f -s - "$(APP_DIR)" >/dev/null
 	@echo "built \"$(APP_DIR)\""
-	@echo "  open it now:   open \"$(APP_DIR)\""
-	@echo "  install it:    make menubar-install   (copies to /Applications)"
+	@echo "  run it now:    make menubar-run       (build + relaunch from ./bin)"
+	@echo "  install it:    make menubar-install   (copy to /Applications + relaunch)"
 	@echo "  auto-start:    enable \"Open at Login\" from the menu-bar dropdown"
 
-## menubar-install: build the app bundle and copy it into /Applications
+# Quit any running instance so a rebuilt binary actually takes over — the
+# app is a compiled bundle, so `git pull` alone changes nothing until it is
+# rebuilt and relaunched. Killing the menu-bar process also stops the daemon
+# it spawned; the fresh launch respawns one.
+define relaunch_menubar
+	@pkill -f "Claude Monitor.app/Contents/MacOS/claude-menubar" 2>/dev/null || true
+	@sleep 0.5
+endef
+
+## menubar-run: build and relaunch from ./bin — the one command to run after a pull
+menubar-run: menubar
+	$(relaunch_menubar)
+	@open "$(APP_DIR)"
+	@echo "launched \"$(APP_DIR)\" — click the menu-bar item"
+
+## menubar-install: build, copy into /Applications, and relaunch
 menubar-install: menubar
+	$(relaunch_menubar)
 	@rm -rf "/Applications/Claude Monitor.app"
 	@cp -R "$(APP_DIR)" "/Applications/Claude Monitor.app"
-	@echo "installed \"/Applications/Claude Monitor.app\" — launch it from Spotlight or /Applications"
+	@open "/Applications/Claude Monitor.app"
+	@echo "installed + launched \"/Applications/Claude Monitor.app\""
 
 ## run: build everything and start claude-monitor (daemon + web)
 run: build

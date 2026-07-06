@@ -52,18 +52,14 @@ enum PanelSnapshotRenderer {
         state.autoSwap = true
         state.connected = true
 
-        let frame = NSRect(x: 120, y: 120, width: 320, height: 720)
+        let frame = NSRect(x: 120, y: 120, width: 320, height: 800)
         let win = NSWindow(contentRect: frame, styleMask: [.borderless], backing: .buffered, defer: false)
         let effect = NSVisualEffectView(frame: NSRect(origin: .zero, size: frame.size))
         effect.material = .menu
         effect.state = .active
         effect.blendingMode = .behindWindow
         effect.autoresizingMask = [.width, .height]
-        let host = NSHostingView(rootView:
-            PanelView()
-                .environmentObject(state)
-                .frame(maxHeight: .infinity, alignment: .top)
-        )
+        let host = NSHostingView(rootView: PanelView().environmentObject(state))
         host.frame = effect.bounds
         host.autoresizingMask = [.width, .height]
         effect.addSubview(host)
@@ -75,7 +71,16 @@ enum PanelSnapshotRenderer {
         win.makeKeyAndOrderFront(nil)
         NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
-        NSLog("PANEL_WINDOW_ID=\(win.windowNumber) SIZE=\(Int(frame.width))x\(Int(frame.height))")
+        NSLog("PANEL_WINDOW_ID=\(win.windowNumber)")
+        // Shrink to the panel's natural height once SwiftUI has resolved the
+        // measured list height (needs a couple of runloop passes).
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.7) {
+            let fit = host.fittingSize
+            if fit.height > 1 {
+                win.setContentSize(NSSize(width: 320, height: fit.height))
+            }
+            NSLog("PANEL_RESIZED=320x\(Int(win.frame.height))")
+        }
         return true
     }
 
@@ -105,7 +110,7 @@ enum PanelSnapshotRenderer {
               "name": "tung-heavy", "config_dir": "/Users/x/.claude-heavy",
               "email": "tung@heavy.dev", "active": false,
               "five_hour": { "utilization": 94, "resets_at": "\(rel(1800))" },
-              "weekly":    { "utilization": 78, "resets_at": "\(rel(2*86400))" }
+              "weekly":    { "utilization": 100, "resets_at": "\(rel(2*86400))" }
             },
             {
               "name": "tung-old", "config_dir": "/Users/x/.claude-old",
