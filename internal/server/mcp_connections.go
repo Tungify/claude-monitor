@@ -299,6 +299,9 @@ func testCommand(ctx context.Context, c connections.Connection) (*exec.Cmd, erro
 		return nil, fmt.Errorf("stanza args has unexpected type %T (want []string)", stanza["args"])
 	}
 	cmd := exec.CommandContext(ctx, cmdName, args...)
+	killTreeOnCancel(cmd)
+	// Backstop: stop waiting on pipes a surviving grandchild still holds.
+	cmd.WaitDelay = 2 * time.Second
 	env := os.Environ()
 	if rawEnv, present := stanza["env"]; present {
 		stanzaEnv, ok := rawEnv.(map[string]string)
