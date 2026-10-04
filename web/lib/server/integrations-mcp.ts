@@ -102,7 +102,7 @@ function slackStanza(i: IntegrationDisk): StdioStanza | null {
 }
 
 // resolveLocalClickUpBin finds the absolute path to the in-tree
-// read-only ClickUp MCP server's compiled entry point. The server
+// ClickUp MCP server's compiled entry point. The server
 // lives at <repo>/mcp-servers/clickup/dist/index.js and must be built
 // (npm run build) before claude-monitor can spawn it.
 //
@@ -138,25 +138,25 @@ function resolveLocalClickUpBin(): string | null {
 // surfaces (daemon-injected .claude.json and SDK-spawned mcpServers)
 // need to spawn the same local Node binary with the same env vars.
 //
-// We bundle a self-hosted read-only MCP server at mcp-servers/clickup/
-// (built to dist/index.js). The third-party @taazkareem package is no
-// longer used; the local server is always read-only by design, so the
-// clickup_allow_write flag is currently a no-op (kept on the schema
-// for forward-compat when write tools are added).
+// We bundle a self-hosted MCP server at mcp-servers/clickup/ (built to
+// dist/index.js). Read-only is the default: CLICKUP_READ_ONLY=1 hides
+// its write tools unless clickup_allow_write is set.
 function clickupStanza(i: IntegrationDisk): StdioStanza | null {
   const key = i.clickup_api_key?.trim();
   const team = i.clickup_team_id?.trim();
   if (!key || !team) return null;
   const bin = resolveLocalClickUpBin();
   if (!bin) return null;
+  const env: Record<string, string> = {
+    CLICKUP_API_KEY: key,
+    CLICKUP_TEAM_ID: team,
+  };
+  if (!i.clickup_allow_write) env.CLICKUP_READ_ONLY = "1";
   return {
     type: "stdio",
     command: "node",
     args: [bin],
-    env: {
-      CLICKUP_API_KEY: key,
-      CLICKUP_TEAM_ID: team,
-    },
+    env,
   };
 }
 

@@ -46,7 +46,7 @@ interface Integration {
   // secret and round-trips in cleartext.
   clickup_api_key?: string;
   clickup_team_id?: string;
-  // ClickUp — opt-in writes. Default = read-only (auditor persona).
+  // ClickUp — opt-in writes. Default = read-only (CLICKUP_READ_ONLY=1).
   clickup_allow_write?: boolean;
   // GitHub — token is redacted on the wire (prefix + ***); the form
   // shows "token is set" without exposing the PAT body.
@@ -792,9 +792,9 @@ function ClickUpFields({
         <span>
           <span className="font-medium">Allow write operations</span>
           <span className="ml-1 text-muted-foreground">
-            (off by default — server pins{" "}
-            <span className="font-mono">auditor</span> persona; read-only tools
-            only. Turn on to enable create/update/delete tasks, comments,
+            (off by default — server runs with{" "}
+            <span className="font-mono">CLICKUP_READ_ONLY=1</span>; read-only
+            tools only. Turn on to enable create/update/delete tasks, comments,
             lists…)
           </span>
         </span>

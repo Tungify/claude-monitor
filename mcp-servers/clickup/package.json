@@ -1,7 +1,7 @@
 {
   "name": "@nexlify/clickup-mcp",
-  "version": "0.1.0",
-  "description": "Local read-only ClickUp MCP server (no license, no third-party).",
+  "version": "0.2.0",
+  "description": "Local token-lean ClickUp MCP server (no license, no third-party).",
   "private": true,
   "type": "module",
   "main": "./dist/index.js",
