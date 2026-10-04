@@ -36,6 +36,8 @@ type ConnectionDisk = {
   disabled?: boolean;
   // Postgres
   uri?: string;
+  // Off (and absent on legacy records) = read-only.
+  allow_write?: boolean;
   // ClickHouse + Redis (overlapping field set — both protocols carry
   // host/port/user/pwd plus an optional TLS toggle).
   host?: string;
@@ -98,15 +100,44 @@ function readConnections(): ConnectionDisk[] {
   return env?.connections?.connections ?? [];
 }
 
+// postgresStanza must match the Go side's postgresStanza in
+// internal/mcp/connections/connections.go: the in-tree server when it
+// is built, bare postgres-mcp otherwise.
 function postgresStanza(c: ConnectionDisk): StdioStanza | null {
   const uri = c.uri?.trim();
   if (!uri) return null;
+  const env: Record<string, string> = { DATABASE_URI: uri };
+  if (!c.allow_write) env.PG_READ_ONLY = "1";
+  const bin = resolveLocalPostgresBin();
+  if (bin) {
+    return { type: "stdio", command: "node", args: [bin], env };
+  }
+  // postgres-mcp imports mcp.server.fastmcp, which mcp 2.x removed.
+  const mode = c.allow_write
+    ? "--access-mode=unrestricted"
+    : "--access-mode=restricted";
   return {
     type: "stdio",
     command: "uvx",
-    args: ["postgres-mcp", "--access-mode=restricted"],
+    args: ["--with", "mcp<2", "postgres-mcp", mode],
     env: { DATABASE_URI: uri },
   };
+}
+
+// resolveLocalPostgresBin mirrors resolveLocalClickUpBin in
+// integrations-mcp.ts for <repo>/mcp-servers/postgres/dist/index.js.
+function resolveLocalPostgresBin(): string | null {
+  const override = process.env.POSTGRES_LOCAL_MCP_PATH?.trim();
+  if (override) return override;
+  let dir = process.cwd();
+  for (let i = 0; i < 8; i++) {
+    const candidate = path.join(dir, "mcp-servers", "postgres", "dist", "index.js");
+    if (existsSync(candidate)) return candidate;
+    const parent = path.dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return null;
 }
 
 function clickhouseStanza(c: ConnectionDisk): StdioStanza | null {

@@ -7,6 +7,8 @@ import {
   ChevronRight,
   Database,
   Loader2,
+  Lock,
+  LockOpen,
   Pencil,
   Plus,
   Power,
@@ -45,6 +47,8 @@ interface Connection {
   disabled?: boolean;
   // Postgres
   uri?: string; // redacted on the wire
+  // Off = read-only (restricted postgres-mcp, no write tools).
+  allow_write?: boolean;
   // ClickHouse + Redis
   host?: string;
   port?: number;
@@ -201,7 +205,9 @@ function ConnectionRow({
   onDone: () => void;
   onError: (msg: string) => void;
 }) {
-  const [busy, setBusy] = useState<"toggle" | "delete" | null>(null);
+  const [busy, setBusy] = useState<"toggle" | "delete" | "access" | null>(
+    null,
+  );
   const summary = summarise(conn);
 
   const remove = async () => {
@@ -249,6 +255,50 @@ function ConnectionRow({
     }
   };
 
+  // toggleAccess flips read-only via the regular update endpoint. An
+  // empty uri tells the daemon to keep the stored one.
+  const toggleAccess = async () => {
+    const allowWrite = !conn.allow_write;
+    if (
+      allowWrite &&
+      !confirm(
+        `Allow writes on "${conn.name}"? execute_sql runs unrestricted and insert/update/delete_rows become available.`,
+      )
+    ) {
+      return;
+    }
+    setBusy("access");
+    try {
+      const res = await fetch(
+        `/daemon/api/mcp/connections/${encodeURIComponent(conn.id)}`,
+        {
+          method: "PUT",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            id: conn.id,
+            name: conn.name,
+            driver: conn.driver,
+            disabled: conn.disabled ?? false,
+            uri: "",
+            allow_write: allowWrite,
+          }),
+        },
+      );
+      if (!res.ok) {
+        const body = (await res.json().catch(() => ({}))) as { error?: string };
+        onError(body.error ?? `HTTP ${res.status}`);
+        return;
+      }
+      const body = (await res.json()) as { warning?: string };
+      if (body.warning) onError(`updated with warning: ${body.warning}`);
+      onDone();
+    } catch (err) {
+      onError((err as Error).message);
+    } finally {
+      setBusy(null);
+    }
+  };
+
   const disabled = conn.disabled ?? false;
 
   return (
@@ -271,13 +321,41 @@ function ConnectionRow({
         <span className="truncate font-mono text-xs text-muted-foreground">
           {disabled ? "disabled" : summary}
         </span>
+        {conn.driver === "postgres" && (
+          <button
+            type="button"
+            onClick={toggleAccess}
+            disabled={busy !== null}
+            title={
+              conn.allow_write
+                ? "Read-write — click to make read-only"
+                : "Read-only — click to allow writes"
+            }
+            className={cn(
+              "ml-auto inline-flex items-center gap-1 rounded-md border px-2 py-0.5 text-xs hover:bg-muted disabled:opacity-50",
+              conn.allow_write
+                ? "border-destructive/50 text-destructive"
+                : "text-muted-foreground",
+            )}
+          >
+            {busy === "access" ? (
+              <Loader2 className="size-3 animate-spin" />
+            ) : conn.allow_write ? (
+              <LockOpen className="size-3" />
+            ) : (
+              <Lock className="size-3" />
+            )}
+            {conn.allow_write ? "read-write" : "read-only"}
+          </button>
+        )}
         <button
           type="button"
           onClick={toggle}
           disabled={busy !== null}
           title={disabled ? "Enable connection" : "Disable connection"}
           className={cn(
-            "ml-auto inline-flex items-center gap-1 rounded-md border px-2 py-0.5 text-xs hover:bg-muted disabled:opacity-50",
+            conn.driver !== "postgres" && "ml-auto",
+            "inline-flex items-center gap-1 rounded-md border px-2 py-0.5 text-xs hover:bg-muted disabled:opacity-50",
             disabled
               ? "text-muted-foreground"
               : "text-emerald-600 dark:text-emerald-400",
@@ -423,6 +501,7 @@ function ConnectionForm({
     initial?.redis_db != null ? String(initial.redis_db) : "",
   );
   const [secure, setSecure] = useState<boolean>(initial?.secure ?? true);
+  const [readOnly, setReadOnly] = useState<boolean>(!initial?.allow_write);
   const [busy, setBusy] = useState<"save" | "test" | null>(null);
   const [test, setTest] = useState<TestState>({ status: "idle" });
 
@@ -438,7 +517,12 @@ function ConnectionForm({
     };
     if (mode === "update" && initial?.id) base.id = initial.id;
     if (driver === "postgres") {
-      return { ...base, uri };
+      return {
+        ...base,
+        disabled: initial?.disabled ?? false,
+        uri,
+        allow_write: !readOnly,
+      };
     }
     if (driver === "clickhouse") {
       return {
@@ -574,7 +658,7 @@ function ConnectionForm({
           hint={
             mode === "update"
               ? "leave empty to keep existing"
-              : "stored chmod 0600; --access-mode=restricted"
+              : "stored chmod 0600"
           }
         >
           <input
@@ -590,6 +674,25 @@ function ConnectionForm({
             autoComplete="off"
           />
         </Field>
+      )}
+
+      {driver === "postgres" && (
+        <label className="flex items-start gap-2 text-xs">
+          <input
+            type="checkbox"
+            checked={readOnly}
+            onChange={(e) => setReadOnly(e.target.checked)}
+            className="mt-0.5"
+          />
+          <span>
+            Read-only
+            <span className="block text-[11px] text-muted-foreground">
+              {readOnly
+                ? "execute_sql runs in a READ ONLY transaction; write tools are hidden."
+                : "Writes allowed: execute_sql runs unrestricted and insert/update/delete_rows are exposed."}
+            </span>
+          </span>
+        </label>
       )}
 
       {driver === "clickhouse" && (

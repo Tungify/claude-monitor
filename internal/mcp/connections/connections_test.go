@@ -69,18 +69,28 @@ func TestValidate_DriverFields(t *testing.T) {
 }
 
 func TestStanza_Postgres(t *testing.T) {
+	t.Setenv("POSTGRES_LOCAL_MCP_PATH", "/repo/mcp-servers/postgres/dist/index.js")
 	c := Connection{Name: "warehouse", Driver: DriverPostgres, URI: "postgres://alice:pw@h:5432/db"}
 	s := c.Stanza()
-	if s["command"] != "uvx" {
+	if s["command"] != "node" {
 		t.Fatalf("command: %v", s["command"])
 	}
 	args, _ := s["args"].([]string)
-	if len(args) < 2 || args[0] != "postgres-mcp" || !strings.Contains(args[1], "restricted") {
+	if len(args) != 1 || args[0] != "/repo/mcp-servers/postgres/dist/index.js" {
 		t.Fatalf("unexpected args: %v", args)
 	}
 	env, _ := s["env"].(map[string]string)
 	if env["DATABASE_URI"] != c.URI {
 		t.Fatalf("DATABASE_URI: %q", env["DATABASE_URI"])
+	}
+	if env["PG_READ_ONLY"] != "1" {
+		t.Fatalf("PG_READ_ONLY: %q, want read-only by default", env["PG_READ_ONLY"])
+	}
+
+	c.AllowWrite = true
+	env, _ = c.Stanza()["env"].(map[string]string)
+	if _, ok := env["PG_READ_ONLY"]; ok {
+		t.Fatalf("PG_READ_ONLY set although AllowWrite")
 	}
 }
 

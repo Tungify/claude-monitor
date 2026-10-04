@@ -9,6 +9,35 @@
 // parsers choke on them in the SDK's `mcp__<name>__<tool>` flattening.
 export const MCP_DB_TOOL_RE = /^mcp__([a-z][a-z0-9_]*)__(execute_sql|run_query)$/;
 
+// Every tool the postgres server (mcp-servers/postgres) exposes: the
+// proxied postgres-mcp tools plus the local ones. "Always allow" on
+// any of them authorizes the whole tool name, like execute_sql.
+const PG_TOOLS = [
+  "execute_sql",
+  "list_schemas",
+  "list_objects",
+  "get_object_details",
+  "explain_query",
+  "analyze_workload_indexes",
+  "analyze_query_indexes",
+  "analyze_db_health",
+  "get_top_queries",
+  "list_tables",
+  "describe_table",
+  "sample_rows",
+  "count_rows",
+  "find_columns",
+  "active_queries",
+  "blocking_locks",
+  "insert_rows",
+  "update_rows",
+  "delete_rows",
+];
+
+export const MCP_DB_ANY_TOOL_RE = new RegExp(
+  `^mcp__([a-z][a-z0-9_]*)__(run_query|${PG_TOOLS.join("|")})$`,
+);
+
 export interface DbToolMatch {
   connectionName: string;
   driver: "postgres" | "clickhouse";

@@ -10,9 +10,11 @@
 // double-underscore FQN flattening never produces an ambiguous tool
 // name.
 //
-// Read-only is delegated to the upstream MCP servers:
-//   - postgres-mcp runs with --access-mode=restricted (READ ONLY tx +
-//     pglast AST guard against ROLLBACK/DROP injection),
+// Read-only is delegated to the MCP servers:
+//   - postgres runs the in-tree mcp-servers/postgres, which proxies
+//     postgres-mcp with --access-mode=restricted (READ ONLY tx +
+//     pglast AST guard against ROLLBACK/DROP injection) and hides its
+//     write tools, unless the connection sets AllowWrite,
 //   - mcp-clickhouse defaults CLICKHOUSE_ALLOW_WRITE_ACCESS=false and
 //     rejects DML/DDL at the tool layer. We never set the flag.
 package connections
@@ -24,6 +26,8 @@ import (
 	"fmt"
 	"net"
 	"net/url"
+	"os"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
@@ -69,6 +73,10 @@ type Connection struct {
 
 	// Postgres
 	URI string `json:"uri,omitempty"`
+	// AllowWrite turns off read-only: postgres-mcp runs unrestricted
+	// and the local server exposes insert/update/delete_rows. False
+	// (and absent on legacy records) keeps the connection read-only.
+	AllowWrite bool `json:"allow_write,omitempty"`
 
 	// ClickHouse + Redis (overlapping shape — host/port/user/pwd map
 	// cleanly to both protocols).
@@ -206,14 +214,68 @@ func postgresStanza(c Connection) map[string]any {
 	}
 	// DATABASE_URI lives in env (not args) so `ps` doesn't echo the
 	// password.
+	env := map[string]string{"DATABASE_URI": c.URI}
+	if !c.AllowWrite {
+		env["PG_READ_ONLY"] = "1"
+	}
+	if bin := resolveLocalPostgresBin(); bin != "" {
+		return map[string]any{
+			"type":    "stdio",
+			"command": "node",
+			"args":    []string{bin},
+			"env":     env,
+		}
+	}
+	// In-tree server not built: fall back to bare postgres-mcp, which
+	// lacks the local tools. postgres-mcp imports mcp.server.fastmcp,
+	// which mcp 2.x removed, so pin the SDK below 2.
+	mode := "--access-mode=restricted"
+	if c.AllowWrite {
+		mode = "--access-mode=unrestricted"
+	}
 	return map[string]any{
 		"type":    "stdio",
 		"command": "uvx",
-		"args":    []string{"postgres-mcp", "--access-mode=restricted"},
-		"env": map[string]string{
-			"DATABASE_URI": c.URI,
-		},
+		"args":    []string{"--with", "mcp<2", "postgres-mcp", mode},
+		"env":     map[string]string{"DATABASE_URI": c.URI},
 	}
+}
+
+// resolveLocalPostgresBin finds <repo>/mcp-servers/postgres/dist/index.js
+// the way integrations.resolveLocalClickUpBin finds the ClickUp server:
+// POSTGRES_LOCAL_MCP_PATH, then walking up from the (symlink-resolved)
+// executable and the cwd. Returns "" when the server isn't built.
+func resolveLocalPostgresBin() string {
+	if p := strings.TrimSpace(os.Getenv("POSTGRES_LOCAL_MCP_PATH")); p != "" {
+		return p
+	}
+	starts := make([]string, 0, 2)
+	if exe, err := os.Executable(); err == nil {
+		// Same as web.FindWebDir: ~/.local/bin/claude-monitor may be a
+		// symlink into <repo>/bin.
+		if resolved, err := filepath.EvalSymlinks(exe); err == nil {
+			exe = resolved
+		}
+		starts = append(starts, filepath.Dir(exe))
+	}
+	if cwd, err := os.Getwd(); err == nil {
+		starts = append(starts, cwd)
+	}
+	for _, start := range starts {
+		dir := start
+		for i := 0; i < 8; i++ {
+			candidate := filepath.Join(dir, "mcp-servers", "postgres", "dist", "index.js")
+			if _, err := os.Stat(candidate); err == nil {
+				return candidate
+			}
+			parent := filepath.Dir(dir)
+			if parent == dir {
+				break
+			}
+			dir = parent
+		}
+	}
+	return ""
 }
 
 func clickhouseStanza(c Connection) map[string]any {
