@@ -4,7 +4,7 @@ MENUBAR_DIR  := macos/menubar
 ALL_PKGS     := ./...
 BIN_DIR      := bin
 WEB_DIR      := web
-MCP_SERVERS  := mcp-servers/clickup
+MCP_SERVERS  := mcp-servers/clickup mcp-servers/postgres
 INSTALL_DIR  ?= $(HOME)/bin
 # macOS menu-bar app bundle. Space in the name is intentional (Finder name);
 # every recipe reference is quoted.

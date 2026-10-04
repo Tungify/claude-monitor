@@ -43,7 +43,7 @@ import {
 } from "./leader-mcp";
 import { getDbMcpEntries } from "./postgres-mcp";
 import { getIntegrationsMcpEntries, hasEnabledService } from "./integrations-mcp";
-import { MCP_DB_TOOL_RE } from "@/lib/mcp-db-tools";
+import { MCP_DB_ANY_TOOL_RE } from "@/lib/mcp-db-tools";
 import {
   deleteStoredSession,
   loadAllStoredSessions,
@@ -3235,14 +3235,14 @@ function synthesizeSuggestions(
       },
     ];
   }
-  // MCP DB tools (`mcp__<conn>__execute_sql` / `__run_query`) — every
-  // call carries a different SQL string, so a content-aware rule like
-  // Bash's `<cmd>:*` would never match. Authorize the whole tool name
-  // instead; the upstream postgres-mcp/mcp-clickhouse servers already
-  // enforce read-only at the SQL parser level, so granting the tool
-  // is no broader than what the user opted into when registering the
-  // connection.
-  if (MCP_DB_TOOL_RE.test(toolName)) {
+  // MCP DB tools (`mcp__<conn>__execute_sql` / `__run_query` and the
+  // other postgres tools) — every call carries different arguments, so
+  // a content-aware rule like Bash's `<cmd>:*` would never match.
+  // Authorize the whole tool name instead. Read-only connections
+  // enforce it at the SQL parser level and hide the write tools, so
+  // granting the tool is no broader than what the user opted into
+  // when registering the connection.
+  if (MCP_DB_ANY_TOOL_RE.test(toolName)) {
     return [
       {
         type: "addRules",
