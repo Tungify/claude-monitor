@@ -86,13 +86,13 @@ type Integration struct {
 	// stdio MCP we spawn here. Tokens live in env, not args.
 	ClickUpAPIKey string `json:"clickup_api_key,omitempty"`
 	ClickUpTeamID string `json:"clickup_team_id,omitempty"`
-	// ClickUpAllowWrite opts into the upstream's full tool surface.
+	// ClickUpAllowWrite opts into the local server's write tools.
 	// Off by default mirrors the Slack pattern (write requires
-	// explicit opt-in). When false we pin
-	// CLICKUP_MCP_PERSONA=auditor so the upstream only registers
-	// read tools. ClickUp's personal API token is workspace-scoped
-	// and has the user's full edit/delete rights — without this
-	// guard, a single misfired tool call could destroy real data.
+	// explicit opt-in). When false we set CLICKUP_READ_ONLY=1 so the
+	// server only registers read tools. ClickUp's personal API token
+	// is workspace-scoped and has the user's full edit/delete rights —
+	// without this guard, a single misfired tool call could destroy
+	// real data.
 	ClickUpAllowWrite bool `json:"clickup_allow_write,omitempty"`
 
 	// GitHub — personal access token (classic ghp_ / fine-grained
@@ -275,7 +275,7 @@ func slackStanza(i Integration) map[string]any {
 }
 
 // resolveLocalClickUpBin finds the absolute path to the in-tree
-// read-only ClickUp MCP server's compiled entry point. The server
+// ClickUp MCP server's compiled entry point. The server
 // lives at <repo>/mcp-servers/clickup/dist/index.js and must be built
 // (npm run build) before claude-monitor can spawn it.
 //
@@ -320,11 +320,9 @@ func resolveLocalClickUpBin() string {
 // (daemon-injected .claude.json and SDK-spawned mcpServers) spawn the
 // same in-tree Node binary with the same env vars.
 //
-// We bundle a self-hosted read-only MCP server at mcp-servers/clickup/
-// (built to dist/index.js). The third-party @taazkareem package is no
-// longer used; the local server is always read-only by design, so
-// ClickUpAllowWrite is currently a no-op (kept on the struct for
-// forward-compat when write tools are added to the local server).
+// We bundle a self-hosted MCP server at mcp-servers/clickup/ (built to
+// dist/index.js). Read-only is the default: CLICKUP_READ_ONLY=1 hides
+// its write tools unless ClickUpAllowWrite is set.
 func clickupStanza(i Integration) map[string]any {
 	key := strings.TrimSpace(i.ClickUpAPIKey)
 	team := strings.TrimSpace(i.ClickUpTeamID)
@@ -335,14 +333,18 @@ func clickupStanza(i Integration) map[string]any {
 	if bin == "" {
 		return nil
 	}
+	env := map[string]string{
+		"CLICKUP_API_KEY": key,
+		"CLICKUP_TEAM_ID": team,
+	}
+	if !i.ClickUpAllowWrite {
+		env["CLICKUP_READ_ONLY"] = "1"
+	}
 	return map[string]any{
 		"type":    "stdio",
 		"command": "node",
 		"args":    []string{bin},
-		"env": map[string]string{
-			"CLICKUP_API_KEY": key,
-			"CLICKUP_TEAM_ID": team,
-		},
+		"env":     env,
 	}
 }
 

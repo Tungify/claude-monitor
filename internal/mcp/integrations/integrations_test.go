@@ -1,7 +1,6 @@
 package integrations
 
 import (
-	"fmt"
 	"os"
 	"runtime"
 	"strings"
@@ -198,36 +197,27 @@ func TestStanza_ClickUp(t *testing.T) {
 	if env["CLICKUP_TEAM_ID"] != "987654321" {
 		t.Fatalf("team id not set: %#v", env)
 	}
-	// Local server is always read-only by design — no persona env should
-	// leak through. AllowWrite is a no-op until the local server grows
-	// write tools.
+	// Read-only by default: the server hides its write tools.
+	if env["CLICKUP_READ_ONLY"] != "1" {
+		t.Fatalf("expected CLICKUP_READ_ONLY=1 by default: %#v", env)
+	}
 	if _, has := env["CLICKUP_MCP_PERSONA"]; has {
 		t.Fatalf("unexpected CLICKUP_MCP_PERSONA in env: %#v", env)
 	}
 }
 
-func TestStanza_ClickUp_AllowWriteIsNoop(t *testing.T) {
-	// Until the local server adds write tools, ClickUpAllowWrite must
-	// not alter the spawned stanza. Asserts the two variants are
-	// byte-equivalent so a future contributor can't accidentally
-	// re-introduce a persona-style toggle without updating this test.
+func TestStanza_ClickUp_AllowWriteDropsReadOnly(t *testing.T) {
 	t.Setenv("CLICKUP_LOCAL_MCP_PATH", "/fake/dist.js")
-	base := Integration{
-		Name:          "tasks",
-		Service:       ServiceClickUp,
-		ClickUpAPIKey: "pk_x",
-		ClickUpTeamID: "1",
-	}
-	off := base.Stanza()
-	on := Integration{
-		Name:              base.Name,
-		Service:           base.Service,
-		ClickUpAPIKey:     base.ClickUpAPIKey,
-		ClickUpTeamID:     base.ClickUpTeamID,
+	s := Integration{
+		Name:              "tasks",
+		Service:           ServiceClickUp,
+		ClickUpAPIKey:     "pk_x",
+		ClickUpTeamID:     "1",
 		ClickUpAllowWrite: true,
 	}.Stanza()
-	if fmt.Sprintf("%v", off) != fmt.Sprintf("%v", on) {
-		t.Fatalf("AllowWrite altered stanza:\n off=%v\n  on=%v", off, on)
+	env, _ := s["env"].(map[string]string)
+	if _, has := env["CLICKUP_READ_ONLY"]; has {
+		t.Fatalf("AllowWrite should drop CLICKUP_READ_ONLY: %#v", env)
 	}
 }
 
